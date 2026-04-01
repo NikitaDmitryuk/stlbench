@@ -11,6 +11,7 @@ from rich.console import Console
 
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
 from stlbench.export.plate import mesh_footprint_xy
+from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
     PackedRect,
@@ -148,10 +149,21 @@ def run_fill(args: FillRunArgs) -> int:
         mesh.apply_scale(s_final)
         console.print(f"Scaled {inp.name} by {s_final:.6f}")
 
-    dx, dy, dz = mesh_footprint_xy(mesh)
-    console.print(f"Part footprint: {dx:.2f} x {dy:.2f} mm, height: {dz:.2f} mm")
+    rot_samples = st.orientation.samples if st else 4096
+    rot_seed = st.orientation.seed if st else 0
 
-    plate = _max_copies_on_plate(dx, dy, px, py, gap)
+    ok, transform, fw, fh = select_layout_transform(
+        mesh, px, py, pz, gap, random_samples=rot_samples, seed=rot_seed
+    )
+    if not ok:
+        console.print("[red]Part does not fit on the bed in any orientation.[/red]")
+        return 1
+
+    mesh.apply_transform(transform)
+    _, _, dz = mesh_footprint_xy(mesh)
+    console.print(f"Part footprint: {fw:.2f} x {fh:.2f} mm, height: {dz:.2f} mm")
+
+    plate = _max_copies_on_plate(fw, fh, px, py, gap)
     if plate is None:
         console.print("[red]Part does not fit on the bed.[/red]")
         return 1
