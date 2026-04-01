@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
-import tomli
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 from stlbench.config.schema import AppSettings
 
@@ -12,7 +16,7 @@ def load_app_settings(path: Path) -> AppSettings:
     if not path.is_file():
         raise FileNotFoundError(f"Config not found: {path}")
     with path.open("rb") as f:
-        raw = tomli.load(f)
+        raw: dict[str, Any] = tomllib.load(f)
     printer = raw.get("printer") or {}
     if "width_mm" not in printer:
         raise ValueError("config [printer] must define width_mm, depth_mm, height_mm.")
