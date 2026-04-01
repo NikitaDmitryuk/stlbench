@@ -1,119 +1,166 @@
 # stlbench
 
-Конвейер подготовки STL к фотополимерной печати: **единый масштаб**, отчёт по группам на столе, команда **`layout`** (укладка в `plate_XX.stl` + JSON), опционально **полые оболочки** (воксели + scipy). **Опоры** в пакете не строятся — их добавляют в **Lychee, Chitubox, Prusa** и т.п. после экспорта; множитель `scaling.supports_scale` в конфиге задаёт только **запас по масштабу** под слайсерные опоры и кайму.
+[![PyPI version](https://img.shields.io/pypi/v/stlbench.svg)](https://pypi.org/project/stlbench/)
+[![Python versions](https://img.shields.io/pypi/pyversions/stlbench.svg)](https://pypi.org/project/stlbench/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Размеры задаются в **одних единицах** (обычно мм).
+**STL preparation toolkit for resin 3D printing.**
 
-Части модели Кратоса лежат в **`models/kratos/base/`**. Результаты пайплайна — рядом: **`models/kratos/print_scaled/`** и **`models/kratos/print_plates/`** (в `.gitignore`, не коммитятся).
+stlbench takes STL files and prepares them for SLA/DLP printers: uniform scaling to
+fit the build volume, packing parts onto rectangular print plates, filling the bed with
+copies, and combined scale-and-pack in one step. Supports are **not** generated --
+use your slicer (Lychee, Chitubox, PrusaSlicer, etc.) after export.
 
-## Модель Кратоса — итоговые команды (скопировать целиком)
-
-Запускайте из **корня клона** этого репозитория (рядом должны быть каталоги `stlbench/` с кодом пакета и `models/`).
-
-**Первый раз** — установка зависимостей и полный прогон:
-
-```bash
-poetry install --with dev --extras hollow
-poetry run stlbench scale -i models/kratos/base -o models/kratos/print_scaled -c configs/mars5_ultra.toml
-poetry run stlbench layout -i models/kratos/print_scaled -o models/kratos/print_plates -c configs/mars5_ultra.toml
-```
-
-**Повторно** (после того как `poetry install` уже делали):
+## Installation
 
 ```bash
-poetry run stlbench scale -i models/kratos/base -o models/kratos/print_scaled -c configs/mars5_ultra.toml
-poetry run stlbench layout -i models/kratos/print_scaled -o models/kratos/print_plates -c configs/mars5_ultra.toml
+pip install stlbench
 ```
 
-**Тот же сценарий через переменную** (подставьте свой путь к клону вместо примера):
+For hollow shell support (optional, requires `scipy`):
 
 ```bash
-export STLBENCH_ROOT="$HOME/Documents/myprojects/stlbench"
-cd "$STLBENCH_ROOT"
-poetry install --with dev --extras hollow
-poetry run stlbench scale -i "$STLBENCH_ROOT/models/kratos/base" -o "$STLBENCH_ROOT/models/kratos/print_scaled" -c configs/mars5_ultra.toml
-poetry run stlbench layout -i "$STLBENCH_ROOT/models/kratos/print_scaled" -o "$STLBENCH_ROOT/models/kratos/print_plates" -c configs/mars5_ultra.toml
+pip install "stlbench[hollow]"
 ```
 
-Результат: **`models/kratos/print_plates/plate_01.stl`** (при необходимости `plate_02.stl`, …) и рядом **`plate_01.json`** с позициями. Опоры — в слайсере.
-
-## Установка (Poetry)
+### Development install
 
 ```bash
-poetry install --with dev --extras hollow
+git clone https://github.com/NikitaDmitryuk/stlbench.git
+cd stlbench
+poetry install --with dev
 ```
 
-- `--extras hollow` — `scipy` для полых оболочек (если включите `--hollow`). Полный цикл для Кратоса — в разделе выше.
-
-## Установка без Poetry (pip)
+## Quick Start
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[hollow]"
-pip install pytest   # только для тестов
+# Inspect model parts
+stlbench info -i ./parts -c configs/mars5_ultra.toml
+
+# Scale all parts to fit the printer
+stlbench scale -i ./parts -o ./scaled -c configs/mars5_ultra.toml
+
+# Pack scaled parts onto plates
+stlbench layout -i ./scaled -o ./plates -c configs/mars5_ultra.toml
+
+# Scale + pack all on one plate in one step
+stlbench autopack -i ./parts -o ./packed -c configs/mars5_ultra.toml
+
+# Fill the bed with copies of a single part
+stlbench fill -i ./part.stl -o ./filled -c configs/mars5_ultra.toml
 ```
 
-Сборка идёт через `poetry-core` из этого `pyproject.toml`; extras `dev` из Poetry group в `pip` не подтягиваются — тесты ставьте отдельно.
-
-## CLI (Typer)
-
-Совместимость: `python -m stlbench -i ... -o ...` автоматически трактуется как подкоманда **`scale`**.
+Or specify the printer inline without a config file:
 
 ```bash
-python -m stlbench scale -i ./parts -o ./out -c configs/mars5_ultra.toml
-# или явно:
-stlbench scale --input ./parts --output ./out --config configs/mars5_ultra.toml
+stlbench scale -i ./parts -o ./scaled -p "153.36,77.76,165"
 ```
 
-Принтер в одной строке:
+## Commands
+
+### `info` -- Analyze models (read-only)
 
 ```bash
-stlbench scale -i ./parts -o ./out -p "153.36,77.76,165"
+stlbench info -i ./parts -c configs/mars5_ultra.toml
 ```
 
-### Команда `layout`
+Displays a table with AABB dimensions, volume, vertex/face counts, whether each
+part fits the bed, maximum scale factor, and how many copies would fit (`fill`).
+No files are written.
 
-Укладка уже подготовленных STL по прямоугольникам AABB в XY (`rectpack`), экспорт **`plate_01.stl`** и **`plate_01.json`** (позиции). Высота по Z не меняется — убедитесь, что детали ориентированы «стоя» на стол.
+### `scale` -- Uniform scaling
 
 ```bash
-stlbench layout -i ./scaled -o ./plates -c configs/mars5_ultra.toml --dry-run
+stlbench scale -i ./parts -o ./out -c configs/mars5_ultra.toml
 ```
 
-`packing.algorithm = "shelf"` в конфиге даёт только **текстовый** отчёт по группам без экспорта STL; для пластин используйте **`rectpack`** (по умолчанию в схеме).
+Computes a single scale factor so that **every** part fits inside the printer
+build volume. The largest part determines the factor; all parts share the same
+scale. Supports two methods: `sorted` (default) and `conservative`.
 
-### Полые оболочки
+Key options: `--dry-run`, `--no-upscale`, `--method`, `--orientation free`,
+`--hollow`, `--supports-scale`.
 
-В [configs/mars5_ultra.toml](configs/mars5_ultra.toml) секция `[hollow]`. Включение в файле + при необходимости флаг:
+### `layout` -- Pack parts onto plates
 
 ```bash
-stlbench scale ... -c configs/mars5_ultra.toml --hollow
+stlbench layout -i ./scaled -o ./plates -c configs/mars5_ultra.toml
 ```
 
-- **Hollow**: backend `open3d_voxel` в конфиге — фактически **scipy + trimesh voxel** (имя историческое). Нужен extra `[hollow]`.
+Arranges already-scaled STL files onto rectangular print plates using `rectpack`.
+Exports `plate_01.stl` + `plate_01.json` with positions. Multiple plates are
+created if parts do not fit on one.
 
-### Опоры
+Key options: `--dry-run`, `--gap-mm`, `--algorithm shelf|rectpack`.
 
-Команда `stlbench supports` выводит напоминание: опоры ставятся в слайсере. Секция `[supports]` в TOML оставлена для совместимости (`backend = "none"`); шаблон `external_command_template` зарезервирован под свой вызов в `supports/external.py` (пока не реализован).
+### `autopack` -- Scale + layout on one plate
 
-Про промышленный offset см. [stlbench/hollow/meshlib_note.md](stlbench/hollow/meshlib_note.md).
+```bash
+stlbench autopack -i ./parts -o ./packed -c configs/mars5_ultra.toml
+```
 
-## Структура пакета
+Binary-searches for the maximum scale factor at which **all** parts fit onto a
+single plate simultaneously. Combines `scale` and `layout` into one step with a
+different goal: all parts on one plate, not each part fitting individually.
 
-Исходники Python — пакет **`stlbench`** (каталог `stlbench/` в корне репозитория).
+Key options: `--dry-run`, `--gap-mm`, `--margin`, `--supports-scale`.
 
-| Модуль | Назначение |
-|--------|------------|
-| `stlbench.core` | Расчёт масштаба и ориентации bbox |
-| `stlbench.config` | Pydantic-схема + загрузка TOML |
-| `stlbench.packing` | Полка (`shelf`) и `rectpack` |
-| `stlbench.export` | Склейка пластины и manifest |
-| `stlbench.hollow` | Воксельная оболочка |
-| `stlbench.supports` | Заглушка под внешние опоры (без геометрии в CLI) |
-| `stlbench.pipeline` | Сценарии `run_scale`, `run_layout` |
-| `stlbench.cli` (модуль `cli.py`) | Typer-приложение |
+### `fill` -- Maximum copies of one part
 
-Вспомогательные модули `stlbench.bbox_fit`, `stlbench.orientation`, `stlbench.plate_groups`, `stlbench.config_load` — прокси для обратной совместимости.
+```bash
+stlbench fill -i ./part.stl -o ./filled -c configs/mars5_ultra.toml
+```
 
-## Ограничения
+Packs as many copies of a single STL file as possible onto one plate. Useful for
+batch printing identical parts.
 
-Boolean и воксели чувствительны к **дырявым** STL. Полости в пакете — упрощение; для сложных моделей и опор используйте слайсер.
+Key options: `--scale` (scale the part to fit before filling), `--dry-run`, `--gap-mm`.
+
+### `hollow` / `supports`
+
+- `stlbench hollow` -- reminder to configure `[hollow]` in the TOML config and use `--hollow` with `scale`.
+- `stlbench supports` -- reminder that supports are added in the slicer.
+
+## Configuration
+
+Printer profiles are TOML files. See [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml)
+for a complete example (ELEGOO Mars 5 Ultra).
+
+Key sections:
+
+| Section         | Purpose                                          |
+|-----------------|--------------------------------------------------|
+| `[printer]`     | Build volume: `width_mm`, `depth_mm`, `height_mm`|
+| `[scaling]`     | `bed_margin`, `supports_scale`                   |
+| `[orientation]` | `mode` (axis/free), `samples`, `seed`            |
+| `[packing]`     | `algorithm` (rectpack/shelf), `gap_mm`, `report` |
+| `[hollow]`      | `enabled`, `wall_thickness_mm`, `voxel_mm`       |
+
+## Examples
+
+See [`examples/README.md`](examples/README.md) for a full walkthrough using the
+included Gendalf model (3 parts tracked via Git LFS).
+
+## Package Structure
+
+| Module             | Purpose                                    |
+|--------------------|--------------------------------------------|
+| `stlbench.cli`     | Typer CLI application                      |
+| `stlbench.core`    | Scale factor computation and orientation   |
+| `stlbench.config`  | Pydantic schema + TOML loader              |
+| `stlbench.packing` | Shelf and rectpack algorithms              |
+| `stlbench.export`  | Plate STL assembly and JSON manifest       |
+| `stlbench.hollow`  | Voxel shell hollowing (optional, scipy)    |
+| `stlbench.pipeline`| Command runners (scale, layout, fill, etc.)|
+
+## Limitations
+
+- Boolean and voxel operations are sensitive to non-manifold STL. For complex
+  models use a mesh repair tool first.
+- Hollow shells in this package are a simplified voxel approach; for production
+  use your slicer's built-in hollowing.
+- Supports are **not** generated -- always add them in your slicer.
+
+## License
+
+[MIT](LICENSE)

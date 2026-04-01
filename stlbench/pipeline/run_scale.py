@@ -23,7 +23,7 @@ from stlbench.core.orientation import (
 )
 from stlbench.hollow.voxel_shell import hollow_mesh_voxel_shell
 from stlbench.packing.shelf import build_packable_parts, greedy_shelf_plates
-from stlbench.pipeline.mesh_io import collect_stl_paths, load_mesh
+from stlbench.pipeline.common import load_named_meshes, resolve_printer, rotation_to_4x4
 
 
 @dataclass
@@ -46,27 +46,12 @@ class ScaleRunArgs:
     hollow_override: bool | None
 
 
-def _merge_printer(args: ScaleRunArgs) -> tuple[float, float, float]:
-    if args.printer_xyz is not None:
-        return args.printer_xyz
-    if args.settings is not None:
-        p = args.settings.printer
-        return p.width_mm, p.depth_mm, p.height_mm
-    raise ValueError("Укажите printer или --config с [printer].")
-
-
-def _rotation_to_4x4(r3: np.ndarray) -> np.ndarray:
-    t = np.eye(4, dtype=np.float64)
-    t[:3, :3] = np.asarray(r3, dtype=np.float64)
-    return t
-
-
 def run_scale(args: ScaleRunArgs) -> int:
     console = Console(stderr=True)
     st = args.settings
 
     try:
-        prx, pry, prz = _merge_printer(args)
+        prx, pry, prz = resolve_printer(args.printer_xyz, st)
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         return 2
@@ -106,33 +91,25 @@ def run_scale(args: ScaleRunArgs) -> int:
         console.print(f"[red]Input is not a directory: {input_dir}[/red]")
         return 2
 
-    paths = collect_stl_paths(input_dir, args.recursive)
-    if not paths:
-        console.print(f"[red]No .stl files under {input_dir}[/red]")
+    loaded = load_named_meshes(input_dir, args.recursive, console)
+    if loaded is None:
         return 1
+    paths, _loaded_names, _loaded_meshes = loaded
 
     px, py, pz = printer_dims_with_margin(prx, pry, prz, margin)
     p_sorted_calc: tuple[float, float, float] = tuple(sorted((px, py, pz)))  # type: ignore[assignment]
 
-    part_names: list[str] = []
+    part_names: list[str] = list(_loaded_names)
+    meshes: list[trimesh.Trimesh] = list(_loaded_meshes)
     parts_dims: list[tuple[float, float, float]] = []
     file_dims: list[tuple[float, float, float]] = []
     rotations: list[np.ndarray] = []
-    meshes: list[trimesh.Trimesh] = []
     rng = np.random.default_rng(seed)
 
-    for p in paths:
-        try:
-            mesh = load_mesh(p)
-        except (OSError, ValueError, TypeError) as e:
-            console.print(f"[red]Failed to load {p}: {e}[/red]")
-            return 1
-        rel = str(p.relative_to(input_dir)) if p.is_relative_to(input_dir) else p.name
+    for mesh in meshes:
         fb = np.asarray(mesh.bounds)
         file_d = aabb_edge_lengths(fb)
-        part_names.append(rel)
         file_dims.append(file_d)
-        meshes.append(mesh)
 
         if orient == "free":
             verts = mesh_vertices_for_orientation(mesh)
@@ -271,7 +248,7 @@ def run_scale(args: ScaleRunArgs) -> int:
 
         rot = rotations[idx]
         if not np.allclose(rot, np.eye(3)):
-            scaled.apply_transform(_rotation_to_4x4(rot))
+            scaled.apply_transform(rotation_to_4x4(rot))
 
         scaled.apply_scale(s_final)
 

@@ -1,7 +1,7 @@
 import numpy as np
 import trimesh.creation
 
-from stlbench.bbox_fit import aabb_edge_lengths, compute_global_scale
+from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 
 
 def test_box_scale_matches_formula():

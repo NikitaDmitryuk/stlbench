@@ -1,8 +1,8 @@
 import numpy as np
 import trimesh.creation
 
-from stlbench.bbox_fit import aabb_edge_lengths
-from stlbench.orientation import (
+from stlbench.core.fit import aabb_edge_lengths
+from stlbench.core.orientation import (
     best_aabb_extents_for_sorted_fit,
     score_sorted_fit,
 )

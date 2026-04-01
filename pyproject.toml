@@ -1,23 +1,46 @@
 [project]
 name = "stlbench"
-version = "0.1.0"
-description = "stlbench"
+version = "0.2.0"
+description = "STL preparation toolkit for resin 3D printing: uniform scaling, bed packing, fill, autopack."
 authors = [
-    {name = "NikitaDmitryuk",email = "dmitryuk.nikita@gmail.com"}
+    {name = "NikitaDmitryuk", email = "dmitryuk.nikita@gmail.com"}
 ]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = [
-    "numpy (>=2.4.4,<3.0.0)",
-    "pydantic (>=2.0,<3.0.0)",
-    "rectpack (>=0.2.2,<0.3.0)",
-    "rich (>=13.0,<15.0.0)",
-    "scipy (>=1.17.1,<2.0.0)",
-    "tomli (>=2.4.1,<3.0.0)",
-    "trimesh (>=4.11.5,<5.0.0)",
-    "typer (>=0.9,<1.0.0)",
+requires-python = ">=3.10"
+keywords = ["stl", "3d-printing", "resin", "scaling", "packing", "sla", "dlp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Manufacturing",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Scientific/Engineering",
 ]
+dependencies = [
+    "numpy>=1.23",
+    "pydantic>=2.0,<3",
+    "rectpack>=0.2.2",
+    "rich>=13.0",
+    "tomli>=1.1; python_version < '3.11'",
+    "trimesh>=3.21",
+    "typer>=0.9",
+]
+
+[project.optional-dependencies]
+hollow = ["scipy>=1.9"]
+
+[project.urls]
+Homepage = "https://github.com/NikitaDmitryuk/stlbench"
+Repository = "https://github.com/NikitaDmitryuk/stlbench"
+"Bug Tracker" = "https://github.com/NikitaDmitryuk/stlbench/issues"
 
 [project.scripts]
 stlbench = "stlbench.cli:main"
@@ -27,13 +50,14 @@ packages = [{ include = "stlbench" }]
 
 [dependency-groups]
 dev = [
-    "pytest (>=9.0.2,<10.0.0)",
-    "isort (>=8.0.1,<9.0.0)",
-    "mypy (>=1.20.0,<2.0.0)",
-    "ruff (>=0.15.8,<0.16.0)",
-    "black (>=26.3.1,<27.0.0)"
+    "pytest>=8.0",
+    "isort>=5.12",
+    "mypy>=1.5",
+    "ruff>=0.1",
+    "black>=23.0",
+    "twine>=5.0",
+    "build>=1.0",
 ]
-
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
@@ -44,7 +68,7 @@ testpaths = ["tests"]
 
 [tool.black]
 line-length = 100
-target-version = ["py314"]
+target-version = ["py310"]
 
 [tool.isort]
 profile = "black"
@@ -54,16 +78,15 @@ known_first_party = ["stlbench"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py310"
 src = ["stlbench", "tests"]
 
 [tool.ruff.lint]
-# Импорты — отдельным isort; иначе дублирование и конфликты с black/ruff format
 select = ["E", "F", "W", "UP", "B", "SIM"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.10"
 packages = ["stlbench"]
 warn_return_any = true
 warn_unused_ignores = true

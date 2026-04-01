@@ -1,4 +1,4 @@
-from stlbench.plate_groups import (
+from stlbench.packing.shelf import (
     PackablePart,
     build_packable_parts,
     greedy_shelf_plates,

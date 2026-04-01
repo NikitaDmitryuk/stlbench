@@ -1,6 +1,6 @@
 import pytest
 
-from stlbench.bbox_fit import (
+from stlbench.core.fit import (
     aabb_edge_lengths,
     compute_global_scale,
     printer_dims_with_margin,

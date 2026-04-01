@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from stlbench.config_load import load_config
+from stlbench.config.loader import load_config
 
 
 def test_load_mars5_config():

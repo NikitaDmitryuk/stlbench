@@ -1,9 +1,8 @@
-.PHONY: lint format test setup-env setup_env debug build clear
+.PHONY: lint format test setup-env setup_env debug build clear publish
 
 SHELL := /bin/bash
 PKG := stlbench
 TESTS := tests
-# Как в promo-agent: можно задать точную версию, например `make setup-env PY=python3.12`
 PY ?= python3
 
 lint:
@@ -18,7 +17,6 @@ format:
 test:
 	poetry run pytest
 
-# Как в promo-agent: сначала привязать интерпретатор, потом config, потом install.
 setup-env setup_env:
 	poetry env use "$(PY)"
 	poetry config virtualenvs.create true
@@ -30,6 +28,9 @@ debug:
 
 build:
 	poetry build
+
+publish: build
+	poetry run twine upload dist/*
 
 clear:
 	find $(PKG) $(TESTS) -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null; true

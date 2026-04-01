@@ -7,13 +7,17 @@ import numpy as np
 import trimesh
 from rich.console import Console
 
-from stlbench.config.loader import load_app_settings
-from stlbench.config.schema import AppSettings
 from stlbench.export.plate import export_plate_stl, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import int_bin_dims_mm, pack_rectangles_on_plates
 from stlbench.packing.shelf import build_packable_parts, greedy_shelf_plates
-from stlbench.pipeline.mesh_io import collect_stl_paths, load_mesh
+from stlbench.pipeline.common import (
+    load_named_meshes,
+    resolve_algorithm,
+    resolve_gap,
+    resolve_printer,
+    resolve_settings,
+)
 
 
 @dataclass
@@ -30,46 +34,21 @@ class LayoutRunArgs:
 
 def run_layout(args: LayoutRunArgs) -> int:
     console = Console(stderr=True)
-    st: AppSettings | None = None
-    if args.config_path is not None:
-        st = load_app_settings(args.config_path)
+    st = resolve_settings(args.config_path)
 
-    if args.printer_xyz is not None:
-        px, py, pz = args.printer_xyz
-    elif st is not None:
-        px, py, pz = (
-            st.printer.width_mm,
-            st.printer.depth_mm,
-            st.printer.height_mm,
-        )
-    else:
-        console.print("[red]Нужны --printer или --config с [printer].[/red]")
+    try:
+        px, py, pz = resolve_printer(args.printer_xyz, st)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
         return 2
 
-    gap = (
-        float(args.gap_mm)
-        if args.gap_mm is not None
-        else (st.packing.gap_mm if st is not None else 2.0)
-    )
-    algo = (
-        args.algorithm
-        if args.algorithm is not None
-        else (st.packing.algorithm if st is not None else "rectpack")
-    )
+    gap = resolve_gap(args.gap_mm, st)
+    algo = resolve_algorithm(args.algorithm, st)
 
-    paths = collect_stl_paths(args.input_dir, args.recursive)
-    if not paths:
-        console.print("[red]Нет .stl[/red]")
+    loaded = load_named_meshes(args.input_dir, args.recursive, console)
+    if loaded is None:
         return 1
-
-    names: list[str] = []
-    meshes: list[trimesh.Trimesh] = []
-    for p in paths:
-        m = load_mesh(p)
-        names.append(
-            str(p.relative_to(args.input_dir)) if p.is_relative_to(args.input_dir) else p.name
-        )
-        meshes.append(m)
+    _paths, names, meshes = loaded
 
     dims_list: list[tuple[float, float, float]] = []
     for m in meshes:
