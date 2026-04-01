@@ -1,0 +1,71 @@
+[project]
+name = "stlbench"
+version = "0.1.0"
+description = "stlbench"
+authors = [
+    {name = "NikitaDmitryuk",email = "dmitryuk.nikita@gmail.com"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy (>=2.4.4,<3.0.0)",
+    "pydantic (>=2.0,<3.0.0)",
+    "rectpack (>=0.2.2,<0.3.0)",
+    "rich (>=13.0,<15.0.0)",
+    "scipy (>=1.17.1,<2.0.0)",
+    "tomli (>=2.4.1,<3.0.0)",
+    "trimesh (>=4.11.5,<5.0.0)",
+    "typer (>=0.9,<1.0.0)",
+]
+
+[project.scripts]
+stlbench = "stlbench.cli:main"
+
+[tool.poetry]
+packages = [{ include = "stlbench" }]
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)",
+    "isort (>=8.0.1,<9.0.0)",
+    "mypy (>=1.20.0,<2.0.0)",
+    "ruff (>=0.15.8,<0.16.0)",
+    "black (>=26.3.1,<27.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py314"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+src_paths = ["stlbench", "tests"]
+known_first_party = ["stlbench"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["stlbench", "tests"]
+
+[tool.ruff.lint]
+# Импорты — отдельным isort; иначе дублирование и конфликты с black/ruff format
+select = ["E", "F", "W", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+packages = ["stlbench"]
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+disallow_untyped_defs = false

@@ -1,0 +1,39 @@
+import numpy as np
+import trimesh
+
+from stlbench.packing.layout_orientation import select_layout_transform
+
+
+def test_orientation_fits_only_with_axis_swap():
+    """
+    Коробка 30×100×10 мм (x,y,z): лежа на узкой стороне высота 10, след 30×100;
+    100 > глубина стола 78 — не влезает. Сторона Y вверх: высота 100 — слишком для pz.
+    Сторона X вверх: высота 30, след 10×100 — вдоль X 100, Y 10 — влезает в 153×78.
+    """
+    mesh = trimesh.creation.box(extents=[30.0, 100.0, 10.0])
+    ok, t, fw, fh = select_layout_transform(mesh, bed_x=153.0, bed_y=78.0, pz=50.0, gap_mm=2.0)
+    assert ok
+    assert t.shape == (4, 4)
+    m2 = mesh.copy()
+    m2.apply_transform(t)
+    b = m2.bounds
+    d = b[1] - b[0]
+    assert float(d[2]) <= 50.0 + 1e-3
+    assert abs(float(d[0]) - fw) < 1e-3
+    assert abs(float(d[1]) - fh) < 1e-3
+
+
+def test_footprint_swap_on_narrow_bed():
+    """После ориентации длинная сторона вдоль X стола (swap в footprint_fits_bin_mm)."""
+    mesh = trimesh.creation.box(extents=[20.0, 90.0, 15.0])
+    ok, _, fw, fh = select_layout_transform(mesh, bed_x=153.0, bed_y=78.0, pz=80.0, gap_mm=1.0)
+    assert ok
+    assert max(fw, fh) <= 153.0 + 1e-3
+    assert min(fw, fh) <= 78.0 + 1e-3
+
+
+def test_impossible_height():
+    mesh = trimesh.creation.box(extents=[50.0, 50.0, 200.0])
+    ok, t, _, _ = select_layout_transform(mesh, bed_x=153.0, bed_y=78.0, pz=100.0, gap_mm=1.0)
+    assert not ok
+    assert np.allclose(t, np.eye(4))

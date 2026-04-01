@@ -1,0 +1,41 @@
+# ELEGOO Mars 5 Ultra — типичные габариты рабочей зоны (≈ 6.04 × 3.06 × 6.49 in → мм).
+# Уточните по инструкции к вашему экземпляру при необходимости.
+
+[printer]
+name = "Elegoo Mars 5 Ultra"
+width_mm = 153.36
+depth_mm = 77.76
+height_mm = 165.0
+
+[scaling]
+# Доля запаса по каждой оси стола/высоты (как --margin): 0.02 ≈ 2 % с каждой стороны логически «уменьшает» объём.
+bed_margin = 0.02
+# Дополнительный множитель к итоговому масштабу (< 1 — запас под опоры в слайсере, кайму, люфт; 1.0 — без запаса).
+supports_scale = 0.95
+
+[orientation]
+# "axis" — только ориентация как в файле STL (эквивалентно перестановке осей в sorted-методе по длинам рёбер AABB).
+# "free" — подбор случайных поворотов, чтобы ужать ось-выровненный bbox (модель в слайсере всё равно можно крутить; это влияет только на расчёт s).
+mode = "free"
+samples = 4096
+seed = 0
+
+[packing]
+# Эвристический отчёт: какие детали могут уместиться на одной пластине по XY (полка + строки), высота детали — наименьшее ребро AABB после free-поворота.
+report = true
+# Для команды `layout`: rectpack (экспорт plate_XX.stl) или shelf (только текстовый отчёт).
+algorithm = "rectpack"
+gap_mm = 0.5
+
+[hollow]
+enabled = false
+# voxel + scipy (extra [hollow]); имя backend историческое.
+backend = "open3d_voxel"
+wall_thickness_mm = 2.0
+voxel_mm = 0.5
+
+# Генерации опор в stlbench нет — только слайсер (Lychee, Chitubox и т.д.).
+[supports]
+enabled = false
+backend = "none"
+external_command_template = ""
