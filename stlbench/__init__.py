@@ -1,3 +1,5 @@
 """STL preparation toolkit for resin 3D printing: scale, layout, fill, autopack, info."""
 
-__version__ = "0.2.1"
+from importlib.metadata import version
+
+__version__ = version("stlbench")

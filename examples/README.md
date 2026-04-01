@@ -83,8 +83,8 @@ This is the "one-command" workflow: no separate scale + layout steps.
 
 ```bash
 stlbench fill \
-  -i examples/gendalf/main/body.stl \
-  -o examples/gendalf/fill_body \
+  -i examples/gendalf/main/sword.stl \
+  -o examples/gendalf/fill_sword \
   -c configs/mars5_ultra.toml
 ```
 
@@ -95,8 +95,8 @@ Add `--scale` to first scale the part down to fit the bed:
 
 ```bash
 stlbench fill \
-  -i examples/gendalf/main/body.stl \
-  -o examples/gendalf/fill_body \
+  -i examples/gendalf/main/sword.stl \
+  -o examples/gendalf/fill_sword_scale \
   -c configs/mars5_ultra.toml \
   --scale
 ```
@@ -111,7 +111,7 @@ stlbench fill \
 | `scale`    | `examples/gendalf/scaled/`      | `*.stl` (one per input part)               |
 | `layout`   | `examples/gendalf/plates/`      | `plate_01.stl`, `plate_01.json`, ...       |
 | `autopack` | `examples/gendalf/autopack/`    | `autopack_plate.stl`, `autopack_plate.json`|
-| `fill`     | `examples/gendalf/fill_body/`   | `fill_plate.stl`, `fill_plate.json`        |
+| `fill`     | `examples/gendalf/fill_sword/`   | `fill_plate.stl`, `fill_plate.json`        |
 
 All output directories are listed in `.gitignore` and are not committed.
 
