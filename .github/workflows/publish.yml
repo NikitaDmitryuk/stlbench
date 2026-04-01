@@ -25,6 +25,11 @@ jobs:
       - name: Build package
         run: poetry build
 
+      - name: Validate distributions (twine check)
+        run: |
+          pip install twine
+          python -m twine check --strict dist/*
+
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -46,3 +51,5 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true
