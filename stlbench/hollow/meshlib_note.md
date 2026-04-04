@@ -1,5 +1,5 @@
-# MeshLib (mrmeshpy) — альтернатива для offset/shell
+# MeshLib (`mrmeshpy`) for offset / shell
 
-Для промышленного качества offset и полых оболочек рассмотрите [MeshLib](https://meshlib.io/) (`mrmeshpy`): параметры `OffsetParameters`, тип `Shell`, поле `voxelSize`.
+For industrial-grade offsets and hollow shells, consider [MeshLib](https://meshlib.io/) (`mrmeshpy`): `OffsetParameters`, `Shell`, `voxelSize`, etc.
 
-Установка зависит от платформы; в этот пакет не включена из‑за нативных бинарников. При необходимости добавьте тонкий адаптер в `stlbench.hollow` локально.
+Installation is platform-specific and not bundled here (native binaries). You can add a thin adapter under `stlbench.hollow` locally if needed.

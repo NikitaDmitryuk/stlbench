@@ -61,7 +61,7 @@ def pack_rectangles_on_plates(
 
     while pending:
         if plate_idx >= max_plates:
-            raise RuntimeError(f"Превышен max_plates={max_plates}; не все детали уместились.")
+            raise RuntimeError(f"Exceeded max_plates={max_plates}; not all parts could be placed.")
         packer = rectpack.newPacker(
             mode=rectpack.PackingMode.Offline,
             rotation=True,
@@ -74,9 +74,9 @@ def pack_rectangles_on_plates(
         ]
         if not fittable:
             raise RuntimeError(
-                "rectpack: ни одна из оставшихся деталей не помещается на стол по XY "
-                f"(bin {bw}×{bh} мм при зазоре {g} мм). Уменьшите packing.gap_mm "
-                "или scaling.supports_scale в конфиге."
+                "rectpack: none of the remaining parts fit on the bed in XY "
+                f"(bin {bw}x{bh} mm at gap {g} mm). Reduce packing.gap_mm "
+                "or scaling.post_fit_scale in the config."
             )
         for idx in fittable:
             w, h = orig_int_dims[idx]
@@ -85,8 +85,8 @@ def pack_rectangles_on_plates(
 
         if len(packer) == 0:
             raise RuntimeError(
-                "rectpack: нет bin после pack() — сообщите об этом кейсе "
-                f"(bin {bw}×{bh}, деталей в очереди: {len(fittable)})."
+                "rectpack: no bin after pack() — please report this case "
+                f"(bin {bw}x{bh}, parts in queue: {len(fittable)})."
             )
 
         b0 = packer[0]
@@ -114,9 +114,7 @@ def pack_rectangles_on_plates(
             )
 
         if not placed_ids:
-            raise RuntimeError(
-                "Не удалось разместить ни одну деталь на пластине; проверьте габариты или gap_mm."
-            )
+            raise RuntimeError("Could not place any part on the plate; check part sizes or gap_mm.")
 
         plates_out.append(PackedPlate(index=plate_idx, rects=tuple(rects)))
         plate_idx += 1

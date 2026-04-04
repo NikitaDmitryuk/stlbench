@@ -9,8 +9,9 @@ import rectpack
 import trimesh
 from rich.console import Console
 
+from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
-from stlbench.export.plate import mesh_footprint_xy
+from stlbench.export.plate import _ROT_Z_90, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
@@ -101,12 +102,6 @@ def _max_copies_on_plate(
     return PackedPlate(index=0, rects=tuple(best_rects[:best_count]))
 
 
-_ROT_Z_90 = np.array(
-    trimesh.transformations.rotation_matrix(np.pi / 2.0, [0.0, 0.0, 1.0]),
-    dtype=np.float64,
-)
-
-
 def run_fill(args: FillRunArgs) -> int:
     console = Console(stderr=True)
     st = resolve_settings(args.config_path)
@@ -144,13 +139,13 @@ def run_fill(args: FillRunArgs) -> int:
         epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
         dims = aabb_edge_lengths(np.asarray(mesh.bounds))
         s, _ = compute_global_scale((epx, epy, epz), [dims], [inp.name], "sorted")
-        supports = st.scaling.supports_scale if st else 1.0
-        s_final = s * supports
+        pf = st.scaling.post_fit_scale if st else 1.0
+        s_final = s * pf
         mesh.apply_scale(s_final)
         console.print(f"Scaled {inp.name} by {s_final:.6f}")
 
-    rot_samples = st.orientation.samples if st else 4096
-    rot_seed = st.orientation.seed if st else 0
+    rot_samples = ORIENTATION_SAMPLES_DEFAULT
+    rot_seed = ORIENTATION_SEED_DEFAULT
 
     ok, transform, fw, fh = select_layout_transform(
         mesh, px, py, pz, gap, random_samples=rot_samples, seed=rot_seed

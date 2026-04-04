@@ -7,6 +7,7 @@ import numpy as np
 import trimesh
 from rich.console import Console
 
+from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.export.plate import export_plate_stl, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import int_bin_dims_mm, pack_rectangles_on_plates
@@ -55,8 +56,8 @@ def run_layout(args: LayoutRunArgs) -> int:
         dx, dy, dz = mesh_footprint_xy(m)
         dims_list.append((dx, dy, dz))
 
-    rot_samples = st.orientation.samples if st is not None else 4096
-    rot_seed = st.orientation.seed if st is not None else 0
+    rot_samples = ORIENTATION_SAMPLES_DEFAULT
+    rot_seed = ORIENTATION_SEED_DEFAULT
 
     bw, bh = int_bin_dims_mm(px, py)
     bad_layout: list[tuple[str, float, float, float]] = []
@@ -80,16 +81,14 @@ def run_layout(args: LayoutRunArgs) -> int:
 
     if bad_layout:
         console.print(
-            "[red]Для этих деталей не нашлось ориентации под стол: дискретные 90° + "
-            f"{rot_samples} случайных поворотов (как при расчёте масштаба; seed={rot_seed}). "
-            f"Стол {bw}×{bh} мм по XY, Pz={pz:.2f} мм, gap={gap:.2f} мм.[/red]"
+            "[red]No bed-fitting orientation for these parts: 90° permutations + "
+            f"{rot_samples} random rotations (same idea as scale; seed={rot_seed}). "
+            f"Bed {bw}x{bh} mm XY, Pz={pz:.2f} mm, gap={gap:.2f} mm.[/red]"
         )
         for name, dx, dy, dz in bad_layout:
-            console.print(
-                f"  [red]{name}[/red]: AABB в файле (по осям) {dx:.2f}×{dy:.2f}×{dz:.2f} мм"
-            )
+            console.print(f"  [red]{name}[/red]: file-axis AABB {dx:.2f}x{dy:.2f}x{dz:.2f} mm")
         console.print(
-            "[dim]Уменьшите packing.gap_mm / scaling.supports_scale или разрежьте модель.[/dim]"
+            "[dim]Try smaller packing.gap_mm / scaling.post_fit_scale or split the model.[/dim]"
         )
         return 1
 
@@ -108,18 +107,18 @@ def run_layout(args: LayoutRunArgs) -> int:
     if algo == "shelf":
         packable, bad = build_packable_parts(names, dims_list, px, py, pz)
         if bad:
-            console.print("Не влезают по эвристике:", ", ".join(bad))
+            console.print("Heuristic says these do not fit:", ", ".join(bad))
         groups = greedy_shelf_plates(packable, px, py)
         for i, g in enumerate(groups, 1):
-            console.print(f"Пластина {i} (shelf): {', '.join(g)}")
+            console.print(f"Plate {i} (shelf): {', '.join(g)}")
         console.print(
-            '[dim]Экспорт одного STL для shelf не реализован — используйте packing.algorithm = "rectpack".[/dim]'
+            "[dim]Shelf mode does not export STL; use: stlbench layout ... --algorithm rectpack[/dim]"
         )
         return 0
 
     plates = pack_rectangles_on_plates(footprints, px, py, gap_mm=gap)
     if args.dry_run:
-        console.print(f"Пластин (rectpack): {len(plates)}")
+        console.print(f"Plates (rectpack): {len(plates)}")
         for pl in plates:
             console.print(f"  Plate {pl.index + 1}: {len(pl.rects)} parts")
         return 0

@@ -9,8 +9,10 @@ import trimesh
 from rich.console import Console
 from rich.table import Table
 
+from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
 from stlbench.export.plate import export_plate_stl
+from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
     PackedRect,
@@ -34,7 +36,7 @@ class AutopackRunArgs:
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
     margin: float | None
-    supports_scale: float | None
+    post_fit_scale: float | None
     dry_run: bool
     recursive: bool
 
@@ -138,10 +140,10 @@ def run_autopack(args: AutopackRunArgs) -> int:
     margin = (
         float(args.margin) if args.margin is not None else (st.scaling.bed_margin if st else 0.0)
     )
-    supports_scale = (
-        float(args.supports_scale)
-        if args.supports_scale is not None
-        else (st.scaling.supports_scale if st else 1.0)
+    post_fit_scale = (
+        float(args.post_fit_scale)
+        if args.post_fit_scale is not None
+        else (st.scaling.post_fit_scale if st else 1.0)
     )
 
     loaded = load_named_meshes(args.input_dir, args.recursive, console)
@@ -151,17 +153,34 @@ def run_autopack(args: AutopackRunArgs) -> int:
 
     epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
 
+    # Raw file dims (for display)
     dims_list: list[tuple[float, float, float]] = []
     for m in meshes:
         dims_list.append(aabb_edge_lengths(np.asarray(m.bounds)))
 
-    s_upper, _ = compute_global_scale((epx, epy, epz), dims_list, names, "sorted")
-    s_upper *= supports_scale
+    # Find best print orientation per mesh (maximises scale, considers axis permutations).
+    # This must be consistent with the footprints passed to _bisect_scale so that the
+    # export uses the same orientation that the packer assumed.
+    orient_transforms: list[np.ndarray] = []
+    oriented_dims: list[tuple[float, float, float]] = []
+    for m in meshes:
+        t4, ext = select_orientation_for_scale(
+            m,
+            epx,
+            epy,
+            epz,
+            "sorted",
+            random_samples=ORIENTATION_SAMPLES_DEFAULT,
+            seed=ORIENTATION_SEED_DEFAULT,
+        )
+        orient_transforms.append(t4)
+        oriented_dims.append(ext)  # (ex, ey, ez) in printer coordinates
 
-    base_footprints: list[tuple[float, float]] = []
-    for d in dims_list:
-        sx, sy, sz = sorted(d)
-        base_footprints.append((sy, sz))
+    s_upper, _ = compute_global_scale((epx, epy, epz), oriented_dims, names, "sorted")
+    s_upper *= post_fit_scale
+
+    # (ex, ey) is the XY footprint after the orientation transform
+    base_footprints: list[tuple[float, float]] = [(ex, ey) for ex, ey, _ez in oriented_dims]
 
     s_best, plate = _bisect_scale(base_footprints, epx, epy, gap, s_upper)
 
@@ -176,9 +195,9 @@ def run_autopack(args: AutopackRunArgs) -> int:
     table.add_column("part", max_width=42)
     table.add_column("original (mm)", justify="right")
     table.add_column("scaled (mm)", justify="right")
-    for name, d in zip(names, dims_list, strict=True):
+    for name, d, od in zip(names, dims_list, oriented_dims, strict=True):
         orig = f"{d[0]:.2f} x {d[1]:.2f} x {d[2]:.2f}"
-        sd = tuple(x * s_best for x in d)
+        sd = tuple(x * s_best for x in od)
         scaled = f"{sd[0]:.2f} x {sd[1]:.2f} x {sd[2]:.2f}"
         table.add_row(name, orig, scaled)
     console.print(table)
@@ -188,13 +207,12 @@ def run_autopack(args: AutopackRunArgs) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Apply orientation transform + scale; export_plate_stl handles translation to origin.
     scaled_meshes: list[trimesh.Trimesh] = []
-    for m in meshes:
+    for m, t4 in zip(meshes, orient_transforms, strict=True):
         s = m.copy()
+        s.apply_transform(t4)
         s.apply_scale(s_best)
-        s.apply_translation(
-            [-float(s.bounds[0][0]), -float(s.bounds[0][1]), -float(s.bounds[0][2])]
-        )
         scaled_meshes.append(s)
 
     out_stl = args.output_dir / "autopack_plate.stl"
