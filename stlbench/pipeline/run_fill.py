@@ -11,7 +11,7 @@ from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
-from stlbench.export.plate import _ROT_Z_90, mesh_footprint_xy
+from stlbench.export.plate import _ROT_Z_90, _write_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
@@ -171,8 +171,8 @@ def run_fill(args: FillRunArgs) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    placed: list[trimesh.Trimesh] = []
-    for r in plate.rects:
+    fill_objects: list[tuple[str, trimesh.Trimesh]] = []
+    for i, r in enumerate(plate.rects):
         m = mesh.copy()
         m.apply_translation(
             [-float(m.bounds[0][0]), -float(m.bounds[0][1]), -float(m.bounds[0][2])]
@@ -181,12 +181,11 @@ def run_fill(args: FillRunArgs) -> int:
             m.apply_transform(_ROT_Z_90)
             m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
         m.apply_translation([r.x, r.y, 0.0])
-        placed.append(m)
+        fill_objects.append((f"copy_{i:02d}", m))
 
-    combined = trimesh.util.concatenate(placed)
-    out_stl = args.output_dir / "fill_plate.stl"
+    out_3mf = args.output_dir / "fill_plate.3mf"
     out_json = args.output_dir / "fill_plate.json"
-    combined.export(out_stl)
+    _write_3mf(out_3mf, fill_objects)
 
     manifest = {
         "source": inp.name,
@@ -207,6 +206,6 @@ def run_fill(args: FillRunArgs) -> int:
     }
     out_json.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    console.print(f"Wrote {out_stl}  ({n} copies)")
+    console.print(f"Wrote {out_3mf}  ({n} copies)")
     console.print(f"Wrote {out_json}")
     return 0

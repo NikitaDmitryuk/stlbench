@@ -8,7 +8,7 @@ import trimesh
 from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
-from stlbench.export.plate import export_plate_stl, mesh_footprint_xy
+from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import int_bin_dims_mm, pack_rectangles_on_plates
 from stlbench.packing.shelf import build_packable_parts, greedy_shelf_plates
@@ -124,8 +124,8 @@ def run_layout(args: LayoutRunArgs) -> int:
         return 0
 
     for pl in plates:
-        out_stl = args.output_dir / f"plate_{pl.index + 1:02d}.stl"
+        out_3mf = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
         out_js = args.output_dir / f"plate_{pl.index + 1:02d}.json"
-        export_plate_stl(oriented_meshes, pl, out_stl, out_js)
-        console.print(f"Wrote {out_stl}")
+        export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
+        console.print(f"Wrote {out_3mf}")
     return 0
