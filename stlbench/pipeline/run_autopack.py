@@ -11,7 +11,7 @@ from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
-from stlbench.export.plate import export_plate_stl
+from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
@@ -215,9 +215,9 @@ def run_autopack(args: AutopackRunArgs) -> int:
         s.apply_scale(s_best)
         scaled_meshes.append(s)
 
-    out_stl = args.output_dir / "autopack_plate.stl"
+    out_3mf = args.output_dir / "autopack_plate.3mf"
     out_json = args.output_dir / "autopack_plate.json"
-    export_plate_stl(scaled_meshes, plate, out_stl, out_json)
-    console.print(f"Wrote {out_stl}")
+    export_plate_3mf(scaled_meshes, plate, out_3mf, names=list(names), out_manifest=out_json)
+    console.print(f"Wrote {out_3mf}")
     console.print(f"Wrote {out_json}")
     return 0
