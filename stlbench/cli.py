@@ -10,16 +10,82 @@ from typing import Annotated
 import typer
 
 from stlbench.config.loader import load_app_settings
+from stlbench.config.sample_config import render_sample_config_toml
 from stlbench.pipeline.run_autopack import AutopackRunArgs, run_autopack
 from stlbench.pipeline.run_fill import FillRunArgs, run_fill
 from stlbench.pipeline.run_info import InfoRunArgs, run_info
 from stlbench.pipeline.run_layout import LayoutRunArgs, run_layout
 from stlbench.pipeline.run_scale import ScaleRunArgs, run_scale
 
-app = typer.Typer(
-    no_args_is_help=True,
-    help="STL preparation for resin 3D printing: scale, layout, fill, autopack, info.",
-)
+_ROOT_HELP = """\
+STL preparation for resin 3D printing: scale, layout, fill, autopack, info.
+
+Typical commands (adjust paths and my_printer.toml):
+
+\b
+  # Printer profile — edit width_mm / depth_mm / height_mm for your machine
+  stlbench config init -o my_printer.toml
+
+  # Inspect parts: dimensions, fit, suggested scale, fill estimate
+  stlbench info -i ./parts -c my_printer.toml
+
+  # Scale all STLs to fit the build volume
+  stlbench scale -i ./parts -o ./scaled -c my_printer.toml
+
+  # Pack scaled parts onto build plates
+  stlbench layout -i ./scaled -o ./plates -c my_printer.toml
+
+  # Scale + pack so everything fits on one plate (if possible)
+  stlbench autopack -i ./parts -o ./packed -c my_printer.toml
+
+  # Fill the bed with copies of one STL (--scale fits part first, then packs)
+  stlbench fill -i ./one_part.stl -o ./filled -c my_printer.toml --scale
+
+  # Voxel hollow shell (optional) — needs [hollow] in TOML and --hollow
+  stlbench scale -i ./parts -o ./scaled -c my_printer.toml --hollow
+
+  # No config file: build volume as three numbers in mm (Px, Py, Pz)
+  stlbench scale -i ./parts -o ./scaled -p "153.36,77.76,165"
+"""
+
+app = typer.Typer(no_args_is_help=True, help=_ROOT_HELP)
+
+config_app = typer.Typer(help="Generate TOML configuration files.")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("init")
+def cmd_config_init(
+    output: Annotated[
+        Path,
+        typer.Option(
+            "-o",
+            "--output",
+            help="Path to write (default: stlbench.toml in the current directory).",
+        ),
+    ] = Path("stlbench.toml"),
+    stdout: Annotated[
+        bool, typer.Option("--stdout", help="Print TOML to stdout; do not write a file.")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("-f", "--force", help="Overwrite an existing file.")
+    ] = False,
+) -> None:
+    text = render_sample_config_toml()
+    if stdout:
+        typer.echo(text, nl=False)
+        raise typer.Exit(0)
+    if output.exists() and not force:
+        typer.secho(
+            f"File already exists: {output}  (use --force to overwrite)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+    typer.echo(f"Wrote {output.resolve()}")
+    raise typer.Exit(0)
 
 
 def _parse_printer_opt(value: str | None) -> tuple[float, float, float] | None:
@@ -28,7 +94,7 @@ def _parse_printer_opt(value: str | None) -> tuple[float, float, float] | None:
     parts = re.split(r"[\s,xX]+", str(value).strip())
     nums = [float(p) for p in parts if p]
     if len(nums) != 3:
-        raise typer.BadParameter("Нужно ровно три числа: Px Py Pz или Px,Py,Pz.")
+        raise typer.BadParameter("Need exactly three numbers: Px Py Pz or Px,Py,Pz.")
     return nums[0], nums[1], nums[2]
 
 
@@ -48,11 +114,17 @@ def cmd_scale(
         typer.Option(
             "--printer",
             "-p",
-            help="Три числа: например 153.36,77.76,165",
+            help="Three numbers, e.g. 153.36,77.76,165",
         ),
     ] = None,
     margin: Annotated[float | None, typer.Option("--margin")] = None,
-    supports_scale: Annotated[float | None, typer.Option("--supports-scale")] = None,
+    post_fit_scale: Annotated[
+        float | None,
+        typer.Option(
+            "--post-fit-scale",
+            help="Multiplier after geometry fit (TOML: scaling.post_fit_scale).",
+        ),
+    ] = None,
     method: Annotated[str | None, typer.Option("--method")] = None,
     orientation: Annotated[str | None, typer.Option("--orientation")] = None,
     rotation_samples: Annotated[int | None, typer.Option("--rotation-samples")] = None,
@@ -60,7 +132,6 @@ def cmd_scale(
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     suffix: Annotated[str, typer.Option("--suffix", show_default=False)] = "",
-    no_packing_report: Annotated[bool, typer.Option("--no-packing-report")] = False,
     hollow: Annotated[bool | None, typer.Option("--hollow/--no-hollow")] = None,
 ) -> None:
     st = load_app_settings(config) if config else None
@@ -74,7 +145,7 @@ def cmd_scale(
                 settings=st,
                 printer_xyz=pr,
                 margin=margin,
-                supports_scale=supports_scale,
+                post_fit_scale=post_fit_scale,
                 method=method,
                 orientation=orientation,
                 rotation_samples=rotation_samples,
@@ -82,7 +153,6 @@ def cmd_scale(
                 dry_run=dry_run,
                 recursive=recursive,
                 suffix=suffix,
-                no_packing_report=no_packing_report,
                 hollow_override=hollow,
             )
         )
@@ -180,7 +250,13 @@ def cmd_autopack(
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
     margin: Annotated[float | None, typer.Option("--margin")] = None,
-    supports_scale: Annotated[float | None, typer.Option("--supports-scale")] = None,
+    post_fit_scale: Annotated[
+        float | None,
+        typer.Option(
+            "--post-fit-scale",
+            help="Multiplier after geometry fit (TOML: scaling.post_fit_scale).",
+        ),
+    ] = None,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
@@ -194,7 +270,7 @@ def cmd_autopack(
                 printer_xyz=pr,
                 gap_mm=gap_mm,
                 margin=margin,
-                supports_scale=supports_scale,
+                post_fit_scale=post_fit_scale,
                 dry_run=dry_run,
                 recursive=recursive,
             )
@@ -233,18 +309,24 @@ def cmd_info(
 
 @app.command("hollow")
 def cmd_hollow_info() -> None:
-    typer.echo("Configure [hollow] section in TOML and run: stlbench scale ... --hollow")
-
-
-@app.command("supports")
-def cmd_supports_info() -> None:
     typer.echo(
-        "Supports are not generated by stlbench. Open exported STL in Lychee, Chitubox or another slicer."
+        "Hollowing runs only with: stlbench scale ... -c your.toml --hollow "
+        "(set [hollow] wall_thickness_mm and voxel_mm in the TOML)."
     )
 
 
 _KNOWN_COMMANDS = frozenset(
-    {"scale", "layout", "fill", "autopack", "info", "hollow", "supports", "-h", "--help"}
+    {
+        "scale",
+        "layout",
+        "fill",
+        "autopack",
+        "info",
+        "hollow",
+        "config",
+        "-h",
+        "--help",
+    }
 )
 
 

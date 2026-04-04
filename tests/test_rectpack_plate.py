@@ -17,8 +17,8 @@ def test_pack_two_rects_one_plate():
 
 
 def test_pack_mixed_oversized_raises_clear_error():
-    """Непомещающиеся детали не должны ломать rectpack (len==0); даём понятную ошибку."""
-    with pytest.raises(RuntimeError, match="ни одна из оставшихся"):
+    """Oversized parts should not leave rectpack with an empty bin; expect a clear error."""
+    with pytest.raises(RuntimeError, match="none of the remaining"):
         pack_rectangles_on_plates(
             [(300.0, 10.0), (5.0, 5.0)],
             bed_w=100.0,
@@ -29,7 +29,7 @@ def test_pack_mixed_oversized_raises_clear_error():
 
 
 def test_pack_rect_needs_rotation():
-    """Деталь 10×90 на столе 100×50: влезает только повёрнутой (90×10 → 10 по Y ≤ 50)."""
+    """Part 10x90 on 100x50 bed: fits only when rotated to 90x10 (10 along Y <= 50)."""
     plates = pack_rectangles_on_plates(
         [(10.0, 90.0)],
         bed_w=100.0,

@@ -46,6 +46,29 @@ def s_max_for_part_conservative(p_min: float, dx: float, dy: float, dz: float) -
     return p_min / dmax
 
 
+def s_max_for_part_printer_axes(
+    px: float, py: float, pz: float, ex: float, ey: float, ez: float
+) -> tuple[float, str]:
+    """
+    Largest uniform scale *s* such that the axis-aligned AABB (ex,ey,ez) fits the
+    printer box (px,py,pz): build height along *pz*/*ez*, and the XY footprint may
+    be rotated 90° on the bed (swap which extent aligns with X vs Y).
+    """
+    _require_positive_dims((ex, ey, ez), "Part")
+    s_z = pz / ez
+    s_a = min(px / ex, py / ey)
+    s_b = min(px / ey, py / ex)
+    s_xy = max(s_a, s_b)
+    s_full = min(s_xy, s_z)
+    eps = 1e-9
+    xy_label = "xy_bed_swapped" if abs(s_xy - s_b) < eps and s_b >= s_a - eps else "xy_bed"
+    if s_z < s_xy - eps:
+        return s_full, "z_build_height"
+    if s_xy < s_z - eps:
+        return s_full, xy_label
+    return s_full, f"{xy_label}_and_z"
+
+
 @dataclass(frozen=True)
 class PartScaleReport:
     name: str
@@ -66,6 +89,12 @@ def compute_global_scale(
     method: Method,
     file_dims: list[tuple[float, float, float]] | None = None,
 ) -> tuple[float, list[PartScaleReport]]:
+    """Uniform scale across parts.
+
+    For ``method="sorted"``, each ``parts_dims`` triple is **(dx, dy, dz) along printer
+    X, Y, Z** (build height along Z). The per-part limit allows a 90° rotation of the
+    XY footprint on the bed (see ``s_max_for_part_printer_axes``).
+    """
     if len(parts_dims) != len(part_names):
         raise ValueError("parts_dims and part_names length mismatch.")
     if not parts_dims:
@@ -81,21 +110,10 @@ def compute_global_scale(
     limits: list[float] = []
 
     if method == "sorted":
-        p_sorted = tuple(sorted((px, py, pz)))
         for i, (name, dims) in enumerate(zip(part_names, parts_dims, strict=True)):
             _require_positive_dims(dims, name)
-            d_sorted = tuple(sorted(dims))
-            s1 = p_sorted[0] / d_sorted[0]
-            s2 = p_sorted[1] / d_sorted[1]
-            s3 = p_sorted[2] / d_sorted[2]
-            s_lim = min(s1, s2, s3)
+            s_lim, axis = s_max_for_part_printer_axes(px, py, pz, *dims)
             limits.append(s_lim)
-            if s_lim == s1:
-                axis = "shortest_part_vs_shortest_printer"
-            elif s_lim == s2:
-                axis = "mid_part_vs_mid_printer"
-            else:
-                axis = "longest_part_vs_longest_printer"
             fx = fy = fz = None
             if file_dims is not None:
                 fx, fy, fz = file_dims[i]

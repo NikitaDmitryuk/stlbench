@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import trimesh
 
+from stlbench.core.fit import Method, s_max_for_part_conservative, s_max_for_part_printer_axes
 from stlbench.core.orientation import (
     _random_rotation_matrix,
     aabb_extents_after_rotation,
@@ -12,7 +13,7 @@ from stlbench.packing.rectpack_plate import footprint_fits_bin_mm
 
 
 def _axis_perm_4x4_list() -> list[np.ndarray]:
-    """6 жёстких перестановок осей (какой размер AABB идёт в Z принтера, какие в X/Y)."""
+    """Six rigid axis permutations (which AABB extent maps to printer Z vs X/Y)."""
     i4 = np.eye(4, dtype=np.float64)
     x_up = np.array(
         [
@@ -64,15 +65,14 @@ def select_layout_transform(
     seed: int = 0,
 ) -> tuple[bool, np.ndarray, float, float]:
     """
-    Ищет ориентацию для печати: после поворота размеры AABB по осям принтера (X,Y,Z)
-    должны укладываться в стол и Pz — с **перестановкой**, какая ось какому размеру принтера
-    соответствует (согласовано с sorted-fit при расчёте масштаба).
+    Find a print orientation: after rotation, printer-axis AABB (X,Y,Z) must fit the bed
+    and Pz, allowing **axis permutation** (which model axis maps to which printer extent).
+    Chooses the smallest XY footprint among valid orientations (for packing).
 
-    Для каждого базового поворота SO(3) (тождество + ``random_samples`` выборок, тот же RNG,
-    что в конфиге) перебираются 6 перестановок осей ``P @ R``.
+    For each base SO(3) rotation (identity plus ``random_samples`` draws, same RNG idea as
+    scale) try six axis permutations ``P @ R``.
 
-    Возвращает (успех, T 4×4, ширина по X стола, глубина по Y стола) — в финальных координатах
-    принтера Z вверх, слои по Z.
+    Returns (ok, 4x4 transform, bed X width, bed Y depth) in printer coordinates (Z up).
     """
     verts = mesh_vertices_for_orientation(mesh)
     rng = np.random.default_rng(seed)
@@ -101,3 +101,51 @@ def select_layout_transform(
         return False, np.eye(4, dtype=np.float64), 0.0, 0.0
     _area, t, fw, fh = best
     return True, t, fw, fh
+
+
+def select_orientation_for_scale(
+    mesh: trimesh.Trimesh,
+    px: float,
+    py: float,
+    pz: float,
+    method: Method,
+    *,
+    random_samples: int = 4096,
+    seed: int = 0,
+) -> tuple[np.ndarray, tuple[float, float, float]]:
+    """
+    Same rotation/permutation search space as ``select_layout_transform`` (``P @ R``),
+    but pick the candidate that **maximizes** the per-part scale limit in printer
+    coordinates (``s_max_for_part_printer_axes`` for ``sorted``, conservative
+    formula for ``conservative``). Tie-break: smaller XY footprint ``ex * ey``.
+    """
+    verts = mesh_vertices_for_orientation(mesh)
+    rng = np.random.default_rng(seed)
+    perms = _perm_3x3_list()
+
+    best_key: tuple[float, float] | None = None
+    best_t4: np.ndarray | None = None
+    best_ext: tuple[float, float, float] | None = None
+
+    bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
+    for _ in range(max(0, random_samples)):
+        bases.append(_random_rotation_matrix(rng))
+
+    p_min = min(px, py, pz)
+    for r in bases:
+        for p in perms:
+            r_tot = p @ r
+            ex, ey, ez = aabb_extents_after_rotation(verts, r_tot)
+            if method == "sorted":
+                sc, _ = s_max_for_part_printer_axes(px, py, pz, ex, ey, ez)
+            else:
+                sc = s_max_for_part_conservative(p_min, ex, ey, ez)
+            area = ex * ey
+            key = (-sc, area)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_t4 = _rotation_to_4x4(r_tot)
+                best_ext = (ex, ey, ez)
+
+    assert best_t4 is not None and best_ext is not None
+    return best_t4, best_ext

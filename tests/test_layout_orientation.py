@@ -6,9 +6,8 @@ from stlbench.packing.layout_orientation import select_layout_transform
 
 def test_orientation_fits_only_with_axis_swap():
     """
-    Коробка 30×100×10 мм (x,y,z): лежа на узкой стороне высота 10, след 30×100;
-    100 > глубина стола 78 — не влезает. Сторона Y вверх: высота 100 — слишком для pz.
-    Сторона X вверх: высота 30, след 10×100 — вдоль X 100, Y 10 — влезает в 153×78.
+    Box 30x100x10 mm (x,y,z): default pose height 10, footprint 30x100; 100 > bed depth 78.
+    Y-up: height 100 exceeds pz. X-up: height 30, footprint 10x100 along X/Y fits 153x78.
     """
     mesh = trimesh.creation.box(extents=[30.0, 100.0, 10.0])
     ok, t, fw, fh = select_layout_transform(mesh, bed_x=153.0, bed_y=78.0, pz=50.0, gap_mm=2.0)
@@ -24,7 +23,7 @@ def test_orientation_fits_only_with_axis_swap():
 
 
 def test_footprint_swap_on_narrow_bed():
-    """После ориентации длинная сторона вдоль X стола (swap в footprint_fits_bin_mm)."""
+    """Long edge ends up along bed X (axis swap inside footprint_fits_bin_mm)."""
     mesh = trimesh.creation.box(extents=[20.0, 90.0, 15.0])
     ok, _, fw, fh = select_layout_transform(mesh, bed_x=153.0, bed_y=78.0, pz=80.0, gap_mm=1.0)
     assert ok

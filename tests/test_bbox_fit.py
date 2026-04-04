@@ -5,6 +5,7 @@ from stlbench.core.fit import (
     compute_global_scale,
     printer_dims_with_margin,
     s_max_for_part_conservative,
+    s_max_for_part_printer_axes,
     s_max_for_part_sorted,
 )
 
@@ -59,6 +60,30 @@ def test_compute_global_scale_conservative():
 
 def test_s_max_for_part_conservative():
     assert s_max_for_part_conservative(12.0, 2.0, 3.0, 4.0) == pytest.approx(3.0)
+
+
+def test_s_max_for_part_printer_axes_z_limits():
+    # Build height ez exceeds pz until scaled; XY is small on the bed.
+    s, hint = s_max_for_part_printer_axes(100.0, 100.0, 50.0, 2.0, 2.0, 100.0)
+    assert s == pytest.approx(0.5)
+    assert hint == "z_build_height"
+
+
+def test_s_max_for_part_printer_axes_xy_swap():
+    # Long edge along Y in printer frame; 90° bed swap uses X for the long edge.
+    s, hint = s_max_for_part_printer_axes(100.0, 100.0, 50.0, 2.0, 100.0, 2.0)
+    assert s == pytest.approx(1.0)
+    assert hint == "xy_bed_swapped"
+
+
+def test_compute_global_scale_sorted_uses_printer_axes():
+    s, _ = compute_global_scale(
+        (100.0, 100.0, 50.0),
+        [(2.0, 2.0, 100.0)],
+        ["tall_z"],
+        "sorted",
+    )
+    assert s == pytest.approx(0.5)
 
 
 def test_compute_global_scale_empty():

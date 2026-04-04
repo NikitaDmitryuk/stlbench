@@ -16,7 +16,11 @@ def test_box_scale_matches_formula():
     scaled = box.copy()
     scaled.apply_scale(s)
     new_dims = aabb_edge_lengths(np.asarray(scaled.bounds))
-    p_sorted = sorted((20.0, 30.0, 40.0))
+    px, py, pz = (20.0, 30.0, 40.0)
+    assert new_dims[0] <= px + 1e-5
+    assert new_dims[1] <= py + 1e-5
+    assert new_dims[2] <= pz + 1e-5
+    p_sorted = sorted((px, py, pz))
     d_sorted = sorted(new_dims)
     assert d_sorted[0] <= p_sorted[0] + 1e-5
     assert d_sorted[1] <= p_sorted[1] + 1e-5

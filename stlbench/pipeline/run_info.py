@@ -7,6 +7,7 @@ import numpy as np
 from rich.console import Console
 from rich.table import Table
 
+from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
 from stlbench.pipeline.common import load_named_meshes, resolve_printer, resolve_settings
 from stlbench.pipeline.run_fill import _max_copies_on_plate
@@ -37,7 +38,7 @@ def run_info(args: InfoRunArgs) -> int:
 
     margin = st.scaling.bed_margin if st else 0.0
     epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
-    gap = st.packing.gap_mm if st else 2.0
+    gap = st.packing.gap_mm if st else DEFAULT_PACKING_GAP_MM
 
     if st and st.printer.name:
         console.print(f"Printer: {st.printer.name}")
@@ -90,8 +91,8 @@ def run_info(args: InfoRunArgs) -> int:
     if len(dims_list) > 1:
         console.print()
         s_all, _ = compute_global_scale((epx, epy, epz), dims_list, names, "sorted")
-        supports = st.scaling.supports_scale if st else 1.0
+        pf = st.scaling.post_fit_scale if st else 1.0
         console.print(f"Global scale (all parts fit individually): {s_all:.6f}")
-        console.print(f"With supports_scale ({supports}): {s_all * supports:.6f}")
+        console.print(f"With post_fit_scale ({pf}): {s_all * pf:.6f}")
 
     return 0

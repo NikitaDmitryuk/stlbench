@@ -6,6 +6,7 @@ import numpy as np
 import trimesh
 from rich.console import Console
 
+from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import AppSettings
 from stlbench.pipeline.mesh_io import collect_stl_paths, load_mesh
@@ -20,7 +21,7 @@ def resolve_printer(
     if settings is not None:
         p = settings.printer
         return p.width_mm, p.depth_mm, p.height_mm
-    raise ValueError("Укажите printer или --config с [printer].")
+    raise ValueError("Set --printer Px,Py,Pz or use --config with a [printer] section.")
 
 
 def resolve_settings(config_path: Path | None) -> AppSettings | None:
@@ -34,14 +35,12 @@ def resolve_gap(gap_mm: float | None, settings: AppSettings | None) -> float:
         return float(gap_mm)
     if settings is not None:
         return settings.packing.gap_mm
-    return 2.0
+    return DEFAULT_PACKING_GAP_MM
 
 
-def resolve_algorithm(algorithm: str | None, settings: AppSettings | None) -> str:
+def resolve_algorithm(algorithm: str | None, _settings: AppSettings | None) -> str:
     if algorithm is not None:
         return algorithm
-    if settings is not None:
-        return settings.packing.algorithm
     return "rectpack"
 
 

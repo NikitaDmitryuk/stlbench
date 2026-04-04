@@ -8,6 +8,11 @@ import trimesh
 from rich.console import Console
 from rich.table import Table
 
+from stlbench.config.defaults import (
+    ORIENTATION_MODE_DEFAULT,
+    ORIENTATION_SAMPLES_DEFAULT,
+    ORIENTATION_SEED_DEFAULT,
+)
 from stlbench.config.schema import AppSettings
 from stlbench.core.fit import (
     Method,
@@ -16,14 +21,9 @@ from stlbench.core.fit import (
     limiting_part_index,
     printer_dims_with_margin,
 )
-from stlbench.core.orientation import (
-    best_orientation_for_conservative_fit,
-    best_orientation_for_sorted_fit,
-    mesh_vertices_for_orientation,
-)
 from stlbench.hollow.voxel_shell import hollow_mesh_voxel_shell
-from stlbench.packing.shelf import build_packable_parts, greedy_shelf_plates
-from stlbench.pipeline.common import load_named_meshes, resolve_printer, rotation_to_4x4
+from stlbench.packing.layout_orientation import select_orientation_for_scale
+from stlbench.pipeline.common import load_named_meshes, resolve_printer
 
 
 @dataclass
@@ -34,7 +34,7 @@ class ScaleRunArgs:
     settings: AppSettings | None
     printer_xyz: tuple[float, float, float] | None
     margin: float | None
-    supports_scale: float | None
+    post_fit_scale: float | None
     method: str | None
     orientation: str | None
     rotation_samples: int | None
@@ -42,7 +42,6 @@ class ScaleRunArgs:
     dry_run: bool
     recursive: bool
     suffix: str
-    no_packing_report: bool
     hollow_override: bool | None
 
 
@@ -61,29 +60,21 @@ def run_scale(args: ScaleRunArgs) -> int:
         if args.margin is not None
         else (st.scaling.bed_margin if st is not None else 0.0)
     )
-    supports_scale = (
-        float(args.supports_scale)
-        if args.supports_scale is not None
-        else (st.scaling.supports_scale if st is not None else 1.0)
+    post_fit_scale = (
+        float(args.post_fit_scale)
+        if args.post_fit_scale is not None
+        else (st.scaling.post_fit_scale if st is not None else 1.0)
     )
 
     method_s: Method = args.method or "sorted"  # type: ignore[assignment]
-    orient: str
-    if st is not None and args.orientation is None:
-        orient = st.orientation.mode
-    elif args.orientation is not None:
-        orient = args.orientation
-    else:
-        orient = "axis"
+    orient = args.orientation if args.orientation is not None else ORIENTATION_MODE_DEFAULT
 
-    if args.rotation_samples is not None:
-        rot_samples = int(args.rotation_samples)
-    elif st is not None:
-        rot_samples = st.orientation.samples
-    else:
-        rot_samples = 2048
-
-    seed = st.orientation.seed if st else 0
+    rot_samples = (
+        int(args.rotation_samples)
+        if args.rotation_samples is not None
+        else ORIENTATION_SAMPLES_DEFAULT
+    )
+    seed = ORIENTATION_SEED_DEFAULT
 
     input_dir = args.input_dir
     output_dir = args.output_dir
@@ -97,14 +88,12 @@ def run_scale(args: ScaleRunArgs) -> int:
     paths, _loaded_names, _loaded_meshes = loaded
 
     px, py, pz = printer_dims_with_margin(prx, pry, prz, margin)
-    p_sorted_calc: tuple[float, float, float] = tuple(sorted((px, py, pz)))  # type: ignore[assignment]
 
     part_names: list[str] = list(_loaded_names)
     meshes: list[trimesh.Trimesh] = list(_loaded_meshes)
     parts_dims: list[tuple[float, float, float]] = []
     file_dims: list[tuple[float, float, float]] = []
-    rotations: list[np.ndarray] = []
-    rng = np.random.default_rng(seed)
+    transforms: list[np.ndarray] = []
 
     for mesh in meshes:
         fb = np.asarray(mesh.bounds)
@@ -112,28 +101,20 @@ def run_scale(args: ScaleRunArgs) -> int:
         file_dims.append(file_d)
 
         if orient == "free":
-            verts = mesh_vertices_for_orientation(mesh)
-            if method_s == "sorted":
-                res = best_orientation_for_sorted_fit(
-                    verts,
-                    p_sorted_calc,
-                    rot_samples,
-                    rng,
-                    identity_baseline=file_d,
-                )
-            else:
-                res = best_orientation_for_conservative_fit(
-                    verts,
-                    min(px, py, pz),
-                    rot_samples,
-                    rng,
-                    identity_baseline=file_d,
-                )
-            parts_dims.append(res.extents)
-            rotations.append(res.rotation)
+            t4, ext = select_orientation_for_scale(
+                mesh,
+                px,
+                py,
+                pz,
+                method_s,
+                random_samples=rot_samples,
+                seed=seed,
+            )
+            parts_dims.append(ext)
+            transforms.append(t4)
         else:
             parts_dims.append(file_d)
-            rotations.append(np.eye(3, dtype=np.float64))
+            transforms.append(np.eye(4, dtype=np.float64))
 
     file_dims_for_report = list(file_dims) if orient == "free" else None
 
@@ -150,21 +131,14 @@ def run_scale(args: ScaleRunArgs) -> int:
         return 1
 
     s_after = min(1.0, s_max) if args.no_upscale else s_max
-    s_final = s_after * supports_scale
+    s_final = s_after * post_fit_scale
     lim_i = limiting_part_index(reports, s_max)
     limiter = reports[lim_i].name
 
-    hollow_on = (
-        (st.hollow.enabled if st else False)
-        if args.hollow_override is None
-        else args.hollow_override
-    )
-    if hollow_on and st and st.hollow.backend == "none":
-        console.print("[yellow]hollow.enabled but backend=none; skipping hollow.[/yellow]")
-        hollow_on = False
+    hollow_on = args.hollow_override is True
     if hollow_on and st is None:
         console.print(
-            "[red]Для --hollow укажите --config с секцией [hollow] (толщина, voxel).[/red]"
+            "[red]For --hollow use --config with a [hollow] section (wall_thickness_mm, voxel_mm).[/red]"
         )
         return 2
 
@@ -175,10 +149,10 @@ def run_scale(args: ScaleRunArgs) -> int:
     if orient == "free":
         console.print(f"Rotation samples: {rot_samples}, seed: {seed}")
     console.print(f"s_max (geometry fit): {s_max:.6f}")
-    console.print(f"supports_scale: {supports_scale:.6f}")
+    console.print(f"post_fit_scale: {post_fit_scale:.6f}")
     console.print(f"s_final (applied): {s_final:.6f}")
     if args.no_upscale:
-        console.print("(capped by --no-upscale before supports_scale)")
+        console.print("(capped by --no-upscale before post_fit_scale)")
     console.print(f"Limiting part: {limiter}")
 
     table = Table(show_header=True, header_style="bold")
@@ -206,29 +180,6 @@ def run_scale(args: ScaleRunArgs) -> int:
         table.add_row(*row)
     console.print(table)
 
-    packing_report = True
-    if args.no_packing_report:
-        packing_report = False
-    elif st is not None:
-        packing_report = st.packing.report
-
-    if packing_report:
-        console.print()
-        console.print("Группировка по столу (эвристика): наименьшее ребро AABB → Z; полки по XY.")
-        scaled_dims = [(r.dx * s_final, r.dy * s_final, r.dz * s_final) for r in reports]
-        packable, too_tall = build_packable_parts(
-            [r.name for r in reports], scaled_dims, px, py, pz
-        )
-        if too_tall:
-            console.print("Не помещаются по высоте/основанию (после s_final):")
-            for n in too_tall:
-                console.print(f"  - {n}")
-        plates = greedy_shelf_plates(packable, px, py)
-        if not plates and not too_tall:
-            console.print("Нет деталей для группировки.")
-        for i, group in enumerate(plates, start=1):
-            console.print(f"Пластина {i}: {', '.join(group)}")
-
     if args.dry_run:
         return 0
 
@@ -246,13 +197,13 @@ def run_scale(args: ScaleRunArgs) -> int:
         out_path = out_dir / f"{stem}.stl"
         scaled = mesh.copy()
 
-        rot = rotations[idx]
-        if not np.allclose(rot, np.eye(3)):
-            scaled.apply_transform(rotation_to_4x4(rot))
+        t4 = transforms[idx]
+        if not np.allclose(t4, np.eye(4)):
+            scaled.apply_transform(t4)
 
         scaled.apply_scale(s_final)
 
-        if hollow_on and st and st.hollow.backend == "open3d_voxel":
+        if hollow_on and st:
             try:
                 scaled = hollow_mesh_voxel_shell(
                     scaled,

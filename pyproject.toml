@@ -20,7 +20,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Graphics :: 3D Modeling",
     "Topic :: Scientific/Engineering",
 ]
@@ -29,13 +28,12 @@ dependencies = [
     "pydantic>=2.0,<3",
     "rectpack>=0.2.2",
     "rich>=13.0",
+    "scipy>=1.9,<1.17; python_version < '3.11'",
+    "scipy>=1.17; python_version >= '3.11'",
     "tomli>=1.1; python_version < '3.11'",
     "trimesh>=3.21",
     "typer>=0.9",
 ]
-
-[project.optional-dependencies]
-hollow = ["scipy>=1.9"]
 
 [project.urls]
 Homepage = "https://github.com/NikitaDmitryuk/stlbench"

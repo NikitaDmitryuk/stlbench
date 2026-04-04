@@ -8,6 +8,7 @@ from stlbench.core.fit import (
     limiting_part_index,
     printer_dims_with_margin,
     s_max_for_part_conservative,
+    s_max_for_part_printer_axes,
     s_max_for_part_sorted,
 )
 from stlbench.core.orientation import (
@@ -24,6 +25,7 @@ __all__ = [
     "limiting_part_index",
     "printer_dims_with_margin",
     "s_max_for_part_conservative",
+    "s_max_for_part_printer_axes",
     "s_max_for_part_sorted",
     "best_aabb_extents_for_conservative_fit",
     "best_aabb_extents_for_sorted_fit",
