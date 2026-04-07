@@ -46,7 +46,7 @@ def _max_copies_on_plate(
     gap_mm: float,
 ) -> PackedPlate | None:
     """Pack as many identical rectangles (fw x fh) as possible onto one bin."""
-    bw, bh = int_bin_dims_mm(bed_w, bed_h)
+    bw, bh = int_bin_dims_mm(bed_w, bed_h, gap_mm)
     rw, rh = int_rect_dims_mm(fw, fh, gap_mm)
 
     if not footprint_fits_bin_mm(fw, fh, bed_w, bed_h, gap_mm):
@@ -82,10 +82,10 @@ def _max_copies_on_plate(
             placed.append(
                 PackedRect(
                     part_index=0,
-                    x=float(r.x) + gap_mm,
-                    y=float(r.y) + gap_mm,
-                    width=float(r.width) - 2 * gap_mm,
-                    height=float(r.height) - 2 * gap_mm,
+                    x=float(r.x),
+                    y=float(r.y),
+                    width=float(r.width) - gap_mm,
+                    height=float(r.height) - gap_mm,
                     rotated=was_rotated,
                 )
             )

@@ -21,20 +21,33 @@ class PackedPlate:
     rects: tuple[PackedRect, ...]
 
 
-def int_bin_dims_mm(bed_w: float, bed_h: float) -> tuple[int, int]:
-    return max(1, int(round(bed_w))), max(1, int(round(bed_h)))
+def int_bin_dims_mm(bed_w: float, bed_h: float, gap_mm: float = 0.0) -> tuple[int, int]:
+    """Convert bed dimensions to integer pixel units, adding one gap to each axis.
+
+    The extra ``gap_mm`` on each axis is the "trailing" gap budget: a model that
+    exactly fills the bed (fw == bed_w) still has room for its trailing-edge gap,
+    so the bin needs to be ``bed_w + gap_mm`` wide.
+    """
+    return max(1, int(round(bed_w + gap_mm))), max(1, int(round(bed_h + gap_mm)))
 
 
 def int_rect_dims_mm(fw: float, fh: float, gap_mm: float) -> tuple[int, int]:
-    g = gap_mm
+    """Rectangle size including one trailing gap on each axis.
+
+    The gap is added only to the *trailing* side of each rectangle.  When two
+    rectangles are packed adjacent to each other the trailing gap of the first
+    becomes the space between them, giving exactly ``gap_mm`` clearance between
+    any two parts.  At the leading edge (bin boundary) no gap is consumed, so
+    parts can sit flush against the bed edge.
+    """
     return (
-        max(1, int(round(fw + 2 * g))),
-        max(1, int(round(fh + 2 * g))),
+        max(1, int(round(fw + gap_mm))),
+        max(1, int(round(fh + gap_mm))),
     )
 
 
 def footprint_fits_bin_mm(fw: float, fh: float, bed_w: float, bed_h: float, gap_mm: float) -> bool:
-    bw, bh = int_bin_dims_mm(bed_w, bed_h)
+    bw, bh = int_bin_dims_mm(bed_w, bed_h, gap_mm)
     w, h = int_rect_dims_mm(fw, fh, gap_mm)
     return (w <= bw and h <= bh) or (w <= bh and h <= bw)
 
@@ -73,10 +86,10 @@ def _pack_subset(
             rects.append(
                 PackedRect(
                     part_index=idx,
-                    x=float(r.x) + g,
-                    y=float(r.y) + g,
-                    width=float(r.width) - 2 * g,
-                    height=float(r.height) - 2 * g,
+                    x=float(r.x),
+                    y=float(r.y),
+                    width=float(r.width) - g,
+                    height=float(r.height) - g,
                     rotated=was_rotated,
                 )
             )

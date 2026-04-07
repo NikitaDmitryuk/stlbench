@@ -51,7 +51,7 @@ def _try_pack_all(
     gap_mm: float,
 ) -> PackedPlate | None:
     """Try to pack all footprints onto a single plate. Returns None on failure."""
-    bw, bh = int_bin_dims_mm(bed_w, bed_h)
+    bw, bh = int_bin_dims_mm(bed_w, bed_h, gap_mm)
     g = gap_mm
 
     for fw, fh in footprints:
@@ -85,10 +85,10 @@ def _try_pack_all(
         rects.append(
             PackedRect(
                 part_index=idx,
-                x=float(r.x) + g,
-                y=float(r.y) + g,
-                width=float(r.width) - 2 * g,
-                height=float(r.height) - 2 * g,
+                x=float(r.x),
+                y=float(r.y),
+                width=float(r.width) - g,
+                height=float(r.height) - g,
                 rotated=was_rotated,
             )
         )

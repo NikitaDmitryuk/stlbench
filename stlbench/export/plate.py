@@ -27,43 +27,101 @@ Target="/3D/3dmodel.model" Id="rel0"/>
 </Relationships>"""
 
 
-def _write_3mf(path: Path, objects: list[tuple[str, trimesh.Trimesh]]) -> None:
+def _mesh_to_xml(obj_id: int, name: str, mesh: trimesh.Trimesh) -> str:
+    """Serialize one mesh object to 3MF XML (vertices in local coordinates).
+
+    Vertices are kept in the mesh's own coordinate system (bounding-box min
+    at origin).  The caller is responsible for encoding any plate-level
+    placement in the ``<item transform>`` attribute.
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float32)  # float32 = 3 sig-fig in mm
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+
+    # Build vertex lines with numpy vectorisation (much faster than a Python loop)
+    v_lines = np.empty(len(verts), dtype=object)
+    xs = verts[:, 0]
+    ys = verts[:, 1]
+    zs = verts[:, 2]
+    v_lines[:] = [
+        f'<vertex x="{x:.3f}" y="{y:.3f}" z="{z:.3f}"/>' for x, y, z in zip(xs, ys, zs, strict=True)
+    ]
+
+    f_lines = np.empty(len(faces), dtype=object)
+    v1s = faces[:, 0]
+    v2s = faces[:, 1]
+    v3s = faces[:, 2]
+    f_lines[:] = [
+        f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in zip(v1s, v2s, v3s, strict=True)
+    ]
+
+    vblock = "\n          ".join(v_lines)
+    fblock = "\n          ".join(f_lines)
+
+    return (
+        f'    <object id="{obj_id}" name="{_xml_escape(name)}" type="model">\n'
+        f"      <mesh>\n"
+        f"        <vertices>\n"
+        f"          {vblock}\n"
+        f"        </vertices>\n"
+        f"        <triangles>\n"
+        f"          {fblock}\n"
+        f"        </triangles>\n"
+        f"      </mesh>\n"
+        f"    </object>"
+    )
+
+
+def _item_transform(tx: float, ty: float) -> str:
+    """3MF row-major 3×4 transform string: identity rotation + (tx, ty, 0) translation.
+
+    The mesh orientation (including any 90° Z rotation) is already baked into
+    the vertex coordinates by ``_place_rect_local``; the item transform only
+    needs to position the object on the build plate.
+
+    3MF layout: m00 m01 m02  m10 m11 m12  m20 m21 m22  tx ty tz
+    """
+    return f"1 0 0 0 1 0 0 0 1 {tx:.3f} {ty:.3f} 0"
+
+
+def _write_3mf(
+    path: Path,
+    objects: list[tuple[str, trimesh.Trimesh]],
+    item_transforms: list[tuple[float, float, bool]] | None = None,
+) -> None:
     """Write a 3MF file with one independent object per (name, mesh) pair.
+
+    Parameters
+    ----------
+    objects:
+        ``(name, mesh)`` pairs.  Each mesh should have its bounding-box minimum
+        at the origin so that the ``item_transforms`` correctly place it on the
+        build plate.
+    item_transforms:
+        Per-object ``(tx_mm, ty_mm, rotate_90)`` placement on the build plate.
+        When *None* every item gets an identity transform.
 
     Uses only stdlib (zipfile + xml) — no networkx required.
     """
-    chunks: list[str] = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<model unit="millimeter" xml:lang="en-US"'
-        ' xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">',
-        "  <resources>",
-    ]
+    parts: list[str] = []
     build_items: list[str] = []
 
     for obj_id, (name, mesh) in enumerate(objects, start=1):
-        verts = np.asarray(mesh.vertices, dtype=np.float64)
-        faces = np.asarray(mesh.faces, dtype=np.int64)
-        chunks.append(f'    <object id="{obj_id}" name="{_xml_escape(name)}" type="model">')
-        chunks.append("      <mesh>")
-        chunks.append("        <vertices>")
-        for v in verts:
-            chunks.append(f'          <vertex x="{v[0]:.6f}" y="{v[1]:.6f}" z="{v[2]:.6f}"/>')
-        chunks.append("        </vertices>")
-        chunks.append("        <triangles>")
-        for f in faces:
-            chunks.append(f'          <triangle v1="{f[0]}" v2="{f[1]}" v3="{f[2]}"/>')
-        chunks.append("        </triangles>")
-        chunks.append("      </mesh>")
-        chunks.append("    </object>")
-        build_items.append(f'    <item objectid="{obj_id}"/>')
+        parts.append(_mesh_to_xml(obj_id, name, mesh))
+        if item_transforms is not None:
+            tx, ty, _rot = item_transforms[obj_id - 1]
+            t = _item_transform(tx, ty)
+        else:
+            t = "1 0 0 0 1 0 0 0 1 0 0 0"
+        build_items.append(f'    <item objectid="{obj_id}" transform="{t}"/>')
 
-    chunks.append("  </resources>")
-    chunks.append("  <build>")
-    chunks.extend(build_items)
-    chunks.append("  </build>")
-    chunks.append("</model>")
-
-    model_xml = "\n".join(chunks).encode("utf-8")
+    model_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US"'
+        ' xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+        "  <resources>\n" + "\n".join(parts) + "\n  </resources>\n"
+        "  <build>\n" + "\n".join(build_items) + "\n  </build>\n"
+        "</model>"
+    ).encode("utf-8")
 
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml", _3MF_CONTENT_TYPES)
@@ -77,12 +135,26 @@ _ROT_Z_90 = np.array(
 )
 
 
-def _place_rect(m: trimesh.Trimesh, r: object, rot_z_90: np.ndarray) -> trimesh.Trimesh:
-    """Translate mesh to origin, optionally rotate 90° Z, then place at rect (x, y)."""
+def _place_rect_local(m: trimesh.Trimesh, r: object, rot_z_90: np.ndarray) -> trimesh.Trimesh:
+    """Move mesh so its bounding-box minimum is at the origin.
+
+    Applies 90° Z rotation when ``r.rotated`` is True, then re-centres.
+    The plate-level (x, y) translation is NOT baked in — it goes into the
+    ``<item transform>`` attribute instead.
+    """
     m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), -float(m.bounds[0][2])])
     if getattr(r, "rotated", False):
         m.apply_transform(rot_z_90)
         m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
+    return m
+
+
+def _place_rect(m: trimesh.Trimesh, r: object, rot_z_90: np.ndarray) -> trimesh.Trimesh:
+    """Translate mesh to origin, optionally rotate 90° Z, then place at rect (x, y).
+
+    Used by the legacy STL exporter where positions must be baked into vertices.
+    """
+    m = _place_rect_local(m, r, rot_z_90)
     m.apply_translation([getattr(r, "x", 0.0), getattr(r, "y", 0.0), 0.0])
     return m
 
@@ -101,13 +173,14 @@ def export_plate_3mf(
     adjust orientation per-part after import.
     """
     objects: list[tuple[str, trimesh.Trimesh]] = []
+    transforms: list[tuple[float, float, bool]] = []
     manifest_parts: list[dict[str, Any]] = []
     seen: dict[str, int] = {}
 
     for r in plate.rects:
         if r.part_index < 0 or r.part_index >= len(meshes):
             continue
-        m = _place_rect(meshes[r.part_index].copy(), r, _ROT_Z_90)
+        m = _place_rect_local(meshes[r.part_index].copy(), r, _ROT_Z_90)
 
         base = (
             names[r.part_index]
@@ -119,6 +192,7 @@ def export_plate_3mf(
         seen[base] = count + 1
 
         objects.append((node_name, m))
+        transforms.append((r.x, r.y, r.rotated))
         manifest_parts.append(
             {
                 "index": r.part_index,
@@ -135,7 +209,7 @@ def export_plate_3mf(
         raise ValueError("No meshes to export for this plate.")
 
     out_3mf.parent.mkdir(parents=True, exist_ok=True)
-    _write_3mf(out_3mf, objects)
+    _write_3mf(out_3mf, objects, item_transforms=transforms)
     if out_manifest is not None:
         payload = {"plate_index": plate.index, "parts": manifest_parts}
         out_manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
