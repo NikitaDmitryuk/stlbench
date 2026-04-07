@@ -21,7 +21,6 @@ from stlbench.core.fit import (
     limiting_part_index,
     printer_dims_with_margin,
 )
-from stlbench.hollow.voxel_shell import hollow_mesh_voxel_shell
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.pipeline.common import load_named_meshes, resolve_printer
 
@@ -42,7 +41,6 @@ class ScaleRunArgs:
     dry_run: bool
     recursive: bool
     suffix: str
-    hollow_override: bool | None
 
 
 def run_scale(args: ScaleRunArgs) -> int:
@@ -135,13 +133,6 @@ def run_scale(args: ScaleRunArgs) -> int:
     lim_i = limiting_part_index(reports, s_max)
     limiter = reports[lim_i].name
 
-    hollow_on = args.hollow_override is True
-    if hollow_on and st is None:
-        console.print(
-            "[red]For --hollow use --config with a [hollow] section (wall_thickness_mm, voxel_mm).[/red]"
-        )
-        return 2
-
     if st and st.printer.name:
         console.print(f"Printer profile: {st.printer.name}")
     console.print(f"Printer (after margin): {px:.4f} x {py:.4f} x {pz:.4f}")
@@ -202,17 +193,6 @@ def run_scale(args: ScaleRunArgs) -> int:
             scaled.apply_transform(t4)
 
         scaled.apply_scale(s_final)
-
-        if hollow_on and st:
-            try:
-                scaled = hollow_mesh_voxel_shell(
-                    scaled,
-                    wall_thickness_mm=st.hollow.wall_thickness_mm,
-                    voxel_mm=st.hollow.voxel_mm,
-                )
-            except Exception as e:
-                console.print(f"[red]Hollow failed for {path.name}: {e}[/red]")
-                return 1
 
         try:
             scaled.export(out_path)

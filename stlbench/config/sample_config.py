@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from stlbench.config.schema import (
     AppSettings,
-    HollowSection,
     PackingSection,
     PrinterSection,
     ScalingSection,
@@ -26,10 +25,6 @@ def sample_app_settings() -> AppSettings:
         ),
         scaling=ScalingSection(bed_margin=0.02, post_fit_scale=0.95),
         packing=PackingSection(gap_mm=0.5),
-        hollow=HollowSection(
-            wall_thickness_mm=2.0,
-            voxel_mm=0.5,
-        ),
     )
 
 
@@ -52,7 +47,6 @@ def render_sample_config_toml() -> str:
     p = s.printer
     sc = s.scaling
     pk = s.packing
-    h = s.hollow
 
     lines = [
         "# Typical SLA build volume (example: ELEGOO Mars 5 Ultra,",
@@ -73,11 +67,6 @@ def render_sample_config_toml() -> str:
         "[packing]",
         "# Gap between parts on the bed (layout, fill, autopack, info).",
         f"gap_mm = {_toml_number(pk.gap_mm)}",
-        "",
-        "[hollow]",
-        "# Used with scale --hollow (voxel shell, trimesh + scipy).",
-        f"wall_thickness_mm = {_toml_number(h.wall_thickness_mm)}",
-        f"voxel_mm = {_toml_number(h.voxel_mm)}",
         "",
     ]
     return "\n".join(lines)

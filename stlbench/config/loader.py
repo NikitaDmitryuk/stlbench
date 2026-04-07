@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import sys
+import tomllib
 from pathlib import Path
 from typing import Any, cast
-
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 from stlbench.config.schema import AppSettings
 
@@ -24,7 +19,6 @@ def load_app_settings(path: Path) -> AppSettings:
         "printer": printer,
         "scaling": raw.get("scaling") or {},
         "packing": raw.get("packing") or {},
-        "hollow": raw.get("hollow") or {},
     }
     return cast(AppSettings, AppSettings.model_validate(data))
 

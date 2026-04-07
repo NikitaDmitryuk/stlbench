@@ -223,3 +223,4 @@ examples/gendalf/fill_*/
 
 # macOS
 .DS_Store
+.idea

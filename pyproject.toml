@@ -1,13 +1,13 @@
 [project]
 name = "stlbench"
-version = "0.2.3"
+version = "0.2.4"
 description = "STL preparation toolkit for resin 3D printing: uniform scaling, bed packing, fill, autopack."
 authors = [
     {name = "NikitaDmitryuk", email = "dmitryuk.nikita@gmail.com"}
 ]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["stl", "3d-printing", "resin", "scaling", "packing", "sla", "dlp"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -16,10 +16,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Graphics :: 3D Modeling",
     "Topic :: Scientific/Engineering",
 ]
@@ -28,9 +28,7 @@ dependencies = [
     "pydantic>=2.0,<3",
     "rectpack>=0.2.2",
     "rich>=13.0",
-    "scipy>=1.9,<1.17; python_version < '3.11'",
-    "scipy>=1.17; python_version >= '3.11'",
-    "tomli>=1.1; python_version < '3.11'",
+    "scipy>=1.17",
     "trimesh>=3.21",
     "typer>=0.9",
 ]
@@ -66,7 +64,7 @@ testpaths = ["tests"]
 
 [tool.black]
 line-length = 100
-target-version = ["py310"]
+target-version = ["py311"]
 
 [tool.isort]
 profile = "black"
@@ -76,7 +74,7 @@ known_first_party = ["stlbench"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 src = ["stlbench", "tests"]
 
 [tool.ruff.lint]
