@@ -15,10 +15,12 @@ from stlbench.pipeline.run_autopack import AutopackRunArgs, run_autopack
 from stlbench.pipeline.run_fill import FillRunArgs, run_fill
 from stlbench.pipeline.run_info import InfoRunArgs, run_info
 from stlbench.pipeline.run_layout import LayoutRunArgs, run_layout
+from stlbench.pipeline.run_orient import OrientRunArgs, run_orient
+from stlbench.pipeline.run_prepare import PrepareRunArgs, run_prepare
 from stlbench.pipeline.run_scale import ScaleRunArgs, run_scale
 
 _ROOT_HELP = """\
-STL preparation for resin 3D printing: scale, layout, fill, autopack, info.
+STL preparation for resin 3D printing: prepare, scale, layout, fill, autopack, orient, info.
 
 Typical commands (adjust paths and my_printer.toml):
 
@@ -26,11 +28,17 @@ Typical commands (adjust paths and my_printer.toml):
   # Printer profile — edit width_mm / depth_mm / height_mm for your machine
   stlbench config init -o my_printer.toml
 
+  # Full pipeline: scale → orient → layout (recommended)
+  stlbench prepare -i ./parts -o ./plates -c my_printer.toml
+
   # Inspect parts: dimensions, fit, suggested scale, fill estimate
   stlbench info -i ./parts -c my_printer.toml
 
+  # Re-orient parts to minimise support structures
+  stlbench orient -i ./parts -o ./oriented -c my_printer.toml
+
   # Scale all STLs to fit the build volume
-  stlbench scale -i ./parts -o ./scaled -c my_printer.toml
+  stlbench scale -i ./oriented -o ./scaled -c my_printer.toml
 
   # Pack scaled parts onto build plates
   stlbench layout -i ./scaled -o ./plates -c my_printer.toml
@@ -40,9 +48,6 @@ Typical commands (adjust paths and my_printer.toml):
 
   # Fill the bed with copies of one STL (--scale fits part first, then packs)
   stlbench fill -i ./one_part.stl -o ./filled -c my_printer.toml --scale
-
-  # Voxel hollow shell (optional) — needs [hollow] in TOML and --hollow
-  stlbench scale -i ./parts -o ./scaled -c my_printer.toml --hollow
 
   # No config file: build volume as three numbers in mm (Px, Py, Pz)
   stlbench scale -i ./parts -o ./scaled -p "153.36,77.76,165"
@@ -132,7 +137,6 @@ def cmd_scale(
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     suffix: Annotated[str, typer.Option("--suffix", show_default=False)] = "",
-    hollow: Annotated[bool | None, typer.Option("--hollow/--no-hollow")] = None,
 ) -> None:
     st = load_app_settings(config) if config else None
     pr = _parse_printer_opt(printer)
@@ -153,7 +157,6 @@ def cmd_scale(
                 dry_run=dry_run,
                 recursive=recursive,
                 suffix=suffix,
-                hollow_override=hollow,
             )
         )
     )
@@ -215,6 +218,14 @@ def cmd_fill(
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
     scale: Annotated[bool, typer.Option("--scale/--no-scale")] = False,
+    orient: Annotated[
+        bool,
+        typer.Option("--orient/--no-orient", help="Rotate part to minimise support structures."),
+    ] = False,
+    overhang_angle: Annotated[
+        float,
+        typer.Option("--overhang-angle", help="Overhang threshold in degrees."),
+    ] = 45.0,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
@@ -227,6 +238,8 @@ def cmd_fill(
                 printer_xyz=pr,
                 gap_mm=gap_mm,
                 scale=scale,
+                orient_on=orient,
+                orient_threshold_deg=overhang_angle,
                 dry_run=dry_run,
             )
         )
@@ -257,6 +270,14 @@ def cmd_autopack(
             help="Multiplier after geometry fit (TOML: scaling.post_fit_scale).",
         ),
     ] = None,
+    orient: Annotated[
+        bool,
+        typer.Option("--orient/--no-orient", help="Rotate parts to minimise support structures."),
+    ] = False,
+    overhang_angle: Annotated[
+        float,
+        typer.Option("--overhang-angle", help="Overhang threshold in degrees."),
+    ] = 45.0,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
 ) -> None:
@@ -271,6 +292,119 @@ def cmd_autopack(
                 gap_mm=gap_mm,
                 margin=margin,
                 post_fit_scale=post_fit_scale,
+                orient_on=orient,
+                orient_threshold_deg=overhang_angle,
+                dry_run=dry_run,
+                recursive=recursive,
+            )
+        )
+    )
+
+
+@app.command("orient")
+def cmd_orient(
+    input_dir: Annotated[
+        Path,
+        typer.Option("--input", "-i", exists=True, file_okay=False, dir_okay=True),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, file_okay=True),
+    ] = None,
+    printer: Annotated[
+        str | None,
+        typer.Option(
+            "-p", "--printer", help="Px,Py,Pz — constrain orientations to fit the build volume."
+        ),
+    ] = None,
+    overhang_angle: Annotated[
+        float,
+        typer.Option(
+            "--overhang-angle",
+            help="Overhang threshold in degrees. Faces steeper than this need support.",
+        ),
+    ] = 45.0,
+    candidates: Annotated[
+        int,
+        typer.Option(
+            "--candidates",
+            help="Number of mesh face normals to test as candidate bottom orientations.",
+        ),
+    ] = 200,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    recursive: Annotated[bool, typer.Option("--recursive")] = False,
+    suffix: Annotated[str, typer.Option("--suffix", show_default=False)] = "",
+) -> None:
+    pr = _parse_printer_opt(printer)
+    raise typer.Exit(
+        run_orient(
+            OrientRunArgs(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                config_path=config,
+                settings=None,
+                printer_xyz=pr,
+                overhang_threshold_deg=overhang_angle,
+                n_candidates=candidates,
+                dry_run=dry_run,
+                recursive=recursive,
+                suffix=suffix,
+            )
+        )
+    )
+
+
+@app.command("prepare")
+def cmd_prepare(
+    input_dir: Annotated[
+        Path,
+        typer.Option("--input", "-i", exists=True, file_okay=False, dir_okay=True),
+    ],
+    output_dir: Annotated[Path, typer.Option("--output", "-o")],
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", exists=True, dir_okay=False, file_okay=True),
+    ] = None,
+    printer: Annotated[
+        str | None,
+        typer.Option("-p", "--printer", help="Px,Py,Pz"),
+    ] = None,
+    gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
+    margin: Annotated[float | None, typer.Option("--margin")] = None,
+    post_fit_scale: Annotated[
+        float | None,
+        typer.Option(
+            "--post-fit-scale",
+            help="Multiplier after geometry fit (TOML: scaling.post_fit_scale).",
+        ),
+    ] = None,
+    method: Annotated[str | None, typer.Option("--method")] = None,
+    overhang_angle: Annotated[
+        float,
+        typer.Option("--overhang-angle", help="Overhang threshold in degrees."),
+    ] = 45.0,
+    orient_candidates: Annotated[
+        int,
+        typer.Option("--orient-candidates", help="Candidate bottom directions for orient step."),
+    ] = 200,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    recursive: Annotated[bool, typer.Option("--recursive")] = False,
+) -> None:
+    pr = _parse_printer_opt(printer)
+    raise typer.Exit(
+        run_prepare(
+            PrepareRunArgs(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                config_path=config,
+                printer_xyz=pr,
+                gap_mm=gap_mm,
+                margin=margin,
+                post_fit_scale=post_fit_scale,
+                method=method,
+                overhang_threshold_deg=overhang_angle,
+                n_orient_candidates=orient_candidates,
                 dry_run=dry_run,
                 recursive=recursive,
             )
@@ -307,22 +441,15 @@ def cmd_info(
     )
 
 
-@app.command("hollow")
-def cmd_hollow_info() -> None:
-    typer.echo(
-        "Hollowing runs only with: stlbench scale ... -c your.toml --hollow "
-        "(set [hollow] wall_thickness_mm and voxel_mm in the TOML)."
-    )
-
-
 _KNOWN_COMMANDS = frozenset(
     {
+        "prepare",
         "scale",
         "layout",
         "fill",
         "autopack",
+        "orient",
         "info",
-        "hollow",
         "config",
         "-h",
         "--help",

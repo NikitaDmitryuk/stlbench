@@ -15,8 +15,3 @@ post_fit_scale = 0.95
 
 [packing]
 gap_mm = 0.5
-
-[hollow]
-# Used only with scale --hollow (voxel shell, trimesh + scipy).
-wall_thickness_mm = 2.0
-voxel_mm = 0.5

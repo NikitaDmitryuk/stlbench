@@ -11,6 +11,7 @@ from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
+from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
 from stlbench.export.plate import _ROT_Z_90, _write_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
@@ -32,6 +33,8 @@ class FillRunArgs:
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
     scale: bool
+    orient_on: bool
+    orient_threshold_deg: float
     dry_run: bool
 
 
@@ -143,6 +146,15 @@ def run_fill(args: FillRunArgs) -> int:
         s_final = s * pf
         mesh.apply_scale(s_final)
         console.print(f"Scaled {inp.name} by {s_final:.6f}")
+
+    if args.orient_on:
+        rotation, score = find_min_overhang_rotation(
+            mesh,
+            overhang_threshold_deg=args.orient_threshold_deg,
+            printer_dims=(px, py, pz),
+        )
+        mesh = apply_min_overhang_orientation(mesh, rotation)
+        console.print(f"Overhang score after orient: {score:.1f}")
 
     rot_samples = ORIENTATION_SAMPLES_DEFAULT
     rot_seed = ORIENTATION_SEED_DEFAULT

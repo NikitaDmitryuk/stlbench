@@ -11,6 +11,7 @@ from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
+from stlbench.core.overhang import find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.packing.rectpack_plate import (
@@ -37,6 +38,8 @@ class AutopackRunArgs:
     gap_mm: float | None
     margin: float | None
     post_fit_scale: float | None
+    orient_on: bool
+    orient_threshold_deg: float
     dry_run: bool
     recursive: bool
 
@@ -158,23 +161,39 @@ def run_autopack(args: AutopackRunArgs) -> int:
     for m in meshes:
         dims_list.append(aabb_edge_lengths(np.asarray(m.bounds)))
 
-    # Find best print orientation per mesh (maximises scale, considers axis permutations).
-    # This must be consistent with the footprints passed to _bisect_scale so that the
-    # export uses the same orientation that the packer assumed.
+    # Find best print orientation per mesh.
+    # --orient: minimise overhangs (support-optimised) → use oriented AABB dims.
+    # default:  maximise scale factor (axis-permutation search).
+    # Both paths must be consistent with the footprints passed to _bisect_scale.
     orient_transforms: list[np.ndarray] = []
     oriented_dims: list[tuple[float, float, float]] = []
-    for m in meshes:
-        t4, ext = select_orientation_for_scale(
-            m,
-            epx,
-            epy,
-            epz,
-            "sorted",
-            random_samples=ORIENTATION_SAMPLES_DEFAULT,
-            seed=ORIENTATION_SEED_DEFAULT,
-        )
-        orient_transforms.append(t4)
-        oriented_dims.append(ext)  # (ex, ey, ez) in printer coordinates
+
+    if args.orient_on:
+        for m in meshes:
+            rotation, _ = find_min_overhang_rotation(
+                m,
+                overhang_threshold_deg=args.orient_threshold_deg,
+                printer_dims=(epx, epy, epz),
+            )
+            t4 = np.eye(4, dtype=np.float64)
+            t4[:3, :3] = rotation
+            orient_transforms.append(t4)
+            m2 = m.copy()
+            m2.apply_transform(t4)
+            oriented_dims.append(aabb_edge_lengths(np.asarray(m2.bounds)))
+    else:
+        for m in meshes:
+            t4, ext = select_orientation_for_scale(
+                m,
+                epx,
+                epy,
+                epz,
+                "sorted",
+                random_samples=ORIENTATION_SAMPLES_DEFAULT,
+                seed=ORIENTATION_SEED_DEFAULT,
+            )
+            orient_transforms.append(t4)
+            oriented_dims.append(ext)  # (ex, ey, ez) in printer coordinates
 
     s_upper, _ = compute_global_scale((epx, epy, epz), oriented_dims, names, "sorted")
     s_upper *= post_fit_scale
