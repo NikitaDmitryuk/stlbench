@@ -14,4 +14,4 @@ bed_margin = 0.02
 post_fit_scale = 0.95
 
 [packing]
-gap_mm = 0.5
+gap_mm = 5.0

@@ -24,7 +24,7 @@ def sample_app_settings() -> AppSettings:
             height_mm=165.0,
         ),
         scaling=ScalingSection(bed_margin=0.02, post_fit_scale=0.95),
-        packing=PackingSection(gap_mm=0.5),
+        packing=PackingSection(gap_mm=5.0),
     )
 
 

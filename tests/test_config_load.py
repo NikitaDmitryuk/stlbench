@@ -9,4 +9,4 @@ def test_load_mars5_config():
     assert "Mars" in cfg.printer_name
     assert cfg.width_mm > 0
     assert cfg.post_fit_scale == 0.95
-    assert cfg.settings.packing.gap_mm == 0.5
+    assert cfg.settings.packing.gap_mm == 5.0
