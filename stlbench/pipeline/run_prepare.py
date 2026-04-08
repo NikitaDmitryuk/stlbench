@@ -14,8 +14,7 @@ Order rationale
 
 from __future__ import annotations
 
-import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +38,7 @@ from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.packing.rectpack_plate import footprint_fits_bin_mm, pack_rectangles_on_plates
 from stlbench.pipeline.common import (
     load_named_meshes,
+    n_workers,
     resolve_gap,
     resolve_printer,
     resolve_settings,
@@ -61,6 +61,7 @@ class PrepareRunArgs:
     n_orient_candidates: int
     dry_run: bool
     recursive: bool
+    verbose: bool = False
 
 
 def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
@@ -112,7 +113,9 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             seed=ORIENTATION_SEED_DEFAULT,
         )
 
-    _n = min(len(meshes), os.cpu_count() or 1)
+    _n = n_workers(len(meshes))
+    if args.verbose:
+        console.print(f"[dim]scale-orient: {_n} workers for {len(meshes)} meshes[/dim]")
     with ThreadPoolExecutor(max_workers=_n) as pool:
         _so = list(pool.map(_select_orient, meshes))
     scale_transforms = [r[0] for r in _so]
@@ -173,9 +176,32 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         pct = (sb - sa) / max(abs(sb), 1.0) * 100.0
         return sb, sa, pct, apply_min_overhang_orientation(mesh, rotation)
 
-    _n2 = min(len(scaled_meshes), os.cpu_count() or 1)
+    # Pre-populate trimesh lazy caches sequentially to prevent concurrent
+    # cache-initialization races and to reduce peak memory during threading.
+    for mesh in scaled_meshes:
+        _ = mesh.face_normals
+        _ = mesh.area_faces
+
+    _n2 = n_workers(len(scaled_meshes))
+    if args.verbose:
+        console.print(f"[dim]orient: {_n2} workers for {len(scaled_meshes)} meshes[/dim]")
+    _total = len(scaled_meshes)
+    _or: list = [None] * _total
     with ThreadPoolExecutor(max_workers=_n2) as pool:
-        _or = list(pool.map(_orient_one, scaled_meshes))
+        future_to_idx = {pool.submit(_orient_one, scaled_meshes[i]): i for i in range(_total)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx.pop(future)
+            try:
+                _or[idx] = future.result()
+            except Exception as e:
+                if args.verbose:
+                    console.print_exception()
+                console.print(f"[red]orient failed for part {idx} ({names[idx]}): {e}[/red]")
+                return 1
+            scaled_meshes[idx] = None  # type: ignore[call-overload]  # release as soon as done
+            if args.verbose:
+                _done = sum(1 for x in _or if x is not None)
+                console.print(f"[dim]  orient [{_done}/{_total}] done: {names[idx]}[/dim]")
     del scaled_meshes
 
     oriented_meshes: list[trimesh.Trimesh] = []
@@ -221,7 +247,9 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
         return out_3mf
 
-    _np = min(len(plates), os.cpu_count() or 1)
+    _np = n_workers(len(plates))
+    if args.verbose:
+        console.print(f"[dim]export: {_np} workers for {len(plates)} plates[/dim]")
     with ThreadPoolExecutor(max_workers=_np) as pool:
         for out_path in pool.map(_export_plate, plates):
             console.print(f"Wrote {out_path}")

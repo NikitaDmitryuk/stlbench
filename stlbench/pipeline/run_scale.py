@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +23,7 @@ from stlbench.core.fit import (
     printer_dims_with_margin,
 )
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.pipeline.common import load_named_meshes, resolve_printer
+from stlbench.pipeline.common import load_named_meshes, n_workers, resolve_printer
 from stlbench.pipeline.mesh_io import load_mesh
 
 
@@ -44,6 +43,7 @@ class ScaleRunArgs:
     dry_run: bool
     recursive: bool
     suffix: str
+    verbose: bool = False
 
 
 def run_scale(args: ScaleRunArgs) -> int:
@@ -106,7 +106,9 @@ def run_scale(args: ScaleRunArgs) -> int:
                 seed=seed,
             )
 
-        _n = min(len(meshes), os.cpu_count() or 1)
+        _n = n_workers(len(meshes))
+        if args.verbose:
+            console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
         with ThreadPoolExecutor(max_workers=_n) as pool:
             _results = list(pool.map(_select_orient, meshes))
         transforms: list[np.ndarray] = [r[0] for r in _results]
@@ -190,6 +192,8 @@ def run_scale(args: ScaleRunArgs) -> int:
         stem = path.stem + args.suffix
         out_path = out_dir / f"{stem}.stl"
 
+        if args.verbose:
+            console.print(f"[dim]  [{idx + 1}/{len(paths)}] exporting {path.name}[/dim]")
         mesh = load_mesh(path)
         t4 = transforms[idx]
         if not np.allclose(t4, np.eye(4)):
