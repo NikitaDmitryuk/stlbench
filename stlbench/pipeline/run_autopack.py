@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -156,20 +158,16 @@ def run_autopack(args: AutopackRunArgs) -> int:
 
     epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
 
-    # Raw file dims (for display)
-    dims_list: list[tuple[float, float, float]] = []
-    for m in meshes:
-        dims_list.append(aabb_edge_lengths(np.asarray(m.bounds)))
-
-    # Find best print orientation per mesh.
+    # Find best print orientation per mesh and collect raw file dims in one pass.
     # --orient: minimise overhangs (support-optimised) → use oriented AABB dims.
     # default:  maximise scale factor (axis-permutation search).
     # Both paths must be consistent with the footprints passed to _bisect_scale.
-    orient_transforms: list[np.ndarray] = []
-    oriented_dims: list[tuple[float, float, float]] = []
-
     if args.orient_on:
-        for m in meshes:
+
+        def _orient_one(
+            m: trimesh.Trimesh,
+        ) -> tuple[tuple[float, float, float], np.ndarray, tuple[float, float, float]]:
+            file_d = aabb_edge_lengths(np.asarray(m.bounds))
             rotation, _ = find_min_overhang_rotation(
                 m,
                 overhang_threshold_deg=args.orient_threshold_deg,
@@ -177,12 +175,16 @@ def run_autopack(args: AutopackRunArgs) -> int:
             )
             t4 = np.eye(4, dtype=np.float64)
             t4[:3, :3] = rotation
-            orient_transforms.append(t4)
             m2 = m.copy()
             m2.apply_transform(t4)
-            oriented_dims.append(aabb_edge_lengths(np.asarray(m2.bounds)))
+            return file_d, t4, aabb_edge_lengths(np.asarray(m2.bounds))
+
     else:
-        for m in meshes:
+
+        def _orient_one(  # noqa: F811
+            m: trimesh.Trimesh,
+        ) -> tuple[tuple[float, float, float], np.ndarray, tuple[float, float, float]]:
+            file_d = aabb_edge_lengths(np.asarray(m.bounds))
             t4, ext = select_orientation_for_scale(
                 m,
                 epx,
@@ -192,8 +194,15 @@ def run_autopack(args: AutopackRunArgs) -> int:
                 random_samples=ORIENTATION_SAMPLES_DEFAULT,
                 seed=ORIENTATION_SEED_DEFAULT,
             )
-            orient_transforms.append(t4)
-            oriented_dims.append(ext)  # (ex, ey, ez) in printer coordinates
+            return file_d, t4, ext
+
+    _n = min(len(meshes), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=_n) as pool:
+        _results = list(pool.map(_orient_one, meshes))
+
+    dims_list: list[tuple[float, float, float]] = [r[0] for r in _results]
+    orient_transforms: list[np.ndarray] = [r[1] for r in _results]
+    oriented_dims: list[tuple[float, float, float]] = [r[2] for r in _results]
 
     s_upper, _ = compute_global_scale((epx, epy, epz), oriented_dims, names, "sorted")
     s_upper *= post_fit_scale
@@ -227,12 +236,17 @@ def run_autopack(args: AutopackRunArgs) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Apply orientation transform + scale; export_plate_stl handles translation to origin.
-    scaled_meshes: list[trimesh.Trimesh] = []
-    for m, t4 in zip(meshes, orient_transforms, strict=True):
+    def _apply_scale(m_t4: tuple[trimesh.Trimesh, np.ndarray]) -> trimesh.Trimesh:
+        m, t4 = m_t4
         s = m.copy()
         s.apply_transform(t4)
         s.apply_scale(s_best)
-        scaled_meshes.append(s)
+        return s
+
+    with ThreadPoolExecutor(max_workers=_n) as pool:
+        scaled_meshes: list[trimesh.Trimesh] = list(
+            pool.map(_apply_scale, zip(meshes, orient_transforms, strict=True))
+        )
 
     out_3mf = args.output_dir / "autopack_plate.3mf"
     out_json = args.output_dir / "autopack_plate.json"

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import trimesh
 from rich.console import Console
 from rich.table import Table
 
@@ -64,28 +67,24 @@ def run_orient(args: OrientRunArgs) -> int:
     table.add_column("score after", justify="right")
     table.add_column("improvement", justify="right")
 
-    results = []
-    for path, name, mesh in zip(paths, names, meshes, strict=True):
-        console.print(f"Analysing {name} …", highlight=False)
-
-        score_before = overhang_score(mesh, _IDENTITY, args.overhang_threshold_deg)
-
-        rotation, score_after = find_min_overhang_rotation(
+    def _orient_one(mesh: trimesh.Trimesh) -> tuple[float, float, float, np.ndarray]:
+        sb = overhang_score(mesh, _IDENTITY, args.overhang_threshold_deg)
+        rotation, sa = find_min_overhang_rotation(
             mesh,
             overhang_threshold_deg=args.overhang_threshold_deg,
             n_candidates=args.n_candidates,
             printer_dims=printer_dims,
         )
+        pct = (sb - sa) / max(abs(sb), 1.0) * 100.0
+        return sb, sa, pct, rotation
 
-        improvement = score_before - score_after
-        pct = (improvement / max(abs(score_before), 1.0)) * 100.0
+    _n = min(len(meshes), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=_n) as pool:
+        _or = list(pool.map(_orient_one, meshes))
 
-        table.add_row(
-            name,
-            f"{score_before:.1f}",
-            f"{score_after:.1f}",
-            f"{pct:+.1f}%",
-        )
+    results = []
+    for path, name, mesh, (sb, sa, pct, rotation) in zip(paths, names, meshes, _or, strict=True):
+        table.add_row(name, f"{sb:.1f}", f"{sa:.1f}", f"{pct:+.1f}%")
         results.append((path, name, mesh, rotation))
 
     console.print(table)
@@ -96,7 +95,8 @@ def run_orient(args: OrientRunArgs) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    for path, _name, mesh, rotation in results:
+    def _export_one(item: tuple[Path, str, trimesh.Trimesh, np.ndarray]) -> Path:
+        path, _name, mesh, rotation = item
         if args.recursive:
             rel_parent = path.parent.relative_to(args.input_dir)
             out_sub = args.output_dir / rel_parent
@@ -104,16 +104,17 @@ def run_orient(args: OrientRunArgs) -> int:
             out_dir = out_sub
         else:
             out_dir = args.output_dir
+        out_path = out_dir / f"{path.stem + args.suffix}.stl"
+        apply_min_overhang_orientation(mesh, rotation).export(out_path)
+        return out_path
 
-        stem = path.stem + args.suffix
-        out_path = out_dir / f"{stem}.stl"
-
-        oriented = apply_min_overhang_orientation(mesh, rotation)
-        try:
-            oriented.export(out_path)
-        except (OSError, ValueError) as e:
-            console.print(f"[red]Failed to export {out_path}: {e}[/red]")
-            return 1
-        console.print(f"Wrote {out_path}")
+    try:
+        _ne = min(len(results), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=_ne) as pool:
+            for out_path in pool.map(_export_one, results):
+                console.print(f"Wrote {out_path}")
+    except (OSError, ValueError) as e:
+        console.print(f"[red]Failed to export: {e}[/red]")
+        return 1
 
     return 0
