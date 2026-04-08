@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +24,7 @@ from stlbench.packing.rectpack_plate import (
 )
 from stlbench.pipeline.common import (
     load_named_meshes,
+    n_workers,
     resolve_gap,
     resolve_printer,
     resolve_settings,
@@ -44,6 +44,7 @@ class AutopackRunArgs:
     orient_threshold_deg: float
     dry_run: bool
     recursive: bool
+    verbose: bool = False
 
 
 def _try_pack_all(
@@ -196,7 +197,14 @@ def run_autopack(args: AutopackRunArgs) -> int:
             )
             return file_d, t4, ext
 
-    _n = min(len(meshes), os.cpu_count() or 1)
+    # Pre-populate trimesh lazy caches sequentially before threading.
+    for mesh in meshes:
+        _ = mesh.face_normals
+        _ = mesh.area_faces
+
+    _n = n_workers(len(meshes))
+    if args.verbose:
+        console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
     with ThreadPoolExecutor(max_workers=_n) as pool:
         _results = list(pool.map(_orient_one, meshes))
 
@@ -243,6 +251,8 @@ def run_autopack(args: AutopackRunArgs) -> int:
         s.apply_scale(s_best)
         return s
 
+    if args.verbose:
+        console.print(f"[dim]scale: {_n} workers for {len(meshes)} meshes[/dim]")
     with ThreadPoolExecutor(max_workers=_n) as pool:
         scaled_meshes: list[trimesh.Trimesh] = list(
             pool.map(_apply_scale, zip(meshes, orient_transforms, strict=True))

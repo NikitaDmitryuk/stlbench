@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,17 @@ from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import AppSettings
 from stlbench.pipeline.mesh_io import collect_stl_paths, load_mesh
+
+
+def n_workers(n_items: int) -> int:
+    """Number of ThreadPoolExecutor workers: min(n_items, ⌊cpu_count * 2/3⌋, 1).
+
+    Caps at two-thirds of available logical CPUs so the system remains
+    responsive while heavy geometry work is running.
+    """
+    cpu = os.cpu_count() or 2
+    cap = max(1, int(cpu * 2 / 3))
+    return min(n_items, cap)
 
 
 def resolve_printer(

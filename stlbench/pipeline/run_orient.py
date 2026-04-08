@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +16,7 @@ from stlbench.core.overhang import (
     find_min_overhang_rotation,
     overhang_score,
 )
-from stlbench.pipeline.common import load_named_meshes, resolve_printer, resolve_settings
+from stlbench.pipeline.common import load_named_meshes, n_workers, resolve_printer, resolve_settings
 
 _IDENTITY = np.eye(3, dtype=np.float64)
 
@@ -34,6 +33,7 @@ class OrientRunArgs:
     dry_run: bool
     recursive: bool
     suffix: str
+    verbose: bool = False
 
 
 def run_orient(args: OrientRunArgs) -> int:
@@ -78,7 +78,14 @@ def run_orient(args: OrientRunArgs) -> int:
         pct = (sb - sa) / max(abs(sb), 1.0) * 100.0
         return sb, sa, pct, rotation
 
-    _n = min(len(meshes), os.cpu_count() or 1)
+    # Pre-populate trimesh lazy caches sequentially before threading.
+    for mesh in meshes:
+        _ = mesh.face_normals
+        _ = mesh.area_faces
+
+    _n = n_workers(len(meshes))
+    if args.verbose:
+        console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
     with ThreadPoolExecutor(max_workers=_n) as pool:
         _or = list(pool.map(_orient_one, meshes))
 
@@ -109,11 +116,15 @@ def run_orient(args: OrientRunArgs) -> int:
         return out_path
 
     try:
-        _ne = min(len(results), os.cpu_count() or 1)
+        _ne = n_workers(len(results))
+        if args.verbose:
+            console.print(f"[dim]export: {_ne} workers for {len(results)} meshes[/dim]")
         with ThreadPoolExecutor(max_workers=_ne) as pool:
             for out_path in pool.map(_export_one, results):
                 console.print(f"Wrote {out_path}")
     except (OSError, ValueError) as e:
+        if args.verbose:
+            console.print_exception()
         console.print(f"[red]Failed to export: {e}[/red]")
         return 1
 

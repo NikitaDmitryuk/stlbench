@@ -137,6 +137,9 @@ def cmd_scale(
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     suffix: Annotated[str, typer.Option("--suffix", show_default=False)] = "",
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
+    ] = False,
 ) -> None:
     st = load_app_settings(config) if config else None
     pr = _parse_printer_opt(printer)
@@ -157,6 +160,7 @@ def cmd_scale(
                 dry_run=dry_run,
                 recursive=recursive,
                 suffix=suffix,
+                verbose=verbose,
             )
         )
     )
@@ -280,6 +284,9 @@ def cmd_autopack(
     ] = 45.0,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -296,6 +303,7 @@ def cmd_autopack(
                 orient_threshold_deg=overhang_angle,
                 dry_run=dry_run,
                 recursive=recursive,
+                verbose=verbose,
             )
         )
     )
@@ -335,6 +343,9 @@ def cmd_orient(
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     suffix: Annotated[str, typer.Option("--suffix", show_default=False)] = "",
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -350,6 +361,7 @@ def cmd_orient(
                 dry_run=dry_run,
                 recursive=recursive,
                 suffix=suffix,
+                verbose=verbose,
             )
         )
     )
@@ -390,6 +402,9 @@ def cmd_prepare(
     ] = 200,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -407,6 +422,7 @@ def cmd_prepare(
                 n_orient_candidates=orient_candidates,
                 dry_run=dry_run,
                 recursive=recursive,
+                verbose=verbose,
             )
         )
     )
