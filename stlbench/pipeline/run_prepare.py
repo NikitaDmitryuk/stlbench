@@ -14,6 +14,8 @@ Order rationale
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -99,10 +101,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     # ──────────────────────────────────────────────────────────────────────────
     console.print("\n[bold]1 / 3  Scale[/bold]")
 
-    scale_transforms: list[np.ndarray] = []
-    oriented_dims: list[tuple[float, float, float]] = []
-    for m in meshes:
-        t4, ext = select_orientation_for_scale(
+    def _select_orient(m: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
+        return select_orientation_for_scale(
             m,
             px,
             py,
@@ -111,8 +111,12 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             random_samples=ORIENTATION_SAMPLES_DEFAULT,
             seed=ORIENTATION_SEED_DEFAULT,
         )
-        scale_transforms.append(t4)
-        oriented_dims.append(ext)
+
+    _n = min(len(meshes), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=_n) as pool:
+        _so = list(pool.map(_select_orient, meshes))
+    scale_transforms = [r[0] for r in _so]
+    oriented_dims = [r[1] for r in _so]
 
     try:
         s_max, reports = compute_global_scale((px, py, pz), oriented_dims, names, method)  # type: ignore[arg-type]
@@ -133,13 +137,19 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         table.add_row(r.name, f"{sd[0]:.2f} × {sd[1]:.2f} × {sd[2]:.2f}")
     console.print(table)
 
-    scaled_meshes: list[trimesh.Trimesh] = []
-    for m, t4 in zip(meshes, scale_transforms, strict=True):
+    def _apply_scale(m_t4: tuple[trimesh.Trimesh, np.ndarray]) -> trimesh.Trimesh:
+        m, t4 = m_t4
         m2 = m.copy()
         m2.apply_transform(t4)
         m2.apply_scale(s_final)
         m2.apply_translation([0.0, 0.0, -float(np.asarray(m2.bounds)[0, 2])])
-        scaled_meshes.append(m2)
+        return m2
+
+    with ThreadPoolExecutor(max_workers=_n) as pool:
+        scaled_meshes: list[trimesh.Trimesh] = list(
+            pool.map(_apply_scale, zip(meshes, scale_transforms, strict=True))
+        )
+    del meshes
 
     # ──────────────────────────────────────────────────────────────────────────
     # Step 2 – Orient for minimum supports
@@ -152,19 +162,27 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     orient_table.add_column("after", justify="right")
     orient_table.add_column("Δ", justify="right")
 
-    oriented_meshes: list[trimesh.Trimesh] = []
-    for name, mesh in zip(names, scaled_meshes, strict=True):
-        console.print(f"  {name} …", highlight=False)
-        score_before = overhang_score(mesh, _IDENTITY3, args.overhang_threshold_deg)
-        rotation, score_after = find_min_overhang_rotation(
+    def _orient_one(mesh: trimesh.Trimesh) -> tuple[float, float, float, trimesh.Trimesh]:
+        sb = overhang_score(mesh, _IDENTITY3, args.overhang_threshold_deg)
+        rotation, sa = find_min_overhang_rotation(
             mesh,
             overhang_threshold_deg=args.overhang_threshold_deg,
             n_candidates=args.n_orient_candidates,
             printer_dims=(px, py, pz),
         )
-        pct = (score_before - score_after) / max(abs(score_before), 1.0) * 100.0
-        orient_table.add_row(name, f"{score_before:.1f}", f"{score_after:.1f}", f"{pct:+.0f}%")
-        oriented_meshes.append(apply_min_overhang_orientation(mesh, rotation))
+        pct = (sb - sa) / max(abs(sb), 1.0) * 100.0
+        return sb, sa, pct, apply_min_overhang_orientation(mesh, rotation)
+
+    _n2 = min(len(scaled_meshes), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=_n2) as pool:
+        _or = list(pool.map(_orient_one, scaled_meshes))
+    del scaled_meshes
+
+    oriented_meshes: list[trimesh.Trimesh] = []
+    for name, (sb, sa, pct, oriented) in zip(names, _or, strict=True):
+        orient_table.add_row(name, f"{sb:.1f}", f"{sa:.1f}", f"{pct:+.0f}%")
+        oriented_meshes.append(oriented)
+    del _or
 
     console.print(orient_table)
 
@@ -197,10 +215,15 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    for pl in plates:
+    def _export_plate(pl) -> Path:
         out_3mf = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
         out_js = args.output_dir / f"plate_{pl.index + 1:02d}.json"
         export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
-        console.print(f"Wrote {out_3mf}")
+        return out_3mf
+
+    _np = min(len(plates), os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=_np) as pool:
+        for out_path in pool.map(_export_plate, plates):
+            console.print(f"Wrote {out_path}")
 
     return 0

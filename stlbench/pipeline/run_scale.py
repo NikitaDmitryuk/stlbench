@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from stlbench.core.fit import (
 )
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.pipeline.common import load_named_meshes, resolve_printer
+from stlbench.pipeline.mesh_io import load_mesh
 
 
 @dataclass
@@ -83,23 +86,17 @@ def run_scale(args: ScaleRunArgs) -> int:
     loaded = load_named_meshes(input_dir, args.recursive, console)
     if loaded is None:
         return 1
-    paths, _loaded_names, _loaded_meshes = loaded
+    paths, part_names, meshes = loaded
+    del loaded
 
     px, py, pz = printer_dims_with_margin(prx, pry, prz, margin)
 
-    part_names: list[str] = list(_loaded_names)
-    meshes: list[trimesh.Trimesh] = list(_loaded_meshes)
-    parts_dims: list[tuple[float, float, float]] = []
-    file_dims: list[tuple[float, float, float]] = []
-    transforms: list[np.ndarray] = []
+    file_dims = [aabb_edge_lengths(np.asarray(m.bounds)) for m in meshes]
 
-    for mesh in meshes:
-        fb = np.asarray(mesh.bounds)
-        file_d = aabb_edge_lengths(fb)
-        file_dims.append(file_d)
+    if orient == "free":
 
-        if orient == "free":
-            t4, ext = select_orientation_for_scale(
+        def _select_orient(mesh: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
+            return select_orientation_for_scale(
                 mesh,
                 px,
                 py,
@@ -108,11 +105,17 @@ def run_scale(args: ScaleRunArgs) -> int:
                 random_samples=rot_samples,
                 seed=seed,
             )
-            parts_dims.append(ext)
-            transforms.append(t4)
-        else:
-            parts_dims.append(file_d)
-            transforms.append(np.eye(4, dtype=np.float64))
+
+        _n = min(len(meshes), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=_n) as pool:
+            _results = list(pool.map(_select_orient, meshes))
+        transforms: list[np.ndarray] = [r[0] for r in _results]
+        parts_dims: list[tuple[float, float, float]] = [r[1] for r in _results]
+    else:
+        transforms = [np.eye(4, dtype=np.float64) for _ in meshes]
+        parts_dims = list(file_dims)
+
+    del meshes  # free mesh data; export will re-load from disk
 
     file_dims_for_report = list(file_dims) if orient == "free" else None
 
@@ -176,7 +179,7 @@ def run_scale(args: ScaleRunArgs) -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, (path, mesh) in enumerate(zip(paths, meshes, strict=True)):
+    for idx, path in enumerate(paths):
         if args.recursive:
             rel_parent = path.parent.relative_to(input_dir)
             out_sub = output_dir / rel_parent
@@ -186,16 +189,15 @@ def run_scale(args: ScaleRunArgs) -> int:
             out_dir = output_dir
         stem = path.stem + args.suffix
         out_path = out_dir / f"{stem}.stl"
-        scaled = mesh.copy()
 
+        mesh = load_mesh(path)
         t4 = transforms[idx]
         if not np.allclose(t4, np.eye(4)):
-            scaled.apply_transform(t4)
-
-        scaled.apply_scale(s_final)
+            mesh.apply_transform(t4)
+        mesh.apply_scale(s_final)
 
         try:
-            scaled.export(out_path)
+            mesh.export(out_path)
         except (OSError, ValueError) as e:
             console.print(f"[red]Failed to export {out_path}: {e}[/red]")
             return 1

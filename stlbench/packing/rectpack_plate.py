@@ -160,7 +160,7 @@ def pack_rectangles_on_plates(
     if bed_w <= 0 or bed_h <= 0:
         raise ValueError("bed dimensions must be positive.")
     g = gap_mm
-    bw, bh = int_bin_dims_mm(bed_w, bed_h)
+    bw, bh = int_bin_dims_mm(bed_w, bed_h, g)
 
     orig_int_dims: dict[int, tuple[int, int]] = {}
     for idx, (fw, fh) in enumerate(footprints):
