@@ -10,7 +10,9 @@ from rich.console import Console
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
-from stlbench.packing.rectpack_plate import int_bin_dims_mm, pack_rectangles_on_plates
+from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_pack import pack_polygons_on_plates
+from stlbench.packing.rectpack_plate import int_bin_dims_mm
 from stlbench.packing.shelf import build_packable_parts, greedy_shelf_plates
 from stlbench.pipeline.common import (
     load_named_meshes,
@@ -93,14 +95,12 @@ def run_layout(args: LayoutRunArgs) -> int:
         return 1
 
     oriented_meshes: list[trimesh.Trimesh] = []
-    footprints: list[tuple[float, float]] = []
     for m, plan in zip(meshes, layout_plans, strict=True):
         assert plan is not None
-        t, fw, fh = plan
+        t, _fw, _fh = plan
         m2 = m.copy()
         m2.apply_transform(t)
         oriented_meshes.append(m2)
-        footprints.append((fw, fh))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -116,9 +116,10 @@ def run_layout(args: LayoutRunArgs) -> int:
         )
         return 0
 
-    plates = pack_rectangles_on_plates(footprints, px, py, gap_mm=gap)
+    shadows = [mesh_to_xy_shadow(m) for m in oriented_meshes]
+    plates = pack_polygons_on_plates(shadows, px, py, gap_mm=gap)
     if args.dry_run:
-        console.print(f"Plates (rectpack): {len(plates)}")
+        console.print(f"Plates: {len(plates)}")
         for pl in plates:
             console.print(f"  Plate {pl.index + 1}: {len(pl.rects)} parts")
         return 0

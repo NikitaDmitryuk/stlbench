@@ -35,7 +35,9 @@ from stlbench.core.overhang import (
 )
 from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.packing.rectpack_plate import footprint_fits_bin_mm, pack_rectangles_on_plates
+from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_pack import pack_polygons_on_plates
+from stlbench.packing.rectpack_plate import footprint_fits_bin_mm
 from stlbench.pipeline.common import (
     load_named_meshes,
     n_workers,
@@ -217,7 +219,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     # ──────────────────────────────────────────────────────────────────────────
     console.print("\n[bold]3 / 3  Layout[/bold]")
 
-    footprints: list[tuple[float, float]] = []
+    # Pre-check: each part must fit the bed in at least one orientation before packing.
     for name, m in zip(names, oriented_meshes, strict=True):
         b = np.asarray(m.bounds)
         dx = float(b[1, 0] - b[0, 0])
@@ -228,9 +230,9 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 f"on bed {px:.1f}×{py:.1f} mm (gap {gap} mm).[/red]"
             )
             return 1
-        footprints.append((dx, dy))
 
-    plates = pack_rectangles_on_plates(footprints, px, py, gap_mm=gap)
+    shadows = [mesh_to_xy_shadow(m) for m in oriented_meshes]
+    plates = pack_polygons_on_plates(shadows, px, py, gap_mm=gap)
 
     console.print(f"Plates: {len(plates)}")
     for pl in plates:
