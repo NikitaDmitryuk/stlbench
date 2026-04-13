@@ -10,7 +10,7 @@ from rich.console import Console
 from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import AppSettings
-from stlbench.pipeline.mesh_io import collect_stl_paths, load_mesh
+from stlbench.pipeline.mesh_io import SUPPORTED_EXTENSIONS, collect_mesh_paths, load_mesh
 
 
 def n_workers(n_items: int) -> int:
@@ -67,14 +67,15 @@ def load_named_meshes(
     recursive: bool,
     console: Console,
 ) -> tuple[list[Path], list[str], list[trimesh.Trimesh]] | None:
-    """Load all STL files from *input_dir* and return (paths, names, meshes).
+    """Load all mesh files from *input_dir* and return (paths, names, meshes).
 
     Returns ``None`` and prints an error when no files are found or a file
     fails to load.
     """
-    paths = collect_stl_paths(input_dir, recursive)
+    paths = collect_mesh_paths(input_dir, recursive)
     if not paths:
-        console.print(f"[red]No .stl files under {input_dir}[/red]")
+        exts = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        console.print(f"[red]No mesh files ({exts}) found under {input_dir}[/red]")
         return None
 
     names: list[str] = []

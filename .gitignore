@@ -220,6 +220,7 @@ examples/gendalf/scaled/
 examples/gendalf/plates/
 examples/gendalf/autopack/
 examples/gendalf/fill_*/
+examples/gendalf/prepare/
 
 # macOS
 .DS_Store
