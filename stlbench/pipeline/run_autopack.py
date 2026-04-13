@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import rectpack
 import trimesh
 from rich.console import Console
 from rich.table import Table
@@ -15,13 +14,8 @@ from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_d
 from stlbench.core.overhang import find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.packing.rectpack_plate import (
-    PackedPlate,
-    PackedRect,
-    footprint_fits_bin_mm,
-    int_bin_dims_mm,
-    int_rect_dims_mm,
-)
+from stlbench.packing.polygon_pack import footprints_to_box_polygons, try_pack_polygons_single_plate
+from stlbench.packing.rectpack_plate import PackedPlate
 from stlbench.pipeline.common import (
     load_named_meshes,
     n_workers,
@@ -54,52 +48,8 @@ def _try_pack_all(
     gap_mm: float,
 ) -> PackedPlate | None:
     """Try to pack all footprints onto a single plate. Returns None on failure."""
-    bw, bh = int_bin_dims_mm(bed_w, bed_h, gap_mm)
-    g = gap_mm
-
-    for fw, fh in footprints:
-        if not footprint_fits_bin_mm(fw, fh, bed_w, bed_h, g):
-            return None
-
-    packer = rectpack.newPacker(mode=rectpack.PackingMode.Offline, rotation=True)
-    packer.add_bin(bw, bh)
-    int_dims: dict[int, tuple[int, int]] = {}
-    for idx, (fw, fh) in enumerate(footprints):
-        w, h = int_rect_dims_mm(fw, fh, g)
-        int_dims[idx] = (w, h)
-        packer.add_rect(w, h, rid=idx)
-    packer.pack()
-
-    if len(packer) == 0:
-        return None
-
-    placed_ids: set[int] = set()
-    rects: list[PackedRect] = []
-    for r in packer[0]:
-        rid = getattr(r, "rid", None)
-        if rid is None:
-            continue
-        idx = int(rid)
-        placed_ids.add(idx)
-        ow, oh = int_dims[idx]
-        placed_w = int(round(r.width))
-        placed_h = int(round(r.height))
-        was_rotated = (placed_w == oh and placed_h == ow) and (ow != oh)
-        rects.append(
-            PackedRect(
-                part_index=idx,
-                x=float(r.x),
-                y=float(r.y),
-                width=float(r.width) - g,
-                height=float(r.height) - g,
-                rotated=was_rotated,
-            )
-        )
-
-    if len(placed_ids) < len(footprints):
-        return None
-
-    return PackedPlate(index=0, rects=tuple(rects))
+    polygons = footprints_to_box_polygons(footprints)
+    return try_pack_polygons_single_plate(polygons, bed_w, bed_h, gap_mm)
 
 
 def _bisect_scale(
