@@ -1,6 +1,6 @@
 [project]
 name = "stlbench"
-version = "1.0.2"
+version = "1.0.3"
 description = "STL preparation toolkit for resin 3D printing: uniform scaling, bed packing, fill, autopack."
 authors = [
     {name = "NikitaDmitryuk", email = "dmitryuk.nikita@gmail.com"}
@@ -31,6 +31,8 @@ dependencies = [
     "scipy>=1.17",
     "trimesh>=3.21",
     "typer>=0.9",
+    "pycollada (>=0.9.3,<0.10.0)",
+    "pymeshlab (>=2025.7.post1,<2026.0)",
 ]
 
 [project.urls]

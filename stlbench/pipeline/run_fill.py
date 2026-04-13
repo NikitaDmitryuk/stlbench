@@ -22,7 +22,7 @@ from stlbench.packing.rectpack_plate import (
     int_rect_dims_mm,
 )
 from stlbench.pipeline.common import resolve_gap, resolve_printer, resolve_settings
-from stlbench.pipeline.mesh_io import load_mesh
+from stlbench.pipeline.mesh_io import collect_mesh_paths, load_mesh
 
 
 @dataclass
@@ -119,13 +119,13 @@ def run_fill(args: FillRunArgs) -> int:
 
     inp = args.input_file
     if inp.is_dir():
-        stls = sorted(inp.glob("*.stl"))
-        if len(stls) != 1:
+        found = collect_mesh_paths(inp, recursive=False)
+        if len(found) != 1:
             console.print(
-                f"[red]fill expects exactly one STL file (found {len(stls)} in {inp}).[/red]"
+                f"[red]fill expects exactly one mesh file (found {len(found)} in {inp}).[/red]"
             )
             return 2
-        inp = stls[0]
+        inp = found[0]
 
     if not inp.is_file():
         console.print(f"[red]File not found: {inp}[/red]")
