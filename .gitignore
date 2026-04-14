@@ -216,11 +216,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # stlbench example outputs
-examples/gendalf/scaled/
-examples/gendalf/plates/
-examples/gendalf/autopack/
-examples/gendalf/fill_*/
-examples/gendalf/prepare/
+examples/gandalf/scaled/
+examples/gandalf/plates/
+examples/gandalf/autopack/
+examples/gandalf/fill_*/
+examples/gandalf/prepare/
 
 # macOS
 .DS_Store

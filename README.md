@@ -8,9 +8,10 @@
 
 stlbench takes STL files and prepares them for SLA/DLP printers: automatic
 support-minimising orientation, uniform scaling to fit the build volume, packing
-parts onto rectangular print plates, filling the bed with copies, and combined
-scale-and-pack in one step. Support generation and hollowing are **not** performed --
-use your slicer (Lychee, Chitubox, PrusaSlicer, etc.) after export.
+parts onto rectangular print plates, filling the bed with copies, and a flexible
+job-file pipeline for mixing raw and pre-prepared models. Support generation and
+hollowing are **not** performed — use your slicer (Lychee, Chitubox,
+PrusaSlicer, Elegoo SatelLite, etc.) after export.
 
 ## Installation
 
@@ -28,26 +29,35 @@ poetry install --with dev
 
 ## Quick Start
 
-Run **`stlbench --help`** for the same command cheatsheet (copy-paste friendly).
+Run **`stlbench --help`** for the command cheatsheet. The most common workflows:
 
 ```bash
-# Full pipeline in one command: scale → orient → layout (recommended)
-stlbench prepare -i ./parts -o ./plates -c configs/mars5_ultra.toml
+# 1a. Generate a printer profile (edit width_mm / depth_mm / height_mm for your machine)
+stlbench config init -o my_printer.toml
 
-# Or step by step:
-stlbench info   -i ./parts                 -c configs/mars5_ultra.toml  # inspect
-stlbench orient -i ./parts -o ./oriented   -c configs/mars5_ultra.toml  # minimise supports
-stlbench scale  -i ./oriented -o ./scaled  -c configs/mars5_ultra.toml  # fit to build volume
-stlbench layout -i ./scaled -o ./plates    -c configs/mars5_ultra.toml  # pack on plates
+# 1b. Or generate a job-file template (includes [pipeline] and [[parts]] sections)
+stlbench config job -o job.toml
 
-# Scale + pack all on one plate in one step
-stlbench autopack -i ./parts -o ./packed -c configs/mars5_ultra.toml
+# 2a. Full pipeline in one command: scale → orient → layout (recommended)
+stlbench prepare -i ./parts -o ./plates -c my_printer.toml
+
+# 2b. Mix raw and pre-prepared parts using a job file
+stlbench job job.toml -o ./plates
+
+# 3. Or run individual steps manually:
+stlbench info    -i ./parts                -c my_printer.toml   # inspect dimensions
+stlbench orient  -i ./parts -o ./oriented  -c my_printer.toml   # minimise supports
+stlbench scale   -i ./oriented -o ./scaled -c my_printer.toml   # fit to build volume
+stlbench layout  -i ./scaled -o ./plates   -c my_printer.toml   # pack onto plates
+
+# Scale + pack all on one plate (no separate scale/layout steps)
+stlbench autopack -i ./parts -o ./packed -c my_printer.toml
 
 # Fill the bed with copies of a single part
-stlbench fill -i ./part.stl -o ./filled -c configs/mars5_ultra.toml
+stlbench fill -i ./part.stl -o ./filled -c my_printer.toml --scale
 ```
 
-Or specify the printer inline without a config file:
+No config file? Specify the build volume inline as three numbers (X, Y, Z) in mm:
 
 ```bash
 stlbench prepare -i ./parts -o ./plates -p "153.36,77.76,165"
@@ -55,156 +65,247 @@ stlbench prepare -i ./parts -o ./plates -p "153.36,77.76,165"
 
 ## Commands
 
-### `prepare` -- Full pipeline: scale → orient → layout
+### `prepare` — Full pipeline: scale → orient → layout
 
 ```bash
-stlbench prepare -i ./parts -o ./plates -c configs/mars5_ultra.toml
+stlbench prepare -i ./parts -o ./plates -c my_printer.toml
 ```
 
-Runs the three preparation steps in optimal order:
+Runs the three preparation steps in the optimal order for resin printing:
 
-1. **Scale** — finds the largest scale factor that fits every part inside the build volume
-   (using an orientation-free search), then applies a uniform scale to all parts.
-2. **Orient** — rotates each *already-scaled* part to minimise overhanging surface area,
-   subject to the constraint that the part still fits the build volume in the new orientation.
-3. **Layout** — packs the oriented parts onto the minimum number of plates, distributed
-   as evenly as possible.
+1. **Scale** — finds the largest scale factor that fits every part inside the build
+   volume (SO(3) orientation search), then applies a uniform scale to all parts.
+2. **Orient** — rotates each scaled part to minimise overhanging surface area,
+   constrained so the part still fits the build volume.
+3. **Layout** — packs the oriented parts onto the minimum number of plates,
+   distributed as evenly as possible.
 
-Exports one `plate_NN.3mf` + `plate_NN.json` per plate.
+Exports one `plate_NN.3mf` + `plate_NN.json` manifest per plate.
 
-Key options: `--overhang-angle` (default 45°), `--orient-candidates`, `--gap-mm`,
-`--post-fit-scale`, `--dry-run`, `--recursive`.
+Key options: `--overhang-angle` (default 45°), `--orient-candidates` (default 200),
+`--gap-mm`, `--post-fit-scale`, `--dry-run`, `--recursive`, `--resume`.
 
-### `info` -- Analyze models (read-only)
+---
+
+### `job` — Per-part configurable pipeline from a job file
 
 ```bash
-stlbench info -i ./parts -c configs/mars5_ultra.toml
+stlbench job job.toml -o ./plates
 ```
 
-Displays a table with AABB dimensions, volume, vertex/face counts, whether each
-part fits the bed, maximum scale factor, and how many copies would fit (`fill`).
+Runs a flexible pipeline where each part can have its own set of steps. Useful when
+some models are already oriented and supported (they only need packing) while others
+need the full scale → orient → layout treatment. All parts end up on the same plates.
+
+**Example `job.toml`:**
+
+```toml
+[printer]
+width_mm  = 153.36
+depth_mm  = 77.76
+height_mm = 165.0
+
+[scaling]
+bed_margin     = 0.02
+post_fit_scale = 0.95
+
+[packing]
+gap_mm = 2.0
+
+[pipeline]
+default_steps = ["scale", "orient", "layout"]   # default for parts without explicit steps
+
+[[parts]]
+path = "models/gandalf.stl"          # uses default_steps
+
+[[parts]]
+path = "models/staff.stl"
+steps = ["scale", "layout"]          # scale but skip orient
+
+[[parts]]
+path = "supported/sword.stl"
+steps = ["layout"]                   # already prepared — pack only
+```
+
+Valid step sequences (`layout` must always be last):
+
+| `steps` | What happens |
+|---------|-------------|
+| `["scale", "orient", "layout"]` | SO(3) search → global scale → Tweaker-3 orient → pack |
+| `["orient", "scale", "layout"]` | Tweaker-3 orient → scale from oriented AABB → pack |
+| `["scale", "layout"]` | SO(3) search → global scale → pack |
+| `["orient", "layout"]` | Tweaker-3 orient → pack |
+| `["layout"]` | Pack only (model already prepared) |
+
+Global scale is computed once across **all** parts that include the `scale` step, so
+they all receive exactly the same scale factor.
+
+Key options: `--candidates`, `--overhang-angle`, `--rotation-samples`,
+`--grid-step`, `--dry-run`, `--verbose`.
+
+---
+
+### `info` — Inspect models (read-only)
+
+```bash
+stlbench info -i ./parts -c my_printer.toml
+```
+
+Displays a table with AABB dimensions, volume, vertex/face counts, whether each part
+fits the bed, maximum scale factor, and how many copies would fit using `fill`.
 No files are written.
 
-### `scale` -- Uniform scaling
+---
+
+### `scale` — Uniform scaling
 
 ```bash
-stlbench scale -i ./parts -o ./out -c configs/mars5_ultra.toml
+stlbench scale -i ./parts -o ./scaled -c my_printer.toml
 ```
 
-Computes a single scale factor so that **every** part fits inside the printer
-build volume. The largest part determines the factor; all parts share the same
-scale. Supports two methods: `sorted` (default) and `conservative`.
+Computes a single scale factor so that **every** part fits inside the printer build
+volume. The largest part determines the factor; all parts share the same scale.
 
-Key options: `--dry-run`, `--no-upscale`, `--method`, `--orientation free`,
+Key options: `--dry-run`, `--no-upscale`, `--method sorted|conservative`,
 `--post-fit-scale`, `--suffix`, `--recursive`.
 
-### `layout` -- Pack parts onto plates
+---
+
+### `orient` — Minimise support structures
 
 ```bash
-stlbench layout -i ./scaled -o ./plates -c configs/mars5_ultra.toml
+stlbench orient -i ./parts -o ./oriented -c my_printer.toml
 ```
 
-Arranges already-scaled STL files onto rectangular print plates using `rectpack`.
-Exports `plate_01.stl` + `plate_01.json` with positions. Multiple plates are
-created if parts do not fit on one.
-
-Key options: `--dry-run`, `--gap-mm`, `--algorithm shelf|rectpack`.
-
-### `fill` -- Maximum copies of one part
-
-```bash
-stlbench fill -i ./part.stl -o ./filled -c configs/mars5_ultra.toml
-```
-
-Packs as many copies of a single STL file as possible onto one plate. Useful for
-batch printing identical parts.
-
-Key options: `--scale` (scale the part to fit before filling),
-`--orient/--no-orient` (minimise supports before filling),
-`--overhang-angle`, `--dry-run`, `--gap-mm`.
-
-### `orient` -- Minimise support structures
-
-```bash
-stlbench orient -i ./parts -o ./oriented -c configs/mars5_ultra.toml
-```
-
-For each STL file, searches for the rotation that minimises the total area of
-overhanging surfaces (faces whose downward angle exceeds the threshold). Uses a
-two-phase search: discrete evaluation of ~600+ candidate orientations derived from
-the model's own face normals and a uniform icosphere, followed by Nelder-Mead local
-refinement via `scipy.optimize`. The result is written as a new STL with the
-bottom at z = 0, ready for `scale` / `layout`.
+For each STL file, searches for the rotation that minimises overhanging surface area
+(faces whose downward angle exceeds the threshold). Uses a two-phase search: discrete
+evaluation of candidate orientations derived from the model's face normals, followed
+by Nelder-Mead local refinement. The result is written with the bottom at z = 0.
 
 When `--config` or `--printer` is supplied, the search is constrained to orientations
-that fit inside the build volume (non-fitting orientations receive a heavy penalty).
+that fit inside the build volume.
 
-Key options: `--config`/`-c`, `--printer`/`-p`, `--overhang-angle` (default 45°),
-`--candidates` (default 200), `--dry-run`, `--suffix`, `--recursive`.
+Key options: `--overhang-angle` (default 45°), `--candidates` (default 200),
+`--dry-run`, `--suffix`, `--recursive`.
 
-### `autopack` -- Scale + layout on one plate
+---
+
+### `layout` — Pack parts onto plates
 
 ```bash
-stlbench autopack -i ./parts -o ./packed -c configs/mars5_ultra.toml
+stlbench layout -i ./scaled -o ./plates -c my_printer.toml
 ```
 
-Binary-searches for the maximum scale factor at which **all** parts fit onto a
-single plate simultaneously. Combines `scale` and `layout` into one step with a
-different goal: all parts on one plate, not each part fitting individually.
+Arranges already-scaled STL files onto rectangular print plates. Exports
+`plate_NN.3mf` + `plate_NN.json` with part positions. Multiple plates are created
+if all parts do not fit on one.
 
-Key options: `--orient/--no-orient` (minimise supports before packing),
-`--overhang-angle`, `--dry-run`, `--gap-mm`, `--margin`, `--post-fit-scale`.
+Key options: `--dry-run`, `--gap-mm`, `--algorithm`.
 
-### `config init` -- Create a starter TOML
+---
+
+### `autopack` — Scale + layout in one step
+
+```bash
+stlbench autopack -i ./parts -o ./packed -c my_printer.toml
+```
+
+Binary-searches for the maximum scale factor at which **all** parts fit onto a single
+plate simultaneously. Combines `scale` and `layout` into one step with the goal of
+keeping everything on one plate.
+
+Key options: `--orient/--no-orient`, `--overhang-angle`, `--dry-run`, `--gap-mm`,
+`--margin`, `--post-fit-scale`.
+
+---
+
+### `fill` — Maximum copies of one part
+
+```bash
+stlbench fill -i ./part.stl -o ./filled -c my_printer.toml
+```
+
+Packs as many copies of a single STL as possible onto one plate. Add `--scale` to
+fit the part to the bed first, `--orient` to minimise supports before filling.
+
+Key options: `--scale/--no-scale`, `--orient/--no-orient`, `--overhang-angle`,
+`--dry-run`, `--gap-mm`.
+
+---
+
+### `config init` — Create a printer profile
 
 ```bash
 stlbench config init -o my_printer.toml
 ```
 
-Writes a commented profile with the same defaults as [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml).
-Use `--stdout` to print without saving, or `--force` to overwrite an existing file.
+Writes a printer profile TOML with `[printer]`, `[scaling]`, and `[packing]` sections.
+Use `--stdout` to print without saving, or `--force` to overwrite.
+
+### `config job` — Create a job-file template
+
+```bash
+stlbench config job -o job.toml
+```
+
+Writes a job-file template with all sections pre-filled: `[printer]`, `[scaling]`,
+`[packing]`, `[pipeline]`, and two commented-out `[[parts]]` examples. Edit the file,
+fill in your STL paths, then run `stlbench job job.toml -o ./plates`.
 
 ## Configuration
 
-Printer profiles are TOML files. See [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml)
-for a complete example (ELEGOO Mars 5 Ultra), or generate one with `stlbench config init`.
+Printer profiles are TOML files. Generate a template with `stlbench config init` or
+see [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml) for a complete example
+(ELEGOO Mars 5 Ultra).
 
-Key sections:
+| Section      | Keys                                                  | Purpose                              |
+|--------------|-------------------------------------------------------|--------------------------------------|
+| `[printer]`  | `name`, `width_mm`, `depth_mm`, `height_mm`           | Build volume (required)              |
+| `[scaling]`  | `bed_margin` (0–1), `post_fit_scale` (>0)             | Margin and post-scale multiplier     |
+| `[packing]`  | `gap_mm`                                              | Surface-to-surface gap between parts |
+| `[pipeline]` | `default_steps`                                       | Default step list for `job` command  |
+| `[[parts]]`  | `path`, `steps`                                       | Per-part entries for `job` command   |
 
-| Section         | Purpose                                          |
-|-----------------|--------------------------------------------------|
-| `[printer]`     | Build volume: `width_mm`, `depth_mm`, `height_mm`|
-| `[scaling]`     | `bed_margin`, `post_fit_scale`                   |
-| `[packing]`     | `gap_mm` between parts on the bed                |
+## Output Files
 
-Orientation (`axis` / `free`) and rotation sample count are **not** in TOML: use
-`scale --orientation` and `scale --rotation-samples`. With `free`, orientation matches the
-same printer-axis search as `layout` (permutation × random rotations), but scale picks the
-candidate that **maximizes** the group scale factor (layout still minimizes XY footprint for
-packing). Plate placement is only in `layout`. Default `layout` algorithm (`rectpack` vs
-`shelf`) is set via `layout --algorithm`.
+All commands that write files produce **3MF** output (except `scale` and `orient`,
+which write scaled/rotated STL files).
+
+| Command    | Output                                           |
+|------------|--------------------------------------------------|
+| `prepare`  | `plate_NN.3mf`, `plate_NN.json` per plate        |
+| `job`      | `plate_NN.3mf`, `plate_NN.json` per plate        |
+| `scale`    | `*.stl` (one per input part, in-place scaled)    |
+| `orient`   | `*.stl` (one per input part, rotated)            |
+| `layout`   | `plate_NN.3mf`, `plate_NN.json` per plate        |
+| `autopack` | `plate_NN.3mf`, `plate_NN.json` per plate        |
+| `fill`     | `fill_plate.3mf`, `fill_plate.json`              |
+| `info`     | Console output only                              |
+
+The 3MF files use only the core 3MF 2015/02 namespace and are compatible with
+Elegoo SatelLite, Chitubox, Lychee, and PrusaSlicer.
 
 ## Examples
 
-See [`examples/README.md`](examples/README.md) for a full walkthrough using the
-included Gendalf model (3 parts tracked via Git LFS).
+See [`examples/README.md`](examples/README.md) for a step-by-step walkthrough
+using the included Gandalf model (3 parts tracked via Git LFS).
 
 ## Package Structure
 
-| Module             | Purpose                                               |
-|--------------------|-------------------------------------------------------|
-| `stlbench.cli`     | Typer CLI application                                 |
-| `stlbench.core`    | Scale factor, orientation, overhang analysis          |
-| `stlbench.config`  | Pydantic schema + TOML loader                         |
-| `stlbench.packing` | Shelf and rectpack algorithms                         |
-| `stlbench.export`  | Plate STL assembly and JSON manifest                  |
-| `stlbench.pipeline`| Command runners (orient, scale, layout, fill, etc.)   |
+| Module              | Purpose                                                 |
+|---------------------|---------------------------------------------------------|
+| `stlbench.cli`      | Typer CLI — all commands and argument parsing           |
+| `stlbench.config`   | Pydantic schema (`AppSettings`, `PartSpec`) + TOML loader |
+| `stlbench.core`     | Scale factor computation, overhang analysis, orientation search |
+| `stlbench.packing`  | 2D polygon packing onto plates (Shapely + custom grid)  |
+| `stlbench.export`   | 3MF and JSON manifest writers                           |
+| `stlbench.pipeline` | Command runners (`run_prepare`, `run_job`, `run_scale`, etc.) |
 
 ## Limitations
 
-- Boolean operations are sensitive to non-manifold STL. For complex models use a
-  mesh repair tool first.
-- Supports and hollowing are not generated — use your slicer after export.
+- Non-manifold meshes may produce incorrect AABB or scale results. Repair first
+  with a tool such as Meshmixer or Microsoft 3D Builder.
+- Supports and hollowing are not generated — open the exported 3MF in your slicer.
 
 ## License
 

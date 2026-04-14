@@ -15,3 +15,13 @@ post_fit_scale = 0.95
 
 [packing]
 gap_mm = 5.0
+
+[pipeline]
+# Default step sequence for parts that do not specify their own steps in a job file.
+# Valid sequences (layout must always be last):
+#   ["scale", "orient", "layout"]  — SO(3) search → global scale → orient → pack  (default)
+#   ["orient", "scale", "layout"]  — orient first, then scale from oriented AABB
+#   ["scale", "layout"]            — scale but skip overhang orientation
+#   ["orient", "layout"]           — orient only, no scaling
+#   ["layout"]                     — pack as-is (model already prepared)
+default_steps = ["scale", "orient", "layout"]

@@ -10,17 +10,18 @@ from typing import Annotated
 import typer
 
 from stlbench.config.loader import load_app_settings
-from stlbench.config.sample_config import render_sample_config_toml
+from stlbench.config.sample_config import render_sample_config_toml, render_sample_job_toml
 from stlbench.pipeline.run_autopack import AutopackRunArgs, run_autopack
 from stlbench.pipeline.run_fill import FillRunArgs, run_fill
 from stlbench.pipeline.run_info import InfoRunArgs, run_info
+from stlbench.pipeline.run_job import JobRunArgs, run_job
 from stlbench.pipeline.run_layout import LayoutRunArgs, run_layout
 from stlbench.pipeline.run_orient import OrientRunArgs, run_orient
 from stlbench.pipeline.run_prepare import PrepareRunArgs, run_prepare
 from stlbench.pipeline.run_scale import ScaleRunArgs, run_scale
 
 _ROOT_HELP = """\
-STL preparation for resin 3D printing: prepare, scale, layout, fill, autopack, orient, info.
+STL preparation for resin 3D printing: prepare, job, scale, layout, fill, autopack, orient, info.
 
 Typical commands (adjust paths and my_printer.toml):
 
@@ -30,6 +31,9 @@ Typical commands (adjust paths and my_printer.toml):
 
   # Full pipeline: scale → orient → layout (recommended)
   stlbench prepare -i ./parts -o ./plates -c my_printer.toml
+
+  # Job file: per-part pipeline (mix pre-oriented and raw models on same plates)
+  stlbench job job.toml -o ./plates
 
   # Inspect parts: dimensions, fit, suggested scale, fill estimate
   stlbench info -i ./parts -c my_printer.toml
@@ -77,6 +81,47 @@ def cmd_config_init(
     ] = False,
 ) -> None:
     text = render_sample_config_toml()
+    if stdout:
+        typer.echo(text, nl=False)
+        raise typer.Exit(0)
+    if output.exists() and not force:
+        typer.secho(
+            f"File already exists: {output}  (use --force to overwrite)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+    typer.echo(f"Wrote {output.resolve()}")
+    raise typer.Exit(0)
+
+
+@config_app.command("job")
+def cmd_config_job(
+    output: Annotated[
+        Path,
+        typer.Option(
+            "-o",
+            "--output",
+            help="Path to write (default: job.toml in the current directory).",
+        ),
+    ] = Path("job.toml"),
+    stdout: Annotated[
+        bool, typer.Option("--stdout", help="Print TOML to stdout; do not write a file.")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("-f", "--force", help="Overwrite an existing file.")
+    ] = False,
+) -> None:
+    """Generate a job-file template with \\[pipeline] and \\[\\[parts]] sections.
+
+    Edit the generated file to add your STL paths, then run:
+
+    \b
+      stlbench job job.toml -o ./plates
+    """
+    text = render_sample_job_toml()
     if stdout:
         typer.echo(text, nl=False)
         raise typer.Exit(0)
@@ -471,9 +516,76 @@ def cmd_info(
     )
 
 
+@app.command()
+def job(
+    job_file: Annotated[
+        Path, typer.Argument(help="Path to job TOML file (contains [[parts]] list).")
+    ],
+    output: Annotated[Path, typer.Option("-o", "--output", help="Output directory.")] = Path("."),
+    candidates: Annotated[
+        int,
+        typer.Option(
+            "--candidates",
+            help="Top-N mesh faces used as overhang orientation candidates (orient step).",
+        ),
+    ] = 200,
+    overhang_angle: Annotated[
+        float,
+        typer.Option("--overhang-angle", help="Overhang threshold in degrees (orient step)."),
+    ] = 45.0,
+    rotation_samples: Annotated[
+        int,
+        typer.Option("--rotation-samples", help="SO(3) samples for scale orientation search."),
+    ] = 4096,
+    grid_step: Annotated[
+        float,
+        typer.Option("--grid-step", help="Packing grid step in mm (layout step)."),
+    ] = 2.0,
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show extra diagnostics.")] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Simulate without writing files.")
+    ] = False,
+) -> None:
+    """Run a per-part configurable pipeline from a job TOML file.
+
+    The job file combines printer config and a [[parts]] list where each entry
+    can override the pipeline steps (scale / orient / layout).  All parts are
+    packed together onto the same build plates regardless of their upstream steps.
+
+    Example job.toml:\n
+    \b
+      [printer]
+      width_mm = 153.36
+      depth_mm = 77.76
+      height_mm = 165.0\n
+      [pipeline]
+      default_steps = ["scale", "orient", "layout"]\n
+      [[parts]]
+      path = "models/gandalf.stl"\n
+      [[parts]]
+      path = "pre_oriented/sword.stl"
+      steps = ["layout"]
+    """
+    raise typer.Exit(
+        run_job(
+            JobRunArgs(
+                job_path=job_file,
+                output_dir=output,
+                n_orient_candidates=candidates,
+                overhang_threshold_deg=overhang_angle,
+                rotation_samples=rotation_samples,
+                grid_step_mm=grid_step,
+                verbose=verbose,
+                dry_run=dry_run,
+            )
+        )
+    )
+
+
 _KNOWN_COMMANDS = frozenset(
     {
         "prepare",
+        "job",
         "scale",
         "layout",
         "fill",

@@ -1,6 +1,6 @@
 [project]
 name = "stlbench"
-version = "1.0.8"
+version = "1.0.9"
 description = "STL preparation toolkit for resin 3D printing: uniform scaling, bed packing, fill, autopack."
 authors = [
     {name = "NikitaDmitryuk", email = "dmitryuk.nikita@gmail.com"}
@@ -87,7 +87,7 @@ select = ["E", "F", "W", "UP", "B", "SIM"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 packages = ["stlbench"]
 warn_return_any = true
 warn_unused_ignores = true
