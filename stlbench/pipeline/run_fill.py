@@ -6,13 +6,12 @@ from pathlib import Path
 
 import numpy as np
 import rectpack
-import trimesh
 from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
-from stlbench.export.plate import _ROT_Z_90, mesh_footprint_xy
+from stlbench.export.plate import _ROT_Z_90, _write_3mf_compat, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
@@ -183,7 +182,9 @@ def run_fill(args: FillRunArgs) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    scene = trimesh.Scene()
+    fill_meshes = []
+    fill_transforms = []
+    fill_names = []
     for i, r in enumerate(plate.rects):
         m = mesh.copy()
         m.apply_translation(
@@ -192,12 +193,16 @@ def run_fill(args: FillRunArgs) -> int:
         if r.rotated:
             m.apply_transform(_ROT_Z_90)
             m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
-        t = trimesh.transformations.translation_matrix([r.x, r.y, 0.0])
-        scene.add_geometry(m, geom_name=f"copy_{i:02d}", transform=t)
+        t = np.eye(4, dtype=np.float64)
+        t[0, 3] = r.x
+        t[1, 3] = r.y
+        fill_meshes.append(m)
+        fill_transforms.append(t)
+        fill_names.append(f"copy_{i:02d}")
 
     out_3mf = args.output_dir / "fill_plate.3mf"
     out_json = args.output_dir / "fill_plate.json"
-    scene.export(str(out_3mf))
+    _write_3mf_compat(fill_meshes, fill_transforms, fill_names, out_3mf)
 
     manifest = {
         "source": inp.name,

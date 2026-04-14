@@ -19,6 +19,8 @@ def load_app_settings(path: Path) -> AppSettings:
         "printer": printer,
         "scaling": raw.get("scaling") or {},
         "packing": raw.get("packing") or {},
+        "pipeline": raw.get("pipeline") or {},
+        "parts": raw.get("parts") or [],
     }
     return cast(AppSettings, AppSettings.model_validate(data))
 
