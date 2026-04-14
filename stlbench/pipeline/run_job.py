@@ -50,6 +50,7 @@ from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SE
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import PartSpec, StepName
 from stlbench.core.fit import compute_global_scale, printer_dims_with_margin
+from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
@@ -69,6 +70,7 @@ class JobRunArgs:
     grid_step_mm: float = 2.0
     verbose: bool = False
     dry_run: bool = False
+    cleanup: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +390,15 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
 
     final_meshes: list[trimesh.Trimesh] = [pw.final_mesh for pw in works]  # type: ignore[misc]
     final_names: list[str] = [pw.label for pw in works]
+
+    if args.cleanup:
+        for i, m in enumerate(final_meshes):
+            cleaned, n_rem = remove_small_components(m)
+            if n_rem:
+                final_meshes[i] = cleaned
+                console.print(
+                    f"[dim]cleanup: {final_names[i]} — removed {n_rem} tiny component(s)[/dim]"
+                )
 
     # ── Pass 4: pack and export ─────────────────────────────────────────────
     console.print("\n[bold]Pass 4  Layout[/bold]")

@@ -225,3 +225,4 @@ examples/gandalf/prepare/
 # macOS
 .DS_Store
 .idea
+trash/

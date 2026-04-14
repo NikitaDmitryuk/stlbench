@@ -11,6 +11,7 @@ from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
+from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
@@ -39,6 +40,7 @@ class AutopackRunArgs:
     dry_run: bool
     recursive: bool
     verbose: bool = False
+    cleanup: bool = False
 
 
 def _try_pack_all(
@@ -207,6 +209,13 @@ def run_autopack(args: AutopackRunArgs) -> int:
         scaled_meshes: list[trimesh.Trimesh] = list(
             pool.map(_apply_scale, zip(meshes, orient_transforms, strict=True))
         )
+
+    if args.cleanup:
+        for i, m in enumerate(scaled_meshes):
+            cleaned, n_rem = remove_small_components(m)
+            if n_rem:
+                scaled_meshes[i] = cleaned
+                console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
 
     out_3mf = args.output_dir / "autopack_plate.3mf"
     out_json = args.output_dir / "autopack_plate.json"

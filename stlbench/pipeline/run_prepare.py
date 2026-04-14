@@ -46,6 +46,7 @@ from stlbench.core.fit import (
     compute_global_scale,
     printer_dims_with_margin,
 )
+from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import (
     apply_min_overhang_orientation,
     find_min_overhang_rotation,
@@ -84,6 +85,7 @@ class PrepareRunArgs:
     verbose: bool = False
     grid_step_mm: float = 2.0
     resume: bool = False
+    cleanup: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +390,13 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             return 1
 
     n_parts = len(oriented_meshes)
+
+    if args.cleanup:
+        for i, m in enumerate(oriented_meshes):
+            cleaned, n_rem = remove_small_components(m)
+            if n_rem:
+                oriented_meshes[i] = cleaned
+                console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
 
     shadows = []
     with _make_progress(console) as progress:
