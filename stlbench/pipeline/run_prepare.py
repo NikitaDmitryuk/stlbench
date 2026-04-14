@@ -55,7 +55,6 @@ from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
-from stlbench.packing.rectpack_plate import footprint_fits_bin_mm
 from stlbench.pipeline.common import (
     load_named_meshes,
     n_workers,
@@ -381,10 +380,10 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         b = np.asarray(m.bounds)
         dx = float(b[1, 0] - b[0, 0])
         dy = float(b[1, 1] - b[0, 1])
-        if not footprint_fits_bin_mm(dx, dy, px, py, gap):
+        if not ((dx <= px and dy <= py) or (dy <= px and dx <= py)):
             console.print(
                 f"[red]Part {name!r} ({dx:.1f}×{dy:.1f} mm) does not fit "
-                f"on bed {px:.1f}×{py:.1f} mm (gap {gap} mm).[/red]"
+                f"on bed {px:.1f}×{py:.1f} mm.[/red]"
             )
             return 1
 

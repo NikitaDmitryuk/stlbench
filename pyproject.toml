@@ -1,6 +1,6 @@
 [project]
 name = "stlbench"
-version = "1.0.6"
+version = "1.0.7"
 description = "STL preparation toolkit for resin 3D printing: uniform scaling, bed packing, fill, autopack."
 authors = [
     {name = "NikitaDmitryuk", email = "dmitryuk.nikita@gmail.com"}

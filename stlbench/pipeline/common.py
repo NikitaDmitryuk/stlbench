@@ -10,7 +10,7 @@ from rich.console import Console
 from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import AppSettings
-from stlbench.pipeline.mesh_io import SUPPORTED_EXTENSIONS, collect_mesh_paths, load_mesh
+from stlbench.pipeline.mesh_io import SUPPORTED_EXTENSIONS, collect_mesh_paths, load_mesh_with_info
 
 
 def n_workers(n_items: int) -> int:
@@ -82,10 +82,16 @@ def load_named_meshes(
     meshes: list[trimesh.Trimesh] = []
     for p in paths:
         try:
-            m = load_mesh(p)
+            m, has_multiple = load_mesh_with_info(p)
         except (OSError, ValueError, TypeError) as e:
             console.print(f"[red]Failed to load {p}: {e}[/red]")
             return None
-        names.append(str(p.relative_to(input_dir)) if p.is_relative_to(input_dir) else p.name)
+        name = str(p.relative_to(input_dir)) if p.is_relative_to(input_dir) else p.name
+        if has_multiple:
+            console.print(
+                f"[yellow]Warning: {name!r} contains multiple surfaces — "
+                f"model may be broken (surfaces merged for processing).[/yellow]"
+            )
+        names.append(name)
         meshes.append(m)
     return paths, names, meshes
