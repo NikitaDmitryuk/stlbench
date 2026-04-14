@@ -201,3 +201,44 @@ def test_rotation_allows_tall_part_to_fit():
     assert len(plates) == 1
     assert len(plates[0].rects) == 1
     assert plates[0].rects[0].rotated is True
+
+
+# ---------------------------------------------------------------------------
+# Termination guarantees
+# ---------------------------------------------------------------------------
+
+
+def test_zero_grid_step_raises():
+    """grid_step_mm=0 would cause an infinite loop; must be rejected early."""
+    polys = [_box_poly(10.0, 10.0)]
+    with pytest.raises(ValueError, match="grid_step_mm must be positive"):
+        pack_polygons_on_plates(polys, bed_w=100.0, bed_h=100.0, gap_mm=1.0, grid_step_mm=0.0)
+
+
+def test_negative_grid_step_raises():
+    polys = [_box_poly(10.0, 10.0)]
+    with pytest.raises(ValueError, match="grid_step_mm must be positive"):
+        pack_polygons_on_plates(polys, bed_w=100.0, bed_h=100.0, gap_mm=1.0, grid_step_mm=-1.0)
+
+
+def test_single_plate_zero_grid_step_raises():
+    polys = [_box_poly(10.0, 10.0)]
+    with pytest.raises(ValueError, match="grid_step_mm must be positive"):
+        try_pack_polygons_single_plate(
+            polys, bed_w=100.0, bed_h=100.0, gap_mm=1.0, grid_step_mm=0.0
+        )
+
+
+def test_many_parts_all_placed():
+    """30 small parts on a large bed must all be placed (terminates, no parts lost)."""
+    polys = [_box_poly(8.0, 8.0) for _ in range(30)]
+    plates = pack_polygons_on_plates(polys, bed_w=100.0, bed_h=100.0, gap_mm=1.0)
+    total = sum(len(p.rects) for p in plates)
+    assert total == 30
+
+
+def test_max_plates_limit_enforced():
+    """max_plates=1 with parts that cannot all fit must raise, not loop."""
+    polys = [_box_poly(90.0, 90.0)] * 3
+    with pytest.raises(RuntimeError):
+        pack_polygons_on_plates(polys, bed_w=100.0, bed_h=100.0, gap_mm=1.0, max_plates=1)

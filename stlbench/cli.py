@@ -400,8 +400,20 @@ def cmd_prepare(
         int,
         typer.Option("--orient-candidates", help="Candidate bottom directions for orient step."),
     ] = 200,
+    grid_step: Annotated[
+        float,
+        typer.Option(
+            "--grid-step", help="Layout grid resolution in mm (smaller = denser packing, slower)."
+        ),
+    ] = 2.0,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume", help="Skip scale+orient steps if output_dir/cache/ has a valid cache."
+        ),
+    ] = False,
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
@@ -423,6 +435,8 @@ def cmd_prepare(
                 dry_run=dry_run,
                 recursive=recursive,
                 verbose=verbose,
+                grid_step_mm=grid_step,
+                resume=resume,
             )
         )
     )
