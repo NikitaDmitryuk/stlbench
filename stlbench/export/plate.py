@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -40,87 +39,6 @@ def _place_rect(m: trimesh.Trimesh, r: object, rot_z_90: np.ndarray) -> trimesh.
     return m
 
 
-def _write_3mf_compat(
-    meshes: list[trimesh.Trimesh],
-    transforms: list[np.ndarray],
-    names: list[str],
-    out_path: Path,
-) -> None:
-    """Write a minimal 3MF using only the core namespace.
-
-    Trimesh ≥ 4.x adds production-extension attributes (p:UUID, partnumber)
-    and re-declares namespaces on every <item> element.  Elegoo SatelLite and
-    some other resin slicers reject those files.  This writer emits only the
-    core 3MF 2015/02 namespace, matching the format those slicers expect.
-
-    Each mesh must already be positioned at its local origin (Z-min = 0,
-    XY-min = 0).  The plate-level XY translation is carried in *transforms*
-    and written as the ``transform`` attribute of each ``<item>`` element.
-    """
-    _CORE_NS = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
-    _CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
-    _REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
-    _MODEL_REL = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"
-
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f'<Types xmlns="{_CT_NS}">\n'
-        '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>\n'
-        '  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>\n'
-        "</Types>\n"
-    )
-    rels = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f'<Relationships xmlns="{_REL_NS}">\n'
-        f'  <Relationship Type="{_MODEL_REL}" Target="/3D/3dmodel.model" Id="rel0"/>\n'
-        "</Relationships>\n"
-    )
-
-    def _attr(s: str) -> str:
-        return (
-            s.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
-        )
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(str(out_path), "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types)
-        zf.writestr("_rels/.rels", rels)
-
-        with zf.open("3D/3dmodel.model", "w") as f:
-
-            def w(s: str) -> None:
-                f.write(s.encode("utf-8"))
-
-            w('<?xml version="1.0" encoding="UTF-8"?>\n')
-            w(f'<model unit="millimeter" xml:lang="en-US" xmlns="{_CORE_NS}">\n')
-            w("  <resources>\n")
-
-            for obj_id, (mesh, name) in enumerate(zip(meshes, names, strict=True), start=1):
-                w(f'    <object id="{obj_id}" name="{_attr(name)}" type="model">\n')
-                w("      <mesh>\n")
-                w("        <vertices>\n")
-                for v in mesh.vertices:
-                    w(f'          <vertex x="{v[0]:.3f}" y="{v[1]:.3f}" z="{v[2]:.3f}"/>\n')
-                w("        </vertices>\n")
-                w("        <triangles>\n")
-                for face in mesh.faces:
-                    w(f'          <triangle v1="{face[0]}" v2="{face[1]}" v3="{face[2]}"/>\n')
-                w("        </triangles>\n")
-                w("      </mesh>\n")
-                w("    </object>\n")
-
-            w("  </resources>\n")
-            w("  <build>\n")
-            for obj_id, tf in enumerate(transforms, start=1):
-                tx, ty = tf[0, 3], tf[1, 3]
-                w(
-                    f'    <item objectid="{obj_id}"'
-                    f' transform="1 0 0 0 1 0 0 0 1 {tx:.3f} {ty:.3f} 0"/>\n'
-                )
-            w("  </build>\n")
-            w("</model>\n")
-
-
 def export_plate_3mf(
     meshes: list[trimesh.Trimesh],
     plate: PackedPlate,
@@ -133,10 +51,6 @@ def export_plate_3mf(
     Each mesh becomes a separate object in the 3MF file so that slicers
     (Elegoo SatelLite, Chitubox, Lychee, PrusaSlicer) can add supports and
     adjust orientation per-part after import.
-
-    Uses a minimal core-only 3MF writer instead of trimesh.Scene.export()
-    to avoid production-extension attributes (p:UUID, partnumber) that
-    cause Elegoo SatelLite to refuse the file.
     """
     out_meshes: list[trimesh.Trimesh] = []
     out_transforms: list[np.ndarray] = []
@@ -182,7 +96,11 @@ def export_plate_3mf(
     if not out_meshes:
         raise ValueError("No meshes to export for this plate.")
 
-    _write_3mf_compat(out_meshes, out_transforms, out_names, out_3mf)
+    scene = trimesh.Scene()
+    for m, tf, name in zip(out_meshes, out_transforms, out_names, strict=True):
+        scene.add_geometry(m, geom_name=name, transform=tf)
+    out_3mf.parent.mkdir(parents=True, exist_ok=True)
+    scene.export(str(out_3mf))
 
     if out_manifest is not None:
         payload = {"plate_index": plate.index, "parts": manifest_parts}

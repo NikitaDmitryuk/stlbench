@@ -6,12 +6,14 @@ from pathlib import Path
 
 import numpy as np
 import rectpack
+import trimesh
 from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
+from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
-from stlbench.export.plate import _ROT_Z_90, _write_3mf_compat, mesh_footprint_xy
+from stlbench.export.plate import _ROT_Z_90, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
@@ -35,6 +37,7 @@ class FillRunArgs:
     orient_on: bool
     orient_threshold_deg: float
     dry_run: bool
+    cleanup: bool = False
 
 
 def _max_copies_on_plate(
@@ -136,6 +139,11 @@ def run_fill(args: FillRunArgs) -> int:
         console.print(f"[red]Failed to load {inp}: {e}[/red]")
         return 1
 
+    if args.cleanup:
+        mesh, n_rem = remove_small_components(mesh)
+        if n_rem:
+            console.print(f"[dim]cleanup: {inp.name} — removed {n_rem} tiny component(s)[/dim]")
+
     if args.scale:
         margin = st.scaling.bed_margin if st else 0.0
         epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
@@ -202,7 +210,10 @@ def run_fill(args: FillRunArgs) -> int:
 
     out_3mf = args.output_dir / "fill_plate.3mf"
     out_json = args.output_dir / "fill_plate.json"
-    _write_3mf_compat(fill_meshes, fill_transforms, fill_names, out_3mf)
+    scene = trimesh.Scene()
+    for m, tf, name in zip(fill_meshes, fill_transforms, fill_names, strict=True):
+        scene.add_geometry(m, geom_name=name, transform=tf)
+    scene.export(str(out_3mf))
 
     manifest = {
         "source": inp.name,

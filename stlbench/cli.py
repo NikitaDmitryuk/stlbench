@@ -230,6 +230,10 @@ def cmd_layout(
     algorithm: Annotated[str | None, typer.Option("--algorithm")] = None,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    cleanup: Annotated[
+        bool,
+        typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -243,6 +247,7 @@ def cmd_layout(
                 algorithm=algorithm,
                 recursive=recursive,
                 dry_run=dry_run,
+                cleanup=cleanup,
             )
         )
     )
@@ -276,6 +281,10 @@ def cmd_fill(
         typer.Option("--overhang-angle", help="Overhang threshold in degrees."),
     ] = 45.0,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    cleanup: Annotated[
+        bool,
+        typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -290,6 +299,7 @@ def cmd_fill(
                 orient_on=orient,
                 orient_threshold_deg=overhang_angle,
                 dry_run=dry_run,
+                cleanup=cleanup,
             )
         )
     )
@@ -332,6 +342,10 @@ def cmd_autopack(
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
+    cleanup: Annotated[
+        bool,
+        typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -349,6 +363,7 @@ def cmd_autopack(
                 dry_run=dry_run,
                 recursive=recursive,
                 verbose=verbose,
+                cleanup=cleanup,
             )
         )
     )
@@ -462,6 +477,10 @@ def cmd_prepare(
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
+    cleanup: Annotated[
+        bool,
+        typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -482,6 +501,7 @@ def cmd_prepare(
                 verbose=verbose,
                 grid_step_mm=grid_step,
                 resume=resume,
+                cleanup=cleanup,
             )
         )
     )
@@ -545,6 +565,10 @@ def job(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Simulate without writing files.")
     ] = False,
+    cleanup: Annotated[
+        bool,
+        typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
+    ] = False,
 ) -> None:
     """Run a per-part configurable pipeline from a job TOML file.
 
@@ -577,6 +601,7 @@ def job(
                 grid_step_mm=grid_step,
                 verbose=verbose,
                 dry_run=dry_run,
+                cleanup=cleanup,
             )
         )
     )

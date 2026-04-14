@@ -8,6 +8,7 @@ import trimesh
 from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
+from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
@@ -33,6 +34,7 @@ class LayoutRunArgs:
     algorithm: str | None
     recursive: bool
     dry_run: bool
+    cleanup: bool = False
 
 
 def run_layout(args: LayoutRunArgs) -> int:
@@ -115,6 +117,13 @@ def run_layout(args: LayoutRunArgs) -> int:
             "[dim]Shelf mode does not export STL; use: stlbench layout ... --algorithm rectpack[/dim]"
         )
         return 0
+
+    if args.cleanup:
+        for i, m in enumerate(oriented_meshes):
+            cleaned, n_rem = remove_small_components(m)
+            if n_rem:
+                oriented_meshes[i] = cleaned
+                console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
 
     shadows = [mesh_to_xy_shadow(m) for m in oriented_meshes]
     plates = pack_polygons_on_plates(shadows, px, py, gap_mm=gap)
