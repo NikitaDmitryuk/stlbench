@@ -25,6 +25,8 @@ data structures and all downstream export code.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from shapely import affinity
 from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
@@ -95,6 +97,10 @@ def _try_place_one(
     return None
 
 
+_FORBIDDEN_SIMPLIFY_EVERY = 5  # simplify forbidden zone every N placed parts
+_FORBIDDEN_SIMPLIFY_TOL = 1.0  # Douglas-Peucker tolerance in mm
+
+
 def _pack_plate(
     part_indices: list[int],
     polygons: list[BaseGeometry],
@@ -103,12 +109,17 @@ def _pack_plate(
     gap_mm: float,
     grid_step_mm: float,
     plate_idx: int,
+    on_placed: Callable[[], None] | None = None,
 ) -> tuple[PackedPlate, list[int]]:
     """Pack as many of *part_indices* as possible onto one plate.
 
     Returns ``(PackedPlate, unplaced_indices)``.  The forbidden zone is built
     incrementally: each placed polygon is dilated by ``gap_mm`` and unioned
     into the running forbidden zone.
+
+    Every ``_FORBIDDEN_SIMPLIFY_EVERY`` placements the forbidden zone is
+    simplified (Douglas-Peucker) to prevent its vertex count from growing
+    without bound as more parts are placed.
     """
     forbidden: BaseGeometry | None = None
     rects: list[PackedRect] = []
@@ -128,6 +139,11 @@ def _pack_plate(
             rects.append(rect)
             buffered = placed_poly.buffer(gap_mm)
             forbidden = buffered if forbidden is None else forbidden.union(buffered)
+            # Periodically simplify to prevent quadratic growth of vertex count.
+            if len(rects) % _FORBIDDEN_SIMPLIFY_EVERY == 0:
+                forbidden = forbidden.simplify(_FORBIDDEN_SIMPLIFY_TOL, preserve_topology=True)
+            if on_placed is not None:
+                on_placed()
         else:
             unplaced.append(orig_idx)
 
@@ -139,8 +155,9 @@ def pack_polygons_on_plates(
     bed_w: float,
     bed_h: float,
     gap_mm: float,
-    grid_step_mm: float = 1.0,
+    grid_step_mm: float = 2.0,
     max_plates: int = 64,
+    on_placed: Callable[[], None] | None = None,
 ) -> list[PackedPlate]:
     """Pack 2-D polygons onto the minimum number of plates.
 
@@ -164,6 +181,8 @@ def pack_polygons_on_plates(
     """
     if bed_w <= 0 or bed_h <= 0:
         raise ValueError("bed dimensions must be positive.")
+    if grid_step_mm <= 0:
+        raise ValueError(f"grid_step_mm must be positive, got {grid_step_mm!r}.")
     if not polygons:
         return []
 
@@ -188,7 +207,7 @@ def pack_polygons_on_plates(
         if len(plates) >= max_plates:
             raise RuntimeError(f"Exceeded max_plates={max_plates}; not all parts could be placed.")
         plate, remaining = _pack_plate(
-            remaining, polygons, bed_w, bed_h, gap_mm, grid_step_mm, len(plates)
+            remaining, polygons, bed_w, bed_h, gap_mm, grid_step_mm, len(plates), on_placed
         )
         if not plate.rects:
             raise RuntimeError(
@@ -205,13 +224,16 @@ def try_pack_polygons_single_plate(
     bed_w: float,
     bed_h: float,
     gap_mm: float,
-    grid_step_mm: float = 1.0,
+    grid_step_mm: float = 2.0,
 ) -> PackedPlate | None:
     """Try to pack **all** *polygons* onto a single plate.
 
     Returns the ``PackedPlate`` on success, ``None`` if any part cannot be
     placed.  Used by the autopack bisection search.
     """
+    if grid_step_mm <= 0:
+        raise ValueError(f"grid_step_mm must be positive, got {grid_step_mm!r}.")
+
     order = sorted(range(len(polygons)), key=lambda i: polygons[i].area, reverse=True)
 
     for orig_idx in order:
