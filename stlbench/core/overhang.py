@@ -246,7 +246,13 @@ def _build_candidates(mesh: trimesh.Trimesh, n_mesh_candidates: int) -> np.ndarr
     mesh_cands = normals[top_idx]
 
     ico = trimesh.creation.icosphere(subdivisions=1)  # 80 faces (was 320 at subdivisions=2)
-    combined = np.vstack([mesh_cands, ico.face_normals, -ico.face_normals])
+    # Six axis-aligned directions guarantee at least one Phase-1 candidate for
+    # meshes that only fit in a narrow angular window (e.g. tall/thin parts).
+    axis_dirs = np.array(
+        [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+        dtype=np.float64,
+    )
+    combined = np.vstack([mesh_cands, ico.face_normals, -ico.face_normals, axis_dirs])
 
     # Normalise and deduplicate (round to 3 decimals for hashing)
     norms = np.linalg.norm(combined, axis=1, keepdims=True)

@@ -42,17 +42,29 @@ def _load_mesh_pymeshlab(path: Path) -> trimesh.Trimesh:
 
 
 def load_mesh(path: Path) -> trimesh.Trimesh:
+    mesh, _ = load_mesh_with_info(path)
+    return mesh
+
+
+def load_mesh_with_info(path: Path) -> tuple[trimesh.Trimesh, bool]:
+    """Load *path* and return ``(mesh, has_multiple_surfaces)``.
+
+    *has_multiple_surfaces* is ``True`` when the file contained more than one
+    geometry object (e.g. a multi-body or multi-part model).  The geometries
+    are always merged into a single ``Trimesh`` for downstream use.
+    """
     if path.suffix.lower() == ".fbx":
-        return _load_mesh_pymeshlab(path)
+        return _load_mesh_pymeshlab(path), False
 
     loaded = trimesh.load(path, force="mesh")
     if isinstance(loaded, trimesh.Scene):
         geom = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if not geom:
             raise ValueError(f"No mesh geometry in scene: {path}")
-        mesh = trimesh.util.concatenate(geom)
+        has_multiple = len(geom) > 1
+        mesh = cast(trimesh.Trimesh, trimesh.util.concatenate(geom)) if has_multiple else geom[0]
+        return cast(trimesh.Trimesh, mesh), has_multiple
     elif isinstance(loaded, trimesh.Trimesh):
-        mesh = loaded
+        return cast(trimesh.Trimesh, loaded), False
     else:
         raise TypeError(f"Unsupported mesh type from {path}: {type(loaded)}")
-    return cast(trimesh.Trimesh, mesh)
