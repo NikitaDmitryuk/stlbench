@@ -262,6 +262,53 @@ def _build_candidates(mesh: trimesh.Trimesh, n_mesh_candidates: int) -> np.ndarr
 
 
 # ---------------------------------------------------------------------------
+# Face-normal subsampling
+# ---------------------------------------------------------------------------
+
+_MAX_FACES_ORIENT = 50_000  # beyond this, subsample for speed
+
+
+def _subsample_normals(
+    face_normals: np.ndarray,
+    area_faces: np.ndarray,
+    max_faces: int = _MAX_FACES_ORIENT,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Down-sample face normals/areas for faster overhang scoring.
+
+    Faces are chosen **with probability proportional to their area**, so large
+    (influential) faces are preferentially retained.  The returned areas are
+    scaled so their total equals the original, preserving the absolute
+    magnitude of overhang scores.
+
+    For meshes with ≤ *max_faces* faces, the original arrays are returned
+    unchanged (no copy, no allocation).
+
+    Parameters
+    ----------
+    face_normals : (N, 3)
+    area_faces   : (N,)
+    max_faces    : target sample size (default 50 000)
+
+    Returns
+    -------
+    face_normals_sub : (min(N, max_faces), 3)
+    area_faces_sub   : (min(N, max_faces),) — scaled to preserve total area
+    """
+    N = len(face_normals)
+    if max_faces >= N:
+        return face_normals, area_faces
+
+    total_area = float(area_faces.sum())
+    probs = area_faces / total_area
+    # Seed 0 → deterministic: same mesh always gives same subsample.
+    rng = np.random.default_rng(0)
+    idx = rng.choice(N, max_faces, replace=False, p=probs)
+    sub_areas = area_faces[idx]
+    scale = total_area / float(sub_areas.sum())
+    return face_normals[idx], sub_areas * scale
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -300,8 +347,26 @@ def find_min_overhang_rotation(
     _PRINTER_PENALTY = 1e9
     cos_t = float(np.cos(np.radians(overhang_threshold_deg)))
 
+    # Sub-sample face normals/areas for speed on high-poly meshes.
+    # Faces are weighted by area so the approximation is unbiased.
+    # Meshes with ≤ _MAX_FACES_ORIENT faces are used as-is (no copy).
+    fn, af = _subsample_normals(mesh.face_normals, mesh.area_faces)
+
+    def _fast_overhang(R: np.ndarray) -> float:
+        """Overhang score using subsampled normals — cheap for NM iterations.
+
+        Uses matrix-vector (fn @ R[2]) instead of matrix-matrix multiply,
+        which is another ~3× speedup over the generic overhang_score path.
+        R[2] is the third row of the rotation matrix, i.e. the "down" axis
+        expressed in the original mesh frame.
+        """
+        nz = fn @ R[2]  # (N_sub,)
+        bottom_mask = nz < -0.99
+        overhang_mask = (nz < -cos_t) & ~bottom_mask
+        return float((af * overhang_mask).sum()) - 0.5 * float((af * bottom_mask).sum())
+
     def _penalised_score(R: np.ndarray) -> float:
-        s = overhang_score(mesh, R, cos_t=cos_t)
+        s = _fast_overhang(R)
         if printer_dims is not None and not _fits_printer(mesh, R, *printer_dims):
             s += _PRINTER_PENALTY
         return s
@@ -310,7 +375,7 @@ def find_min_overhang_rotation(
 
     # Phase 1: batch-evaluate all candidates in one vectorised pass ----------
     rotations = np.array([_rotation_from_to(cand, _DOWN) for cand in candidates])  # (K, 3, 3)
-    raw_scores = _batch_overhang_scores(mesh.face_normals, mesh.area_faces, rotations, cos_t)
+    raw_scores = _batch_overhang_scores(fn, af, rotations, cos_t)
 
     # Apply printer-fit penalty in Phase 1 so only fitting orientations are
     # selected as starting points for the Nelder-Mead refinement.

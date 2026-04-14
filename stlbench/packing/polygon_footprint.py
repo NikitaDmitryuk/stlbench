@@ -1,30 +1,47 @@
 from __future__ import annotations
 
+import numpy as np
 import trimesh
 from shapely.geometry import MultiPoint, Polygon
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
 
 
-def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseGeometry:
-    """Return the XY-plane shadow of *mesh* as a Shapely geometry.
+def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 1.0) -> BaseGeometry:
+    """Return the XY-plane shadow (top-view footprint) of *mesh* as a Shapely polygon.
 
-    Projects every triangular face onto the XY plane and takes the union.
-    The result is the exact footprint (not a convex hull), so concave shapes
-    pack correctly — e.g. a small part can fit inside the concave pocket of
-    an L-shaped model.
+    Computes the **convex hull** of all vertex projections onto the XY plane.
+    This is O(V log V) and handles meshes with millions of faces in milliseconds,
+    versus the old triangle-union approach which was O(F) and took tens of seconds.
+
+    Trade-off: the result is the convex hull of the footprint, so concave pockets
+    (e.g. the inside of an L-shape) are not represented.  For typical resin-print
+    parts this rarely matters — the convex envelope determines how much bed space
+    a part occupies from above.
 
     Parameters
     ----------
     mesh:
-        Mesh already oriented for printing (the XY plane is the build plate).
+        Mesh already oriented for printing (XY plane = build plate).
     simplify_tol:
-        Douglas–Peucker tolerance in mm.  Reduces vertex count without
-        significant shape distortion.  Pass 0 to disable.
+        Douglas–Peucker tolerance in mm applied to the hull polygon.  Reduces
+        vertex count without meaningful shape change.  Default 1.0 mm is
+        appropriate for typical print beds (150–300 mm).  Pass 0 to disable.
     """
-    tris = [Polygon(mesh.vertices[face, :2]) for face in mesh.faces]
-    valid = [t for t in tris if t.is_valid and not t.is_empty]
-    shadow = unary_union(valid) if valid else MultiPoint(mesh.vertices[:, :2]).convex_hull
-    if simplify_tol > 0:
+    xy: np.ndarray = mesh.vertices[:, :2]
+
+    if len(xy) < 3:
+        return MultiPoint(xy).convex_hull
+
+    try:
+        from scipy.spatial import ConvexHull  # noqa: PLC0415
+
+        hull = ConvexHull(xy)
+        shadow: BaseGeometry = Polygon(xy[hull.vertices])
+    except Exception:
+        # Degenerate geometry (e.g. all points collinear) — fall back to Shapely.
+        shadow = MultiPoint(xy).convex_hull
+
+    if simplify_tol > 0 and not shadow.is_empty:
         shadow = shadow.simplify(simplify_tol, preserve_topology=True)
+
     return shadow
