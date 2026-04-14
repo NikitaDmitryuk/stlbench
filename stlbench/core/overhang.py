@@ -161,6 +161,39 @@ def _batch_overhang_scores(
     return scores
 
 
+def _batch_fits_printer(
+    ch_verts: np.ndarray,
+    rotations: np.ndarray,
+    px: float,
+    py: float,
+    pz: float,
+) -> np.ndarray:
+    """Batch printer-fit check for K candidate rotations.
+
+    Parameters
+    ----------
+    ch_verts  : (V, 3) convex-hull vertices of the mesh (cached by trimesh)
+    rotations : (K, 3, 3) candidate rotation matrices
+
+    Returns
+    -------
+    (K,) bool array — True where the rotated mesh fits inside (px, py, pz).
+    """
+    # rotated[k, v, xyz] = rotations[k] @ ch_verts[v]
+    # (K, 3, 3) @ (3, V) → (K, 3, V) → transpose → (K, V, 3)
+    rotated = (rotations @ ch_verts.T).transpose(0, 2, 1)
+    dx = rotated[:, :, 0].max(axis=1) - rotated[:, :, 0].min(axis=1)
+    dy = rotated[:, :, 1].max(axis=1) - rotated[:, :, 1].min(axis=1)
+    dz = rotated[:, :, 2].max(axis=1) - rotated[:, :, 2].min(axis=1)
+    xy_lo = np.minimum(dx, dy)
+    xy_hi = np.maximum(dx, dy)
+    bed_lo = min(px, py)
+    bed_hi = max(px, py)
+    tol = 1e-6
+    fits: np.ndarray = (dz <= pz + tol) & (xy_lo <= bed_lo + tol) & (xy_hi <= bed_hi + tol)
+    return fits
+
+
 # ---------------------------------------------------------------------------
 # Printer-fit check
 # ---------------------------------------------------------------------------
@@ -272,14 +305,34 @@ def find_min_overhang_rotation(
     # Phase 1: batch-evaluate all candidates in one vectorised pass ----------
     rotations = np.array([_rotation_from_to(cand, _DOWN) for cand in candidates])  # (K, 3, 3)
     raw_scores = _batch_overhang_scores(mesh.face_normals, mesh.area_faces, rotations, cos_t)
-    n_top = min(3, len(raw_scores))
-    top_idx = np.argpartition(raw_scores, n_top - 1)[:n_top]
-    top_candidates = [(raw_scores[i], rotations[i]) for i in top_idx]
+
+    # Apply printer-fit penalty in Phase 1 so only fitting orientations are
+    # selected as starting points for the Nelder-Mead refinement.
+    if printer_dims is not None:
+        ch_verts = mesh.convex_hull.vertices  # (V, 3), cached by trimesh
+        fits = _batch_fits_printer(ch_verts, rotations, *printer_dims)
+        phase1_scores = raw_scores + np.where(fits, 0.0, _PRINTER_PENALTY)
+    else:
+        phase1_scores = raw_scores
+        fits = np.ones(len(rotations), dtype=bool)
+
+    n_top = min(3, len(phase1_scores))
+    top_idx = np.argpartition(phase1_scores, n_top - 1)[:n_top]
+    top_candidates = [(phase1_scores[i], rotations[i]) for i in top_idx]
     top_candidates.sort(key=lambda x: x[0])
+
+    # Keep the best fitting Phase 1 candidate as an emergency fallback in case
+    # Nelder-Mead fails to escape the non-fitting region for all starting points.
+    fitting_mask = fits & (phase1_scores < 0.5 * _PRINTER_PENALTY)
+    if fitting_mask.any():
+        best_phase1_idx = int(np.argmin(np.where(fitting_mask, raw_scores, np.inf)))
+        fallback_R: np.ndarray = rotations[best_phase1_idx]
+    else:
+        fallback_R = rotations[top_idx[0]]
 
     # Phase 2: Nelder-Mead refinement around each top candidate -------------
     best_penalised = float("inf")
-    best_R = rotations[top_idx[0]]
+    best_R = fallback_R
 
     for _, init_R in top_candidates:
         down_in_orig = init_R.T @ _DOWN
@@ -300,6 +353,11 @@ def find_min_overhang_rotation(
         if result.fun < best_penalised:
             best_penalised = result.fun
             best_R = _rotation_from_angles(result.x[0], result.x[1])
+
+    # Fallback: if Phase 2 converged to a non-fitting orientation despite the
+    # penalty, use the best fitting candidate from Phase 1 instead.
+    if best_penalised >= 0.5 * _PRINTER_PENALTY:
+        best_R = fallback_R
 
     return best_R, overhang_score(mesh, best_R, cos_t=cos_t)
 
