@@ -42,10 +42,7 @@ from rich.progress import (
 from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
-from stlbench.core.fit import (
-    compute_global_scale,
-    printer_dims_with_margin,
-)
+from stlbench.core.fit import compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import (
     apply_min_overhang_orientation,
@@ -75,7 +72,6 @@ class PrepareRunArgs:
     config_path: Path | None
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
-    margin: float | None
     post_fit_scale: float | None
     method: str | None
     overhang_threshold_deg: float
@@ -187,9 +183,6 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         console.print(f"[red]{e}[/red]")
         return 2
 
-    margin = (
-        float(args.margin) if args.margin is not None else (st.scaling.bed_margin if st else 0.0)
-    )
     post_fit_scale = (
         float(args.post_fit_scale)
         if args.post_fit_scale is not None
@@ -198,11 +191,11 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     gap = resolve_gap(args.gap_mm, st)
     method: str = args.method or "sorted"
 
-    px, py, pz = printer_dims_with_margin(px_raw, py_raw, pz_raw, margin)
+    px, py, pz = px_raw, py_raw, pz_raw
 
     if st and st.printer.name:
         console.print(f"Printer: {st.printer.name}")
-    console.print(f"Build volume (after margin): {px:.1f} × {py:.1f} × {pz:.1f} mm")
+    console.print(f"Build volume: {px:.1f} × {py:.1f} × {pz:.1f} mm")
     console.print(f"Gap: {gap} mm  |  post_fit_scale: {post_fit_scale}")
 
     loaded = load_named_meshes(args.input_dir, args.recursive, console)

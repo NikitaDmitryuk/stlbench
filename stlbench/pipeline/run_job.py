@@ -8,12 +8,13 @@ Algorithm overview
 ------------------
 Pass 1 — scale preparation (parallel)
     For parts that include the ``scale`` step:
-    * If ``scale`` comes before ``orient``: run ``select_orientation_for_scale()``
-      (SO(3) search) to get the best orientation transform and AABB extents.
+    * If ``scale`` comes before ``orient``: optionally search for the best
+      orientation (controlled by ``[scaling] allow_rotation`` and ``maximize``
+      in the job TOML), then read the AABB extents of the (possibly rotated)
+      mesh.  By default no rotation is performed.
     * If ``orient`` comes before ``scale``: run ``find_min_overhang_rotation()``
       first, apply that orientation, then read the AABB extents of the oriented
-      mesh.  No additional SO(3) search is needed because the orientation is
-      already fixed.
+      mesh.  No additional rotation search is needed.
 
 Pass 2 — global scale
     Compute a single ``s_final`` that fits every scale-part inside the build
@@ -49,7 +50,7 @@ from rich.table import Table
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import PartSpec, StepName
-from stlbench.core.fit import compute_global_scale, printer_dims_with_margin
+from stlbench.core.fit import compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
@@ -139,22 +140,32 @@ def _pass1_scale_first(
     py: float,
     pz: float,
     method: str,
+    allow_rotation: bool,
+    maximize: bool,
     rotation_samples: int,
 ) -> _PartWork:
-    """SO(3) search for best scale orientation; store transform + dims."""
+    """Prepare mesh for global scale: optionally search for best orientation."""
     mesh = load_mesh(pw.abs_path)
-    t4, dims = select_orientation_for_scale(
-        mesh,
-        px,
-        py,
-        pz,
-        method,  # type: ignore[arg-type]
-        random_samples=rotation_samples,
-        seed=ORIENTATION_SEED_DEFAULT,
-    )
-    # Apply the scale-orientation transform now so the mesh is ready for Pass 3.
-    mesh.apply_transform(t4)
-    mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
+    if allow_rotation:
+        t4, dims = select_orientation_for_scale(
+            mesh,
+            px,
+            py,
+            pz,
+            method,  # type: ignore[arg-type]
+            maximize=maximize,
+            random_samples=rotation_samples,
+            seed=ORIENTATION_SEED_DEFAULT,
+        )
+        mesh.apply_transform(t4)
+        mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
+    else:
+        b = np.asarray(mesh.bounds)
+        dims = (
+            float(b[1, 0] - b[0, 0]),
+            float(b[1, 1] - b[0, 1]),
+            float(b[1, 2] - b[0, 2]),
+        )
     pw.pass1_mesh = mesh
     pw.pass1_dims = dims
     return pw
@@ -257,16 +268,17 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
     px_raw = settings.printer.width_mm
     py_raw = settings.printer.depth_mm
     pz_raw = settings.printer.height_mm
-    margin = settings.scaling.bed_margin
     post_fit_scale = settings.scaling.post_fit_scale
+    allow_rotation = settings.scaling.allow_rotation
+    maximize = settings.scaling.maximize
     gap_mm = settings.packing.gap_mm
     method = "sorted"
 
-    px, py, pz = printer_dims_with_margin(px_raw, py_raw, pz_raw, margin)
+    px, py, pz = px_raw, py_raw, pz_raw
 
     if settings.printer.name:
         console.print(f"Printer: {settings.printer.name}")
-    console.print(f"Build volume (after margin): {px:.1f} × {py:.1f} × {pz:.1f} mm")
+    console.print(f"Build volume: {px:.1f} × {py:.1f} × {pz:.1f} mm")
     console.print(f"Gap: {gap_mm} mm  |  post_fit_scale: {post_fit_scale}")
 
     default_steps = settings.pipeline.default_steps
@@ -309,7 +321,9 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
 
         def _submit_pass1(pw: _PartWork):
             if pw.has_scale and pw.scale_before_orient:
-                return _pass1_scale_first(pw, px, py, pz, method, args.rotation_samples)
+                return _pass1_scale_first(
+                    pw, px, py, pz, method, allow_rotation, maximize, args.rotation_samples
+                )
             else:
                 # orient-first (either scale-after-orient or orient-only)
                 return _pass1_orient_first(

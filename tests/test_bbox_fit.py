@@ -3,22 +3,10 @@ import pytest
 from stlbench.core.fit import (
     aabb_edge_lengths,
     compute_global_scale,
-    printer_dims_with_margin,
     s_max_for_part_conservative,
     s_max_for_part_printer_axes,
     s_max_for_part_sorted,
 )
-
-
-def test_printer_dims_with_margin():
-    assert printer_dims_with_margin(100, 200, 300, 0.1) == (90.0, 180.0, 270.0)
-
-
-def test_printer_dims_margin_invalid():
-    with pytest.raises(ValueError):
-        printer_dims_with_margin(1, 1, 1, -0.1)
-    with pytest.raises(ValueError):
-        printer_dims_with_margin(1, 1, 1, 1.0)
 
 
 def test_aabb_edge_lengths():

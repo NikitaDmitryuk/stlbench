@@ -83,10 +83,49 @@ stlbench scale \
 Computes a single scale factor so that every part fits inside the printer volume.
 Writes scaled STL files to `examples/gandalf/scaled/`.
 
-Useful options:
+By default the orientation is **not changed** — parts are scaled as-is.
+
+**Lay parts on their best-fitting axis-aligned face before scaling:**
+
+```bash
+stlbench scale \
+  -i examples/gandalf/main \
+  -o examples/gandalf/scaled \
+  -c configs/mars5_ultra.toml \
+  --allow-rotation
+```
+
+Tries the 6 canonical 90° rotations per part and picks whichever fits best. No
+arbitrary angles — the part always lands flat on one of its original faces.
+
+**Full rotation search to maximise scale (slow, arbitrary angles):**
+
+```bash
+stlbench scale \
+  -i examples/gandalf/main \
+  -o examples/gandalf/scaled \
+  -c configs/mars5_ultra.toml \
+  --allow-rotation --maximize
+```
+
+Samples 4 096 random orientations × 6 axis permutations per part to find the
+absolute maximum scale factor. Useful for organic shapes where no flat face is
+obviously optimal. The result may be tilted at an arbitrary angle.
+
+**Apply an explicit scale factor (no printer required):**
+
+```bash
+# Double the size of every part
+stlbench scale -i examples/gandalf/main -o examples/gandalf/scaled --scale 2.0
+
+# Shrink to 75%
+stlbench scale -i examples/gandalf/main -o examples/gandalf/scaled --scale 0.75
+```
+
+**Other useful options:**
 - `--dry-run` — show the scale factor without writing files
 - `--no-upscale` — cap scale at 1.0 (never enlarge)
-- `--post-fit-scale 0.95` — apply an extra 5% safety margin
+- `--post-fit-scale 0.95` — apply an extra 5% safety margin after the fit
 
 ---
 

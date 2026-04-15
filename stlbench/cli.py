@@ -167,7 +167,6 @@ def cmd_scale(
             help="Three numbers, e.g. 153.36,77.76,165",
         ),
     ] = None,
-    margin: Annotated[float | None, typer.Option("--margin")] = None,
     post_fit_scale: Annotated[
         float | None,
         typer.Option(
@@ -176,7 +175,27 @@ def cmd_scale(
         ),
     ] = None,
     method: Annotated[str | None, typer.Option("--method")] = None,
-    orientation: Annotated[str | None, typer.Option("--orientation")] = None,
+    allow_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--allow-rotation/--no-allow-rotation",
+            help="Try axis permutations to find a better-fitting orientation.",
+        ),
+    ] = False,
+    maximize: Annotated[
+        bool,
+        typer.Option(
+            "--maximize/--no-maximize",
+            help="Use full SO(3) random search to maximise scale factor (requires --allow-rotation).",
+        ),
+    ] = False,
+    scale_factor: Annotated[
+        float | None,
+        typer.Option(
+            "--scale",
+            help="Apply an explicit scale factor instead of fitting to printer dimensions.",
+        ),
+    ] = None,
     rotation_samples: Annotated[int | None, typer.Option("--rotation-samples")] = None,
     no_upscale: Annotated[bool, typer.Option("--no-upscale")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
@@ -196,10 +215,11 @@ def cmd_scale(
                 config_path=config,
                 settings=st,
                 printer_xyz=pr,
-                margin=margin,
                 post_fit_scale=post_fit_scale,
                 method=method,
-                orientation=orientation,
+                allow_rotation=allow_rotation,
+                maximize=maximize,
+                scale_factor=scale_factor,
                 rotation_samples=rotation_samples,
                 no_upscale=no_upscale,
                 dry_run=dry_run,
@@ -321,7 +341,6 @@ def cmd_autopack(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
-    margin: Annotated[float | None, typer.Option("--margin")] = None,
     post_fit_scale: Annotated[
         float | None,
         typer.Option(
@@ -356,7 +375,6 @@ def cmd_autopack(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
-                margin=margin,
                 post_fit_scale=post_fit_scale,
                 orient_on=orient,
                 orient_threshold_deg=overhang_angle,
@@ -443,7 +461,6 @@ def cmd_prepare(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
-    margin: Annotated[float | None, typer.Option("--margin")] = None,
     post_fit_scale: Annotated[
         float | None,
         typer.Option(
@@ -491,7 +508,6 @@ def cmd_prepare(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
-                margin=margin,
                 post_fit_scale=post_fit_scale,
                 method=method,
                 overhang_threshold_deg=overhang_angle,

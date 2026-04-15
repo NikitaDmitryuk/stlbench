@@ -29,7 +29,7 @@ def _write_box(path: Path, extents: tuple[float, float, float]) -> None:
 
 
 def test_run_scale_free_parallel_multiple_parts():
-    """Parallel orientation search (orient=free) produces valid scaled STLs."""
+    """Parallel orientation search (allow_rotation+maximize) produces valid scaled STLs."""
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         _write_box(d / "a.stl", (10.0, 20.0, 5.0))
@@ -43,10 +43,10 @@ def test_run_scale_free_parallel_multiple_parts():
                 config_path=None,
                 settings=None,
                 printer_xyz=(100.0, 100.0, 100.0),
-                margin=None,
                 post_fit_scale=None,
                 method="sorted",
-                orientation="free",
+                allow_rotation=True,
+                maximize=True,
                 rotation_samples=8,  # minimal — keeps test fast
                 no_upscale=False,
                 dry_run=False,
@@ -65,7 +65,7 @@ def test_run_scale_free_parallel_multiple_parts():
 
 
 def test_run_scale_fixed_two_pass_export():
-    """With orient=fixed the two-pass export (re-load from disk) writes valid STLs."""
+    """Default (no rotation) two-pass export (re-load from disk) writes valid STLs."""
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         _write_box(d / "x.stl", (40.0, 40.0, 40.0))
@@ -79,10 +79,9 @@ def test_run_scale_fixed_two_pass_export():
                 config_path=None,
                 settings=None,
                 printer_xyz=(100.0, 100.0, 100.0),
-                margin=None,
                 post_fit_scale=None,
                 method="sorted",
-                orientation="fixed",
+                allow_rotation=False,
                 rotation_samples=None,
                 no_upscale=False,
                 dry_run=False,
@@ -117,10 +116,9 @@ def test_run_scale_output_ordering():
                 config_path=None,
                 settings=None,
                 printer_xyz=(100.0, 100.0, 100.0),
-                margin=None,
                 post_fit_scale=None,
                 method="sorted",
-                orientation="fixed",
+                allow_rotation=False,
                 rotation_samples=None,
                 no_upscale=False,
                 dry_run=False,
@@ -215,7 +213,6 @@ def test_run_prepare_dry_run_parallel():
                 config_path=None,
                 printer_xyz=(500.0, 500.0, 500.0),
                 gap_mm=2.0,
-                margin=None,
                 post_fit_scale=0.5,  # scale down so re-oriented dims stay well within bed
                 method="sorted",
                 overhang_threshold_deg=45.0,

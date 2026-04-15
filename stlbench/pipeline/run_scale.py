@@ -10,17 +10,16 @@ from rich.console import Console
 from rich.table import Table
 
 from stlbench.config.defaults import (
-    ORIENTATION_MODE_DEFAULT,
     ORIENTATION_SAMPLES_DEFAULT,
     ORIENTATION_SEED_DEFAULT,
 )
 from stlbench.config.schema import AppSettings
 from stlbench.core.fit import (
     Method,
+    PartScaleReport,
     aabb_edge_lengths,
     compute_global_scale,
     limiting_part_index,
-    printer_dims_with_margin,
 )
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.pipeline.common import load_named_meshes, n_workers, resolve_printer
@@ -34,15 +33,16 @@ class ScaleRunArgs:
     config_path: Path | None
     settings: AppSettings | None
     printer_xyz: tuple[float, float, float] | None
-    margin: float | None
     post_fit_scale: float | None
     method: str | None
-    orientation: str | None
-    rotation_samples: int | None
-    no_upscale: bool
-    dry_run: bool
-    recursive: bool
-    suffix: str
+    allow_rotation: bool = False
+    maximize: bool = False
+    scale_factor: float | None = None
+    rotation_samples: int | None = None
+    no_upscale: bool = False
+    dry_run: bool = False
+    recursive: bool = False
+    suffix: str = ""
     verbose: bool = False
 
 
@@ -50,17 +50,29 @@ def run_scale(args: ScaleRunArgs) -> int:
     console = Console(stderr=True)
     st = args.settings
 
-    try:
-        prx, pry, prz = resolve_printer(args.printer_xyz, st)
-    except ValueError as e:
-        console.print(f"[red]{e}[/red]")
+    # ── Validation ────────────────────────────────────────────────────────────
+    if args.maximize and not args.allow_rotation:
+        console.print(
+            "[red]--maximize requires --allow-rotation "
+            "(cannot search for a better orientation without enabling rotation)[/red]"
+        )
         return 2
 
-    margin = (
-        float(args.margin)
-        if args.margin is not None
-        else (st.scaling.bed_margin if st is not None else 0.0)
-    )
+    # ── Printer / post_fit_scale ─────────────────────────────────────────────
+    # scale_factor bypasses fit-to-printer entirely, so printer dims are optional.
+    if args.scale_factor is None:
+        try:
+            prx, pry, prz = resolve_printer(args.printer_xyz, st)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            return 2
+    else:
+        # Printer dims may still be provided (used only for display / validation).
+        try:
+            prx, pry, prz = resolve_printer(args.printer_xyz, st)
+        except ValueError:
+            prx, pry, prz = 0.0, 0.0, 0.0
+
     post_fit_scale = (
         float(args.post_fit_scale)
         if args.post_fit_scale is not None
@@ -68,7 +80,6 @@ def run_scale(args: ScaleRunArgs) -> int:
     )
 
     method_s: Method = args.method or "sorted"  # type: ignore[assignment]
-    orient = args.orientation if args.orientation is not None else ORIENTATION_MODE_DEFAULT
 
     rot_samples = (
         int(args.rotation_samples)
@@ -89,11 +100,12 @@ def run_scale(args: ScaleRunArgs) -> int:
     paths, part_names, meshes = loaded
     del loaded
 
-    px, py, pz = printer_dims_with_margin(prx, pry, prz, margin)
+    px, py, pz = prx, pry, prz
 
     file_dims = [aabb_edge_lengths(np.asarray(m.bounds)) for m in meshes]
 
-    if orient == "free":
+    # ── Rotation search ───────────────────────────────────────────────────────
+    if args.allow_rotation:
 
         def _select_orient(mesh: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
             return select_orientation_for_scale(
@@ -102,6 +114,7 @@ def run_scale(args: ScaleRunArgs) -> int:
                 py,
                 pz,
                 method_s,
+                maximize=args.maximize,
                 random_samples=rot_samples,
                 seed=seed,
             )
@@ -119,62 +132,80 @@ def run_scale(args: ScaleRunArgs) -> int:
 
     del meshes  # free mesh data; export will re-load from disk
 
-    file_dims_for_report = list(file_dims) if orient == "free" else None
+    file_dims_for_report = list(file_dims) if args.allow_rotation else None
 
-    try:
-        s_max, reports = compute_global_scale(
-            (px, py, pz),
-            parts_dims,
-            part_names,
-            method_s,
-            file_dims=file_dims_for_report,
-        )
-    except ValueError as e:
-        console.print(f"[red]{e}[/red]")
-        return 1
+    # ── Scale computation ─────────────────────────────────────────────────────
+    if args.scale_factor is not None:
+        s_final = float(args.scale_factor) * post_fit_scale
+        s_max = float(args.scale_factor)
+        reports: list[PartScaleReport] = []
+        limiter = "(explicit factor)"
 
-    s_after = min(1.0, s_max) if args.no_upscale else s_max
-    s_final = s_after * post_fit_scale
-    lim_i = limiting_part_index(reports, s_max)
-    limiter = reports[lim_i].name
+        if st and st.printer.name:
+            console.print(f"Printer profile: {st.printer.name}")
+        console.print(f"Scale factor: {args.scale_factor:.6f}")
+        console.print(f"post_fit_scale: {post_fit_scale:.6f}")
+        console.print(f"s_final (applied): {s_final:.6f}")
+    else:
+        try:
+            s_max, reports = compute_global_scale(
+                (px, py, pz),
+                parts_dims,
+                part_names,
+                method_s,
+                file_dims=file_dims_for_report,
+            )
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            return 1
 
-    if st and st.printer.name:
-        console.print(f"Printer profile: {st.printer.name}")
-    console.print(f"Printer (after margin): {px:.4f} x {py:.4f} x {pz:.4f}")
-    console.print(f"Method: {method_s}, orientation: {orient}")
-    if orient == "free":
-        console.print(f"Rotation samples: {rot_samples}, seed: {seed}")
-    console.print(f"s_max (geometry fit): {s_max:.6f}")
-    console.print(f"post_fit_scale: {post_fit_scale:.6f}")
-    console.print(f"s_final (applied): {s_final:.6f}")
-    if args.no_upscale:
-        console.print("(capped by --no-upscale before post_fit_scale)")
-    console.print(f"Limiting part: {limiter}")
+        s_after = min(1.0, s_max) if args.no_upscale else s_max
+        s_final = s_after * post_fit_scale
+        lim_i = limiting_part_index(reports, s_max)
+        limiter = reports[lim_i].name
 
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("part", max_width=42)
-    table.add_column("dx", justify="right")
-    table.add_column("dy", justify="right")
-    table.add_column("dz", justify="right")
-    table.add_column("s_part", justify="right")
-    if orient == "free":
-        table.add_column("fx")
-        table.add_column("fy")
-        table.add_column("fz")
-    for r in reports:
-        row = [
-            r.name,
-            f"{r.dx:.4f}",
-            f"{r.dy:.4f}",
-            f"{r.dz:.4f}",
-            f"{r.s_limit:.6f}",
-        ]
-        if orient == "free" and r.file_dx is not None:
-            row.extend([f"{r.file_dx:.3f}", f"{r.file_dy:.3f}", f"{r.file_dz:.3f}"])
-        elif orient == "free":
-            row.extend(["", "", ""])
-        table.add_row(*row)
-    console.print(table)
+        if st and st.printer.name:
+            console.print(f"Printer profile: {st.printer.name}")
+        console.print(f"Printer: {px:.4f} x {py:.4f} x {pz:.4f}")
+        console.print(f"Method: {method_s}")
+        if args.allow_rotation:
+            mode = "maximize" if args.maximize else "axis-permutations"
+            console.print(f"Rotation: {mode}")
+            if args.maximize:
+                console.print(f"Rotation samples: {rot_samples}, seed: {seed}")
+        else:
+            console.print("Rotation: none")
+        console.print(f"s_max (geometry fit): {s_max:.6f}")
+        console.print(f"post_fit_scale: {post_fit_scale:.6f}")
+        console.print(f"s_final (applied): {s_final:.6f}")
+        if args.no_upscale:
+            console.print("(capped by --no-upscale before post_fit_scale)")
+        console.print(f"Limiting part: {limiter}")
+
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("part", max_width=42)
+        table.add_column("dx", justify="right")
+        table.add_column("dy", justify="right")
+        table.add_column("dz", justify="right")
+        table.add_column("s_part", justify="right")
+        if args.allow_rotation:
+            table.add_column("fx")
+            table.add_column("fy")
+            table.add_column("fz")
+        for r in reports:
+            row = [
+                r.name,
+                f"{r.dx:.4f}",
+                f"{r.dy:.4f}",
+                f"{r.dz:.4f}",
+                f"{r.s_limit:.6f}",
+            ]
+            if args.allow_rotation and r.file_dx is not None:
+                row.extend([f"{r.file_dx:.3f}", f"{r.file_dy:.3f}", f"{r.file_dz:.3f}"])
+            elif args.allow_rotation:
+                row.extend(["", "", ""])
+            table.add_row(*row)
+        console.print(table)
 
     if args.dry_run:
         return 0

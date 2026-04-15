@@ -8,15 +8,6 @@ import numpy as np
 Method = Literal["sorted", "conservative"]
 
 
-def printer_dims_with_margin(
-    px: float, py: float, pz: float, margin: float
-) -> tuple[float, float, float]:
-    if margin < 0 or margin >= 1:
-        raise ValueError("margin must be in [0, 1).")
-    f = 1.0 - margin
-    return px * f, py * f, pz * f
-
-
 def aabb_edge_lengths(bounds: np.ndarray) -> tuple[float, float, float]:
     """bounds: (2, 3) min/max corners."""
     if bounds.shape != (2, 3):

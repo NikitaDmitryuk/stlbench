@@ -10,7 +10,6 @@ from rich.console import Console
 from rich.table import Table
 
 from stlbench.config.schema import AppSettings
-from stlbench.core.fit import printer_dims_with_margin
 from stlbench.core.overhang import (
     apply_min_overhang_orientation,
     find_min_overhang_rotation,
@@ -49,12 +48,10 @@ def run_orient(args: OrientRunArgs) -> int:
         except ValueError as e:
             console.print(f"[red]{e}[/red]")
             return 2
-        margin = st.scaling.bed_margin if st is not None else 0.0
-        px, py, pz = printer_dims_with_margin(px, py, pz, margin)
         printer_dims = (px, py, pz)
         if st and st.printer.name:
             console.print(f"Printer: {st.printer.name}")
-        console.print(f"Build volume (after margin): {px:.1f} × {py:.1f} × {pz:.1f} mm")
+        console.print(f"Build volume: {px:.1f} × {py:.1f} × {pz:.1f} mm")
 
     loaded = load_named_meshes(args.input_dir, args.recursive, console)
     if loaded is None:

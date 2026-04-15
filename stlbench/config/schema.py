@@ -14,8 +14,9 @@ class PrinterSection(BaseModel):
 
 
 class ScalingSection(BaseModel):
-    bed_margin: float = Field(default=0.0, ge=0.0, lt=1.0)
     post_fit_scale: float = Field(default=1.0, gt=0.0)
+    allow_rotation: bool = False
+    maximize: bool = False
 
 
 class PackingSection(BaseModel):
@@ -32,11 +33,14 @@ class StepName(StrEnum):
 
     Valid sequences (``layout`` must always be last):
 
-    * ``["scale", "orient", "layout"]`` — SO(3) search → global scale → Tweaker-3 orient → pack
+    * ``["scale", "orient", "layout"]`` — global scale → Tweaker-3 orient → pack
     * ``["orient", "scale", "layout"]`` — Tweaker-3 orient → scale from oriented AABB → pack
-    * ``["scale", "layout"]`` — SO(3) search → global scale → pack
+    * ``["scale", "layout"]`` — global scale → pack
     * ``["orient", "layout"]`` — Tweaker-3 orient → pack
     * ``["layout"]`` — pack only (model already prepared)
+
+    Rotation during the ``scale`` step is controlled by ``[scaling] allow_rotation``
+    and ``maximize`` in the job TOML (both default to ``false``).
     """
 
     SCALE = "scale"
