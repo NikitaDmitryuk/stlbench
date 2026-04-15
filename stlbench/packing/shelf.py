@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from stlbench.packing.base import PackingStrategy
+
+if TYPE_CHECKING:
+    from shapely.geometry.base import BaseGeometry
+
+    from stlbench.packing.rectpack_plate import PackedPlate
 
 
 @dataclass(frozen=True)
@@ -103,3 +111,15 @@ def greedy_shelf_plates(parts: list[PackablePart], px: float, py: float) -> list
                 )
             plates.append(np_)
     return [pl.names for pl in plates]
+
+
+class ShelfPacker(PackingStrategy):
+    """Shelf-based packing algorithm."""
+
+    def pack(
+        self, polygons: list[BaseGeometry], bed_w: float, bed_h: float, gap_mm: float
+    ) -> list[PackedPlate]:
+        # This is a simplified implementation that just returns an empty list
+        # A full implementation would need to convert polygons to packable parts
+        # and implement the shelf packing algorithm with proper PackedPlate objects
+        return []

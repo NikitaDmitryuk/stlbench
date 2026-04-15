@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import rectpack
+
+from stlbench.packing.base import PackingStrategy
+
+if TYPE_CHECKING:
+    from shapely.geometry.base import BaseGeometry
 
 
 @dataclass(frozen=True)
 class PackedRect:
+    """One placed rectangle on a plate (zero-based part index + placement)."""
+
     part_index: int
     x: float
     y: float
@@ -17,6 +25,8 @@ class PackedRect:
 
 @dataclass(frozen=True)
 class PackedPlate:
+    """One build plate with a list of placed rectangles."""
+
     index: int
     rects: tuple[PackedRect, ...]
 
@@ -215,3 +225,25 @@ def pack_rectangles_on_plates(
 
     # Ensure sequential plate indices
     return [PackedPlate(index=i, rects=pl.rects) for i, pl in enumerate(plates_out)]
+
+
+class RectPacker(PackingStrategy):
+    """Rectangle-based packing using rectpack library."""
+
+    def __init__(self, max_plates: int = 64) -> None:
+        self.max_plates = max_plates
+
+    def pack(
+        self, polygons: list[BaseGeometry], bed_w: float, bed_h: float, gap_mm: float
+    ) -> list[PackedPlate]:
+        # Convert polygons to bounding boxes
+        footprints = []
+        for poly in polygons:
+            minx, miny, maxx, maxy = poly.bounds
+            fw = maxx - minx
+            fh = maxy - miny
+            footprints.append((fw, fh))
+
+        return pack_rectangles_on_plates(
+            footprints, bed_w, bed_h, gap_mm, max_plates=self.max_plates
+        )

@@ -26,13 +26,18 @@ data structures and all downstream export code.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from shapely import affinity
 from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
 from shapely.prepared import prep
 
+from stlbench.packing.base import PackingStrategy
 from stlbench.packing.rectpack_plate import PackedPlate, PackedRect
+
+if TYPE_CHECKING:
+    pass
 
 
 def _normalize(poly: BaseGeometry) -> BaseGeometry:
@@ -253,3 +258,37 @@ def footprints_to_box_polygons(footprints: list[tuple[float, float]]) -> list[Ba
     Convenience helper for code that only has AABB footprints (e.g. autopack).
     """
     return [shapely_box(0.0, 0.0, fw, fh) for fw, fh in footprints]
+
+
+class PolygonPacker(PackingStrategy):
+    """Packing with exact XY shadows (Shapely), gap is physical surface-to-surface."""
+
+    def __init__(
+        self,
+        grid_step_mm: float = 2.0,
+        max_plates: int = 64,
+        on_placed: Callable[[], None] | None = None,
+    ) -> None:
+        self.grid_step_mm = grid_step_mm
+        self.max_plates = max_plates
+        self.on_placed = on_placed
+
+    def pack(self, polygons, bed_w, bed_h, gap_mm) -> list[PackedPlate]:
+        return pack_polygons_on_plates(
+            polygons,
+            bed_w,
+            bed_h,
+            gap_mm,
+            grid_step_mm=self.grid_step_mm,
+            max_plates=self.max_plates,
+            on_placed=self.on_placed,
+        )
+
+    def try_pack_single_plate(self, polygons, bed_w, bed_h, gap_mm) -> PackedPlate | None:
+        return try_pack_polygons_single_plate(
+            polygons,
+            bed_w,
+            bed_h,
+            gap_mm,
+            grid_step_mm=self.grid_step_mm,
+        )
