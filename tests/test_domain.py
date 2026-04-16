@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
+import trimesh
 
 from stlbench.domain.part import Part
 from stlbench.domain.printer import Printer
@@ -16,9 +18,59 @@ def sample_printer() -> Printer:
 
 
 @pytest.fixture
-def sample_mesh_path() -> Path:
-    # Using a simple cube mesh from the test assets
-    return Path(__file__).parent / "assets" / "cube.stl"
+def sample_mesh_path():
+    """Create a temporary unit cube STL file for testing."""
+    # Create a proper unit cube mesh
+    vertices = np.array(
+        [
+            [0, 0, 0],  # 0
+            [1, 0, 0],  # 1
+            [1, 1, 0],  # 2
+            [0, 1, 0],  # 3
+            [0, 0, 1],  # 4
+            [1, 0, 1],  # 5
+            [1, 1, 1],  # 6
+            [0, 1, 1],  # 7
+        ]
+    )
+
+    faces = np.array(
+        [
+            # Bottom face (z=0)
+            [0, 3, 2],
+            [0, 2, 1],
+            # Top face (z=1)
+            [4, 5, 6],
+            [4, 6, 7],
+            # Front face (y=0)
+            [0, 1, 5],
+            [0, 5, 4],
+            # Back face (y=1)
+            [2, 3, 7],
+            [2, 7, 6],
+            # Left face (x=0)
+            [0, 4, 7],
+            [0, 7, 3],
+            # Right face (x=1)
+            [1, 2, 6],
+            [1, 6, 5],
+        ]
+    )
+
+    cube = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+    # Create temporary file
+    with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as f:
+        temp_path = Path(f.name)
+
+    # Export the mesh to the temporary file
+    cube.export(str(temp_path))
+
+    # Provide the path to the test
+    yield temp_path
+
+    # Cleanup after test
+    temp_path.unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -90,20 +142,16 @@ class TestPart:
         assert part.mesh is not None
 
     def test_extents(self, sample_part: Part):
-        # Check that we get reasonable extents
+        # Check that we get reasonable extents for our unit cube
         dx, dy, dz = sample_part.extents
         # All dimensions should be positive
         assert dx > 0
         assert dy > 0
         assert dz > 0
-        # For our unit cube, dimensions should be around 1.0
-        assert dx >= 1.0
-        assert dy >= 1.0
-        assert dz >= 1.0
-        # Should be reasonable sizes for a 3D model (not huge)
-        assert dx < 1000
-        assert dy < 1000
-        assert dz < 1000
+        # For our unit cube, dimensions should be exactly 1.0
+        assert abs(dx - 1.0) < 1e-10
+        assert abs(dy - 1.0) < 1e-10
+        assert abs(dz - 1.0) < 1e-10
 
     def test_footprint_xy(self, sample_part: Part):
         fw, fh = sample_part.footprint_xy
@@ -132,9 +180,13 @@ class TestPart:
         # Should have recorded the transform
         assert len(sample_part._transforms) == 1
         np.testing.assert_array_equal(sample_part._transforms[0], transform)
-        # Vertices should be different
-        with pytest.raises(AssertionError):
-            np.testing.assert_array_equal(sample_part.mesh.vertices, original_vertices)
+        # Vertices should be different (translated by 10mm in X)
+        # Check that vertices have actually changed
+        assert not np.allclose(sample_part.mesh.vertices, original_vertices)
+        # Specifically, the X coordinates should be shifted by 10
+        expected_vertices = original_vertices.copy()
+        expected_vertices[:, 0] += 10
+        np.testing.assert_array_almost_equal(sample_part.mesh.vertices, expected_vertices)
 
     def test_apply_scale(self, sample_part: Part):
         original_vertices = sample_part.mesh.vertices.copy()
