@@ -247,6 +247,13 @@ def cmd_layout(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
+    allow_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--allow-rotation/--no-allow-rotation",
+            help="Try axis permutations to find a better-fitting orientation.",
+        ),
+    ] = False,
     algorithm: Annotated[str | None, typer.Option("--algorithm")] = None,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
@@ -264,6 +271,7 @@ def cmd_layout(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
+                allow_rotation=allow_rotation,
                 algorithm=algorithm,
                 recursive=recursive,
                 dry_run=dry_run,
@@ -291,6 +299,13 @@ def cmd_fill(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
+    allow_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--allow-rotation/--no-allow-rotation",
+            help="Try axis permutations to find a better-fitting orientation.",
+        ),
+    ] = False,
     scale: Annotated[bool, typer.Option("--scale/--no-scale")] = False,
     orient: Annotated[
         bool,
@@ -315,6 +330,7 @@ def cmd_fill(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
+                allow_rotation=allow_rotation,
                 scale=scale,
                 orient_on=orient,
                 orient_threshold_deg=overhang_angle,
@@ -348,6 +364,13 @@ def cmd_autopack(
             help="Multiplier after geometry fit (TOML: scaling.post_fit_scale).",
         ),
     ] = None,
+    allow_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--allow-rotation/--no-allow-rotation",
+            help="Try axis permutations to find a better-fitting orientation.",
+        ),
+    ] = False,
     orient: Annotated[
         bool,
         typer.Option("--orient/--no-orient", help="Rotate parts to minimise support structures."),
@@ -376,6 +399,7 @@ def cmd_autopack(
                 printer_xyz=pr,
                 gap_mm=gap_mm,
                 post_fit_scale=post_fit_scale,
+                allow_rotation=allow_rotation,
                 orient_on=orient,
                 orient_threshold_deg=overhang_angle,
                 dry_run=dry_run,
@@ -468,6 +492,13 @@ def cmd_prepare(
             help="Multiplier after geometry fit (TOML: scaling.post_fit_scale).",
         ),
     ] = None,
+    allow_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--allow-rotation/--no-allow-rotation",
+            help="Try axis permutations to find a better-fitting orientation.",
+        ),
+    ] = False,
     method: Annotated[str | None, typer.Option("--method")] = None,
     overhang_angle: Annotated[
         float,
@@ -509,6 +540,7 @@ def cmd_prepare(
                 printer_xyz=pr,
                 gap_mm=gap_mm,
                 post_fit_scale=post_fit_scale,
+                allow_rotation=allow_rotation,
                 method=method,
                 overhang_threshold_deg=overhang_angle,
                 n_orient_candidates=orient_candidates,
@@ -577,6 +609,13 @@ def job(
         float,
         typer.Option("--grid-step", help="Packing grid step in mm (layout step)."),
     ] = 2.0,
+    allow_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--allow-rotation/--no-allow-rotation",
+            help="Try axis permutations to find a better-fitting orientation.",
+        ),
+    ] = False,
     verbose: Annotated[bool, typer.Option("--verbose", help="Show extra diagnostics.")] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Simulate without writing files.")
@@ -614,6 +653,7 @@ def job(
                 n_orient_candidates=candidates,
                 overhang_threshold_deg=overhang_angle,
                 rotation_samples=rotation_samples,
+                allow_rotation=allow_rotation,
                 grid_step_mm=grid_step,
                 verbose=verbose,
                 dry_run=dry_run,

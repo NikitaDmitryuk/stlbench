@@ -214,6 +214,7 @@ def test_run_prepare_dry_run_parallel():
                 printer_xyz=(500.0, 500.0, 500.0),
                 gap_mm=2.0,
                 post_fit_scale=0.5,  # scale down so re-oriented dims stay well within bed
+                allow_rotation=False,
                 method="sorted",
                 overhang_threshold_deg=45.0,
                 n_orient_candidates=5,  # minimal — keeps test fast

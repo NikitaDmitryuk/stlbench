@@ -50,7 +50,7 @@ from rich.table import Table
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import PartSpec, StepName
-from stlbench.core.fit import compute_global_scale
+from stlbench.core.fit import FitCalculator, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
@@ -68,6 +68,7 @@ class JobRunArgs:
     n_orient_candidates: int = 200
     overhang_threshold_deg: float = 45.0
     rotation_samples: int = ORIENTATION_SAMPLES_DEFAULT
+    allow_rotation: bool = False
     grid_step_mm: float = 2.0
     verbose: bool = False
     dry_run: bool = False
@@ -160,12 +161,11 @@ def _pass1_scale_first(
         mesh.apply_transform(t4)
         mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
     else:
-        b = np.asarray(mesh.bounds)
-        dims = (
-            float(b[1, 0] - b[0, 0]),
-            float(b[1, 1] - b[0, 1]),
-            float(b[1, 2] - b[0, 2]),
-        )
+        # Use arbitrary rotation around Z axis for better fitting
+        fit_calc = FitCalculator((px, py, pz))
+        t4, dims = fit_calc.find_optimal_z_rotation_transform(mesh.vertices)
+        mesh.apply_transform(t4)
+        mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
     pw.pass1_mesh = mesh
     pw.pass1_dims = dims
     return pw

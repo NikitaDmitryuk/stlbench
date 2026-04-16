@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from stlbench.core.fit import Method, compute_global_scale
+from stlbench.core.fit import FitCalculator, Method, compute_global_scale
 from stlbench.domain.part import Part
 from stlbench.domain.printer import Printer
 from stlbench.packing.layout_orientation import select_orientation_for_scale
@@ -41,25 +41,58 @@ class ScaleStep(PipelineStep):
     def _compute_and_apply(self, parts: list[Part]) -> StepResult:
         if self.allow_rotation:
             transforms, dims = self._find_orientations(parts)
+            s_max, reports = compute_global_scale(
+                self.printer.xyz,
+                dims,
+                [p.name for p in parts],
+                self.method,
+            )
         else:
-            transforms = [None] * len(parts)
-            dims = [p.extents for p in parts]
+            # Use arbitrary rotation around Z axis for better fitting
+            calc = FitCalculator(self.printer.xyz)
+            mesh_vertices_list = [p.mesh.vertices for p in parts]
+            transforms = []
+            dims = []
 
-        s_max, reports = compute_global_scale(
-            self.printer.xyz,
-            dims,
-            [p.name for p in parts],
-            self.method,
-        )
+            # Find optimal transforms for each part
+            for vertices in mesh_vertices_list:
+                t4, extents = calc.find_optimal_z_rotation_transform(vertices)
+                transforms.append(t4)
+                dims.append(extents)
+
+            # Explicitly type the arguments for mypy
+            printer_xyz: tuple[float, float, float] = self.printer.xyz
+            part_names: list[str] = [p.name for p in parts]
+            method: Method = self.method
+            file_dims: list[tuple[float, float, float]] | None = None
+            use_arbitrary_rotation: bool = True
+            # Convert TrackedArray to ndarray for type compatibility
+            mesh_vertices_list_param: list[np.ndarray] | None = [
+                np.asarray(vertices) for vertices in mesh_vertices_list
+            ]
+
+            s_max, reports = compute_global_scale(
+                printer_xyz,
+                dims,
+                part_names,
+                method,
+                file_dims=file_dims,
+                use_arbitrary_rotation=use_arbitrary_rotation,
+                mesh_vertices_list=mesh_vertices_list_param,
+            )
 
         s = min(1.0, s_max) if self.no_upscale else s_max
         s_final = s * self.post_fit_scale
 
         result_parts = []
-        for part, t4 in zip(parts, transforms, strict=True):
+        for i, part in enumerate(parts):
+            transform_matrix: np.ndarray | None = transforms[i]
             p = part.clone()
-            if t4 is not None:
-                p.apply_transform(t4)
+            # Handle the case where transform_matrix might be None
+            transform: np.ndarray = (
+                transform_matrix if transform_matrix is not None else np.eye(4, dtype=np.float64)
+            )
+            p.apply_transform(transform)
             p.apply_scale(s_final).floor_z()
             result_parts.append(p)
 

@@ -42,7 +42,7 @@ from rich.progress import (
 from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
-from stlbench.core.fit import compute_global_scale
+from stlbench.core.fit import FitCalculator, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import (
     apply_min_overhang_orientation,
@@ -73,6 +73,7 @@ class PrepareRunArgs:
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
     post_fit_scale: float | None
+    allow_rotation: bool
     method: str | None
     overhang_threshold_deg: float
     n_orient_candidates: int
@@ -225,15 +226,21 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         console.print("\n[bold]1 / 3  Scale[/bold]")
 
         def _select_orient(m: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
-            return select_orientation_for_scale(
-                m,
-                px,
-                py,
-                pz,
-                method,  # type: ignore[arg-type]
-                random_samples=ORIENTATION_SAMPLES_DEFAULT,
-                seed=ORIENTATION_SEED_DEFAULT,
-            )
+            if args.allow_rotation:
+                return select_orientation_for_scale(
+                    m,
+                    px,
+                    py,
+                    pz,
+                    method,  # type: ignore[arg-type]
+                    maximize=True,  # Do full search if allow_rotation is True
+                    random_samples=ORIENTATION_SAMPLES_DEFAULT,
+                    seed=ORIENTATION_SEED_DEFAULT,
+                )
+            else:
+                # Use arbitrary rotation around Z axis for better fitting
+                calc = FitCalculator((px, py, pz))
+                return calc.find_optimal_z_rotation_transform(m.vertices)
 
         _n = n_workers(len(meshes))
         if args.verbose:
