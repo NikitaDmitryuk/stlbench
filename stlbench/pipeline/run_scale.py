@@ -1,30 +1,24 @@
+"""Scale parts to fit printer volume."""
+
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import numpy as np
-import trimesh
 from rich.console import Console
-from rich.table import Table
 
-from stlbench.config.defaults import (
-    ORIENTATION_MODE_DEFAULT,
-    ORIENTATION_SAMPLES_DEFAULT,
-    ORIENTATION_SEED_DEFAULT,
+from stlbench.domain.part import Part
+from stlbench.domain.printer import Printer
+from stlbench.pipeline.common import (
+    load_named_meshes,
+    resolve_printer,
 )
-from stlbench.config.schema import AppSettings
-from stlbench.core.fit import (
-    Method,
-    aabb_edge_lengths,
-    compute_global_scale,
-    limiting_part_index,
-    printer_dims_with_margin,
-)
-from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.pipeline.common import load_named_meshes, n_workers, resolve_printer
-from stlbench.pipeline.mesh_io import load_mesh
+from stlbench.reporting.tables import scale_table
+from stlbench.steps.scale import ScaleStep
+
+if TYPE_CHECKING:
+    from stlbench.config.schema import AppSettings
 
 
 @dataclass
@@ -34,15 +28,16 @@ class ScaleRunArgs:
     config_path: Path | None
     settings: AppSettings | None
     printer_xyz: tuple[float, float, float] | None
-    margin: float | None
     post_fit_scale: float | None
     method: str | None
-    orientation: str | None
-    rotation_samples: int | None
-    no_upscale: bool
-    dry_run: bool
-    recursive: bool
-    suffix: str
+    allow_rotation: bool = False
+    maximize: bool = False
+    scale_factor: float | None = None
+    rotation_samples: int | None = None
+    no_upscale: bool = False
+    dry_run: bool = False
+    recursive: bool = False
+    suffix: str = ""
     verbose: bool = False
 
 
@@ -50,32 +45,43 @@ def run_scale(args: ScaleRunArgs) -> int:
     console = Console(stderr=True)
     st = args.settings
 
-    try:
-        prx, pry, prz = resolve_printer(args.printer_xyz, st)
-    except ValueError as e:
-        console.print(f"[red]{e}[/red]")
+    # ── Validation ────────────────────────────────────────────────────────────
+    if args.maximize and not args.allow_rotation:
+        console.print(
+            "[red]--maximize requires --allow-rotation "
+            "(cannot search for a better orientation without enabling rotation)[/red]"
+        )
         return 2
 
-    margin = (
-        float(args.margin)
-        if args.margin is not None
-        else (st.scaling.bed_margin if st is not None else 0.0)
-    )
+    # ── Printer / post_fit_scale ─────────────────────────────────────────────
+    # scale_factor bypasses fit-to-printer entirely, so printer dims are optional.
+    if args.scale_factor is None:
+        try:
+            prx, pry, prz = resolve_printer(args.printer_xyz, st)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            return 2
+    else:
+        # Printer dims may still be provided (used only for display / validation).
+        try:
+            prx, pry, prz = resolve_printer(args.printer_xyz, st)
+        except ValueError:
+            prx, pry, prz = 0.0, 0.0, 0.0
+
     post_fit_scale = (
         float(args.post_fit_scale)
         if args.post_fit_scale is not None
         else (st.scaling.post_fit_scale if st is not None else 1.0)
     )
 
-    method_s: Method = args.method or "sorted"  # type: ignore[assignment]
-    orient = args.orientation if args.orientation is not None else ORIENTATION_MODE_DEFAULT
-
-    rot_samples = (
-        int(args.rotation_samples)
-        if args.rotation_samples is not None
-        else ORIENTATION_SAMPLES_DEFAULT
-    )
-    seed = ORIENTATION_SEED_DEFAULT
+    printer = Printer.from_tuple((prx, pry, prz))
+    if st and st.printer.name:
+        printer = Printer(
+            width_mm=printer.width_mm,
+            depth_mm=printer.depth_mm,
+            height_mm=printer.height_mm,
+            name=st.printer.name,
+        )
 
     input_dir = args.input_dir
     output_dir = args.output_dir
@@ -89,99 +95,66 @@ def run_scale(args: ScaleRunArgs) -> int:
     paths, part_names, meshes = loaded
     del loaded
 
-    px, py, pz = printer_dims_with_margin(prx, pry, prz, margin)
+    # Create parts using the new domain object
+    parts = [
+        Part(name=name, mesh=mesh, source_path=path)
+        for name, mesh, path in zip(part_names, meshes, paths, strict=True)
+    ]
 
-    file_dims = [aabb_edge_lengths(np.asarray(m.bounds)) for m in meshes]
+    # Create and run the scale step
+    rotation_samples = args.rotation_samples if args.rotation_samples is not None else 4096
+    scale_step = ScaleStep(
+        printer=printer,
+        method=args.method or "sorted",  # type: ignore[arg-type]
+        post_fit_scale=post_fit_scale,
+        allow_rotation=args.allow_rotation,
+        maximize=args.maximize,
+        scale_factor=args.scale_factor,
+        no_upscale=args.no_upscale,
+        rotation_samples=rotation_samples,
+    )
 
-    if orient == "free":
+    result = scale_step.process(parts)
+    scaled_parts = result.parts
+    s_max = result.metadata.get("s_max", 1.0)
+    s_final = result.metadata.get("s_final", 1.0)
+    reports = result.metadata.get("reports", [])
 
-        def _select_orient(mesh: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
-            return select_orientation_for_scale(
-                mesh,
-                px,
-                py,
-                pz,
-                method_s,
-                random_samples=rot_samples,
-                seed=seed,
-            )
-
-        _n = n_workers(len(meshes))
-        if args.verbose:
-            console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
-        with ThreadPoolExecutor(max_workers=_n) as pool:
-            _results = list(pool.map(_select_orient, meshes))
-        transforms: list[np.ndarray] = [r[0] for r in _results]
-        parts_dims: list[tuple[float, float, float]] = [r[1] for r in _results]
-    else:
-        transforms = [np.eye(4, dtype=np.float64) for _ in meshes]
-        parts_dims = list(file_dims)
-
-    del meshes  # free mesh data; export will re-load from disk
-
-    file_dims_for_report = list(file_dims) if orient == "free" else None
-
-    try:
-        s_max, reports = compute_global_scale(
-            (px, py, pz),
-            parts_dims,
-            part_names,
-            method_s,
-            file_dims=file_dims_for_report,
+    # Print results using the new reporting module
+    if reports:
+        if st and st.printer.name:
+            console.print(f"Printer profile: {st.printer.name}")
+        console.print(
+            f"Printer: {printer.width_mm:.4f} x {printer.depth_mm:.4f} x {printer.height_mm:.4f}"
         )
-    except ValueError as e:
-        console.print(f"[red]{e}[/red]")
-        return 1
+        console.print(f"Method: {args.method or 'sorted'}")
+        if args.allow_rotation:
+            mode = "maximize" if args.maximize else "axis-permutations"
+            console.print(f"Rotation: {mode}")
+            if args.maximize and args.rotation_samples:
+                console.print(f"Rotation samples: {args.rotation_samples}")
+        else:
+            console.print("Rotation: none")
+        console.print(f"s_max (geometry fit): {s_max:.6f}")
+        console.print(f"post_fit_scale: {post_fit_scale:.6f}")
+        console.print(f"s_final (applied): {s_final:.6f}")
+        if args.no_upscale:
+            console.print("(capped by --no-upscale before post_fit_scale)")
 
-    s_after = min(1.0, s_max) if args.no_upscale else s_max
-    s_final = s_after * post_fit_scale
-    lim_i = limiting_part_index(reports, s_max)
-    limiter = reports[lim_i].name
+        if reports:
+            limiting_part = reports[0].name if reports else "unknown"
+            console.print(f"Limiting part: {limiting_part}")
 
-    if st and st.printer.name:
-        console.print(f"Printer profile: {st.printer.name}")
-    console.print(f"Printer (after margin): {px:.4f} x {py:.4f} x {pz:.4f}")
-    console.print(f"Method: {method_s}, orientation: {orient}")
-    if orient == "free":
-        console.print(f"Rotation samples: {rot_samples}, seed: {seed}")
-    console.print(f"s_max (geometry fit): {s_max:.6f}")
-    console.print(f"post_fit_scale: {post_fit_scale:.6f}")
-    console.print(f"s_final (applied): {s_final:.6f}")
-    if args.no_upscale:
-        console.print("(capped by --no-upscale before post_fit_scale)")
-    console.print(f"Limiting part: {limiter}")
-
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("part", max_width=42)
-    table.add_column("dx", justify="right")
-    table.add_column("dy", justify="right")
-    table.add_column("dz", justify="right")
-    table.add_column("s_part", justify="right")
-    if orient == "free":
-        table.add_column("fx")
-        table.add_column("fy")
-        table.add_column("fz")
-    for r in reports:
-        row = [
-            r.name,
-            f"{r.dx:.4f}",
-            f"{r.dy:.4f}",
-            f"{r.dz:.4f}",
-            f"{r.s_limit:.6f}",
-        ]
-        if orient == "free" and r.file_dx is not None:
-            row.extend([f"{r.file_dx:.3f}", f"{r.file_dy:.3f}", f"{r.file_dz:.3f}"])
-        elif orient == "free":
-            row.extend(["", "", ""])
-        table.add_row(*row)
-    console.print(table)
+        table = scale_table(reports, s_final)
+        console.print(table)
 
     if args.dry_run:
         return 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, path in enumerate(paths):
+    # Export scaled parts
+    for idx, (path, part) in enumerate(zip(paths, scaled_parts, strict=True)):
         if args.recursive:
             rel_parent = path.parent.relative_to(input_dir)
             out_sub = output_dir / rel_parent
@@ -194,14 +167,9 @@ def run_scale(args: ScaleRunArgs) -> int:
 
         if args.verbose:
             console.print(f"[dim]  [{idx + 1}/{len(paths)}] exporting {path.name}[/dim]")
-        mesh = load_mesh(path)
-        t4 = transforms[idx]
-        if not np.allclose(t4, np.eye(4)):
-            mesh.apply_transform(t4)
-        mesh.apply_scale(s_final)
 
         try:
-            mesh.export(out_path)
+            part.mesh.export(out_path)
         except (OSError, ValueError) as e:
             console.print(f"[red]Failed to export {out_path}: {e}[/red]")
             return 1

@@ -1,24 +1,31 @@
-from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
-from stlbench.packing.polygon_pack import (
-    footprints_to_box_polygons,
-    pack_polygons_on_plates,
-    try_pack_polygons_single_plate,
-)
-from stlbench.packing.rectpack_plate import PackedPlate, pack_rectangles_on_plates
-from stlbench.packing.shelf import (
-    PackablePart,
-    build_packable_parts,
-    greedy_shelf_plates,
-)
+from __future__ import annotations
 
-__all__ = [
-    "PackablePart",
-    "build_packable_parts",
-    "greedy_shelf_plates",
-    "PackedPlate",
-    "pack_rectangles_on_plates",
-    "mesh_to_xy_shadow",
-    "pack_polygons_on_plates",
-    "try_pack_polygons_single_plate",
-    "footprints_to_box_polygons",
-]
+from typing import TYPE_CHECKING
+
+from stlbench.packing.base import PackingStrategy
+from stlbench.packing.polygon_pack import PolygonPacker
+from stlbench.packing.rectpack_plate import RectPacker
+from stlbench.packing.shelf import ShelfPacker
+
+if TYPE_CHECKING:
+    pass
+
+_REGISTRY: dict[str, type[PackingStrategy]] = {
+    "polygon": PolygonPacker,
+    "rectpack": RectPacker,
+    "shelf": ShelfPacker,
+}
+
+
+def make_packer(algorithm: str, **kwargs) -> PackingStrategy:
+    """Create a packer by algorithm name.
+
+    Args:
+        algorithm: "polygon" | "rectpack" | "shelf"
+        **kwargs:  Constructor parameters (grid_step_mm, max_plates, etc.)
+    """
+    cls = _REGISTRY.get(algorithm)
+    if cls is None:
+        available = ", ".join(sorted(_REGISTRY))
+        raise ValueError(f"Unknown packing algorithm {algorithm!r}. Available: {available}")
+    return cls(**kwargs)

@@ -1,8 +1,4 @@
-"""Sample TOML generators for `stlbench config init` and `stlbench config job`.
-
-Orientation mode, rotation sample count, and default layout algorithm live in code
-(`stlbench.config.defaults` and CLI: `--orientation`, `layout --algorithm`).
-"""
+"""Sample TOML generators for `stlbench config init` and `stlbench config job`."""
 
 from __future__ import annotations
 
@@ -24,7 +20,7 @@ def sample_app_settings() -> AppSettings:
             depth_mm=77.76,
             height_mm=165.0,
         ),
-        scaling=ScalingSection(bed_margin=0.02, post_fit_scale=0.95),
+        scaling=ScalingSection(post_fit_scale=0.95),
         packing=PackingSection(gap_mm=5.0),
     )
 
@@ -60,10 +56,14 @@ def render_sample_config_toml() -> str:
         f"height_mm = {_toml_number(p.height_mm)}",
         "",
         "[scaling]",
-        "# Per-axis margin on bed/height: 0.02 ~ 2% inset on each side.",
-        f"bed_margin = {_toml_number(sc.bed_margin)}",
         "# Multiplier applied after geometry fit (<1 leaves room for slicer brim; 1.0 = none).",
         f"post_fit_scale = {_toml_number(sc.post_fit_scale)}",
+        "# Try the 6 canonical axis permutations to find a better-fitting orientation.",
+        "# false = scale in the current orientation (default).",
+        "allow_rotation = false",
+        "# Full SO(3) random search (4096 samples) to maximise scale factor.",
+        "# Requires allow_rotation = true. Slow; produces arbitrary tilt angles.",
+        "maximize = false",
         "",
         "[packing]",
         "# Surface-to-surface gap between parts on the bed (mm).",
@@ -93,10 +93,14 @@ def render_sample_job_toml() -> str:
         f"height_mm = {_toml_number(p.height_mm)}",
         "",
         "[scaling]",
-        "# Per-axis margin on bed/height: 0.02 ~ 2% inset on each side.",
-        f"bed_margin = {_toml_number(sc.bed_margin)}",
         "# Multiplier applied after geometry fit (<1 leaves room for slicer brim; 1.0 = none).",
         f"post_fit_scale = {_toml_number(sc.post_fit_scale)}",
+        "# Try the 6 canonical axis permutations to find a better-fitting orientation.",
+        "# false = scale in the current orientation (default).",
+        "allow_rotation = false",
+        "# Full SO(3) random search (4096 samples) to maximise scale factor.",
+        "# Requires allow_rotation = true. Slow; produces arbitrary tilt angles.",
+        "maximize = false",
         "",
         "[packing]",
         "# Surface-to-surface gap between parts on the bed (mm).",

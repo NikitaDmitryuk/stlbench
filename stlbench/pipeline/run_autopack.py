@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
-from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
+from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
@@ -33,7 +33,6 @@ class AutopackRunArgs:
     config_path: Path | None
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
-    margin: float | None
     post_fit_scale: float | None
     orient_on: bool
     orient_threshold_deg: float
@@ -95,9 +94,6 @@ def run_autopack(args: AutopackRunArgs) -> int:
         return 2
 
     gap = resolve_gap(args.gap_mm, st)
-    margin = (
-        float(args.margin) if args.margin is not None else (st.scaling.bed_margin if st else 0.0)
-    )
     post_fit_scale = (
         float(args.post_fit_scale)
         if args.post_fit_scale is not None
@@ -109,7 +105,7 @@ def run_autopack(args: AutopackRunArgs) -> int:
         return 1
     _paths, names, meshes = loaded
 
-    epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
+    epx, epy, epz = px, py, pz
 
     # Find best print orientation per mesh and collect raw file dims in one pass.
     # --orient: minimise overhangs (support-optimised) → use oriented AABB dims.

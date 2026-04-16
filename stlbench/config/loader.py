@@ -48,10 +48,6 @@ class AppConfig:
         return self._s.printer.height_mm
 
     @property
-    def bed_margin(self) -> float:
-        return self._s.scaling.bed_margin
-
-    @property
     def post_fit_scale(self) -> float:
         return self._s.scaling.post_fit_scale
 

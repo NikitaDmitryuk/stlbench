@@ -8,8 +8,6 @@ depth_mm = 77.76
 height_mm = 165.0
 
 [scaling]
-# Per-axis margin on bed/height (same idea as --margin): 0.02 ≈ 2% inset each side.
-bed_margin = 0.02
 # Multiplier applied after geometry fit (<1 leaves room for slicer, brim, clearance; 1.0 = none).
 post_fit_scale = 0.95
 
@@ -19,7 +17,7 @@ gap_mm = 5.0
 [pipeline]
 # Default step sequence for parts that do not specify their own steps in a job file.
 # Valid sequences (layout must always be last):
-#   ["scale", "orient", "layout"]  — SO(3) search → global scale → orient → pack  (default)
+#   ["scale", "orient", "layout"]  — global scale → orient → pack  (default)
 #   ["orient", "scale", "layout"]  — orient first, then scale from oriented AABB
 #   ["scale", "layout"]            — scale but skip overhang orientation
 #   ["orient", "layout"]           — orient only, no scaling

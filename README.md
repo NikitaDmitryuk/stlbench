@@ -106,7 +106,6 @@ depth_mm  = 77.76
 height_mm = 165.0
 
 [scaling]
-bed_margin     = 0.02
 post_fit_scale = 0.95
 
 [packing]
@@ -166,8 +165,40 @@ stlbench scale -i ./parts -o ./scaled -c my_printer.toml
 Computes a single scale factor so that **every** part fits inside the printer build
 volume. The largest part determines the factor; all parts share the same scale.
 
-Key options: `--dry-run`, `--no-upscale`, `--method sorted|conservative`,
-`--post-fit-scale`, `--suffix`, `--recursive`.
+By default the model is **not rotated** — scaling is applied in the current
+orientation. Two opt-in flags add rotation behaviour:
+
+| Flags | Behaviour |
+|-------|-----------|
+| _(default)_ | Fit to printer in current orientation |
+| `--allow-rotation` | Try the 6 canonical axis permutations (90° rotations), pick the best-fitting one |
+| `--allow-rotation --maximize` | Full SO(3) random search (4 096 samples × 6 permutations) to maximise scale factor |
+| `--scale N` | Apply an explicit factor `N` instead of fitting to the printer; printer config becomes optional |
+
+**Examples:**
+
+```bash
+# Default: fit to build volume, no rotation
+stlbench scale -i ./parts -o ./scaled -c my_printer.toml
+
+# Lay each part on its best-fitting flat face (axis-aligned only)
+stlbench scale -i ./parts -o ./scaled -c my_printer.toml --allow-rotation
+
+# Full rotation search — maximise scale by trying arbitrary orientations (slow)
+stlbench scale -i ./parts -o ./scaled -c my_printer.toml --allow-rotation --maximize
+
+# Explicit factor: double every part's size, no printer required
+stlbench scale -i ./parts -o ./scaled --scale 2.0
+
+# Shrink to 80% of current size
+stlbench scale -i ./parts -o ./scaled --scale 0.8
+
+# Fit to printer, but cap at 1.0 and add a 5% safety margin
+stlbench scale -i ./parts -o ./scaled -c my_printer.toml --no-upscale --post-fit-scale 0.95
+```
+
+Key options: `--scale N`, `--allow-rotation`, `--maximize`, `--no-upscale`,
+`--post-fit-scale`, `--method sorted|conservative`, `--dry-run`, `--suffix`, `--recursive`.
 
 ---
 
@@ -215,7 +246,7 @@ plate simultaneously. Combines `scale` and `layout` into one step with the goal 
 keeping everything on one plate.
 
 Key options: `--orient/--no-orient`, `--overhang-angle`, `--dry-run`, `--gap-mm`,
-`--margin`, `--post-fit-scale`.
+`--post-fit-scale`.
 
 ---
 
@@ -258,13 +289,13 @@ Printer profiles are TOML files. Generate a template with `stlbench config init`
 see [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml) for a complete example
 (ELEGOO Mars 5 Ultra).
 
-| Section      | Keys                                                  | Purpose                              |
-|--------------|-------------------------------------------------------|--------------------------------------|
-| `[printer]`  | `name`, `width_mm`, `depth_mm`, `height_mm`           | Build volume (required)              |
-| `[scaling]`  | `bed_margin` (0–1), `post_fit_scale` (>0)             | Margin and post-scale multiplier     |
-| `[packing]`  | `gap_mm`                                              | Surface-to-surface gap between parts |
-| `[pipeline]` | `default_steps`                                       | Default step list for `job` command  |
-| `[[parts]]`  | `path`, `steps`                                       | Per-part entries for `job` command   |
+| Section      | Keys                                                                          | Purpose                              |
+|--------------|-------------------------------------------------------------------------------|--------------------------------------|
+| `[printer]`  | `name`, `width_mm`, `depth_mm`, `height_mm`                                   | Build volume (required)              |
+| `[scaling]`  | `post_fit_scale` (>0), `allow_rotation`, `maximize`                           | Scale behaviour (see `scale` command) |
+| `[packing]`  | `gap_mm`                                                                      | Surface-to-surface gap between parts |
+| `[pipeline]` | `default_steps`                                                               | Default step list for `job` command  |
+| `[[parts]]`  | `path`, `steps`                                                               | Per-part entries for `job` command   |
 
 ## Output Files
 

@@ -10,7 +10,7 @@ import trimesh
 from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
-from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
+from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
 from stlbench.export.plate import _ROT_Z_90, mesh_footprint_xy
@@ -145,10 +145,8 @@ def run_fill(args: FillRunArgs) -> int:
             console.print(f"[dim]cleanup: {inp.name} — removed {n_rem} tiny component(s)[/dim]")
 
     if args.scale:
-        margin = st.scaling.bed_margin if st else 0.0
-        epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
         dims = aabb_edge_lengths(np.asarray(mesh.bounds))
-        s, _ = compute_global_scale((epx, epy, epz), [dims], [inp.name], "sorted")
+        s, _ = compute_global_scale((px, py, pz), [dims], [inp.name], "sorted")
         pf = st.scaling.post_fit_scale if st else 1.0
         s_final = s * pf
         mesh.apply_scale(s_final)

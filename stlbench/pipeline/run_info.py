@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
-from stlbench.core.fit import aabb_edge_lengths, compute_global_scale, printer_dims_with_margin
+from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.pipeline.common import load_named_meshes, resolve_printer, resolve_settings
 from stlbench.pipeline.run_fill import _max_copies_on_plate
 
@@ -36,14 +36,11 @@ def run_info(args: InfoRunArgs) -> int:
         return 1
     _paths, names, meshes = loaded
 
-    margin = st.scaling.bed_margin if st else 0.0
-    epx, epy, epz = printer_dims_with_margin(px, py, pz, margin)
     gap = st.packing.gap_mm if st else DEFAULT_PACKING_GAP_MM
 
     if st and st.printer.name:
         console.print(f"Printer: {st.printer.name}")
     console.print(f"Build volume: {px:.2f} x {py:.2f} x {pz:.2f} mm")
-    console.print(f"Effective (margin {margin:.1%}): {epx:.2f} x {epy:.2f} x {epz:.2f} mm")
     console.print()
 
     dims_list: list[tuple[float, float, float]] = []
@@ -67,10 +64,10 @@ def run_info(args: InfoRunArgs) -> int:
         n_verts = len(m.vertices)
         n_faces = len(m.faces)
 
-        s, _ = compute_global_scale((epx, epy, epz), [d], [name], "sorted")
+        s, _ = compute_global_scale((px, py, pz), [d], [name], "sorted")
         fits = s >= 1.0 - 1e-9
 
-        plate = _max_copies_on_plate(d[0], d[1], epx, epy, gap)
+        plate = _max_copies_on_plate(d[0], d[1], px, py, gap)
         copies = len(plate.rects) if plate else 0
 
         table.add_row(
@@ -90,7 +87,7 @@ def run_info(args: InfoRunArgs) -> int:
 
     if len(dims_list) > 1:
         console.print()
-        s_all, _ = compute_global_scale((epx, epy, epz), dims_list, names, "sorted")
+        s_all, _ = compute_global_scale((px, py, pz), dims_list, names, "sorted")
         pf = st.scaling.post_fit_scale if st else 1.0
         console.print(f"Global scale (all parts fit individually): {s_all:.6f}")
         console.print(f"With post_fit_scale ({pf}): {s_all * pf:.6f}")

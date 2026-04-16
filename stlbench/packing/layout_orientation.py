@@ -110,14 +110,20 @@ def select_orientation_for_scale(
     pz: float,
     method: Method,
     *,
+    maximize: bool = True,
     random_samples: int = 4096,
     seed: int = 0,
 ) -> tuple[np.ndarray, tuple[float, float, float]]:
     """
-    Same rotation/permutation search space as ``select_layout_transform`` (``P @ R``),
-    but pick the candidate that **maximizes** the per-part scale limit in printer
-    coordinates (``s_max_for_part_printer_axes`` for ``sorted``, conservative
-    formula for ``conservative``). Tie-break: smaller XY footprint ``ex * ey``.
+    Search for a print orientation that optimises scale fit.
+
+    When *maximize* is ``True`` (the legacy behaviour), samples ``random_samples``
+    random SO(3) rotations in addition to the six canonical axis permutations and
+    picks the candidate that **maximises** the per-part scale limit.
+
+    When *maximize* is ``False``, only the six canonical axis permutations are
+    evaluated.  The best-fitting one is returned (same tie-break: smaller XY
+    footprint ``ex * ey``).
     """
     verts = mesh_vertices_for_orientation(mesh)
     rng = np.random.default_rng(seed)
@@ -128,8 +134,9 @@ def select_orientation_for_scale(
     best_ext: tuple[float, float, float] | None = None
 
     bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
-    for _ in range(max(0, random_samples)):
-        bases.append(_random_rotation_matrix(rng))
+    if maximize:
+        for _ in range(max(0, random_samples)):
+            bases.append(_random_rotation_matrix(rng))
 
     p_min = min(px, py, pz)
     for r in bases:

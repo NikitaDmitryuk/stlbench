@@ -1,18 +1,19 @@
+"""Layout parts on build plates using various packing algorithms."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import numpy as np
-import trimesh
 from rich.console import Console
 
-from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.mesh_cleanup import remove_small_components
-from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
+from stlbench.domain.part import Part
+from stlbench.domain.plate import Plate
+from stlbench.domain.printer import Printer
+from stlbench.packing import make_packer
 from stlbench.packing.layout_orientation import select_layout_transform
-from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
-from stlbench.packing.polygon_pack import pack_polygons_on_plates
 from stlbench.packing.rectpack_plate import int_bin_dims_mm
 from stlbench.packing.shelf import build_packable_parts, greedy_shelf_plates
 from stlbench.pipeline.common import (
@@ -22,6 +23,10 @@ from stlbench.pipeline.common import (
     resolve_printer,
     resolve_settings,
 )
+from stlbench.steps.layout import LayoutStep
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 @dataclass
@@ -50,43 +55,54 @@ def run_layout(args: LayoutRunArgs) -> int:
     gap = resolve_gap(args.gap_mm, st)
     algo = resolve_algorithm(args.algorithm, st)
 
+    printer = Printer.from_tuple((px, py, pz))
+    if st and st.printer.name:
+        printer = Printer(
+            width_mm=printer.width_mm,
+            depth_mm=printer.depth_mm,
+            height_mm=printer.height_mm,
+            name=st.printer.name,
+        )
+
     loaded = load_named_meshes(args.input_dir, args.recursive, console)
     if loaded is None:
         return 1
-    _paths, names, meshes = loaded
+    _paths, part_names, meshes = loaded
 
+    # Create parts using the new domain object
+    parts = [
+        Part(name=name, mesh=mesh, source_path=path)
+        for name, mesh, path in zip(part_names, meshes, _paths, strict=True)
+    ]
+
+    # Pre-check: every part must fit the bed in at least one orientation.
     dims_list: list[tuple[float, float, float]] = []
-    for m in meshes:
-        dx, dy, dz = mesh_footprint_xy(m)
-        dims_list.append((dx, dy, dz))
-
-    rot_samples = ORIENTATION_SAMPLES_DEFAULT
-    rot_seed = ORIENTATION_SEED_DEFAULT
-
-    bw, bh = int_bin_dims_mm(px, py)
-    bad_layout: list[tuple[str, float, float, float]] = []
     layout_plans: list[tuple[np.ndarray, float, float] | None] = []
-    for m, name in zip(meshes, names, strict=True):
-        dx, dy, dz = mesh_footprint_xy(m)
+    bad_layout: list[tuple[str, float, float, float]] = []
+
+    for part in parts:
+        dx, dy, dz = part.extents
+        dims_list.append((dx, dy, dz))
         ok, t, fw, fh = select_layout_transform(
-            m,
+            part.mesh,
             px,
             py,
             pz,
             gap,
-            random_samples=rot_samples,
-            seed=rot_seed,
+            random_samples=4096,
+            seed=0,
         )
         if not ok:
-            bad_layout.append((name, dx, dy, dz))
+            bad_layout.append((part.name, dx, dy, dz))
             layout_plans.append(None)
         else:
             layout_plans.append((t, fw, fh))
 
     if bad_layout:
+        bw, bh = int_bin_dims_mm(px, py)
         console.print(
             "[red]No bed-fitting orientation for these parts: 90° permutations + "
-            f"{rot_samples} random rotations (same idea as scale; seed={rot_seed}). "
+            f"4096 random rotations. "
             f"Bed {bw}x{bh} mm XY, Pz={pz:.2f} mm, gap={gap:.2f} mm.[/red]"
         )
         for name, dx, dy, dz in bad_layout:
@@ -96,18 +112,19 @@ def run_layout(args: LayoutRunArgs) -> int:
         )
         return 1
 
-    oriented_meshes: list[trimesh.Trimesh] = []
-    for m, plan in zip(meshes, layout_plans, strict=True):
+    # Apply layout transforms
+    oriented_parts: list[Part] = []
+    for part, plan in zip(parts, layout_plans, strict=True):
         assert plan is not None
         t, _fw, _fh = plan
-        m2 = m.copy()
-        m2.apply_transform(t)
-        oriented_meshes.append(m2)
+        oriented_part = part.clone()
+        oriented_part.apply_transform(t)
+        oriented_parts.append(oriented_part)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if algo == "shelf":
-        packable, bad = build_packable_parts(names, dims_list, px, py, pz)
+        packable, bad = build_packable_parts(part_names, dims_list, px, py, pz)
         if bad:
             console.print("Heuristic says these do not fit:", ", ".join(bad))
         groups = greedy_shelf_plates(packable, px, py)
@@ -119,23 +136,42 @@ def run_layout(args: LayoutRunArgs) -> int:
         return 0
 
     if args.cleanup:
-        for i, m in enumerate(oriented_meshes):
-            cleaned, n_rem = remove_small_components(m)
+        for i, part in enumerate(oriented_parts):
+            cleaned_mesh, n_rem = remove_small_components(part.mesh)
             if n_rem:
-                oriented_meshes[i] = cleaned
-                console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
+                oriented_parts[i].mesh = cleaned_mesh
+                console.print(
+                    f"[dim]cleanup: {part_names[i]} — removed {n_rem} tiny component(s)[/dim]"
+                )
 
-    shadows = [mesh_to_xy_shadow(m) for m in oriented_meshes]
-    plates = pack_polygons_on_plates(shadows, px, py, gap_mm=gap)
+    # Use the new packing strategy pattern
+    try:
+        packer = make_packer(algo, max_plates=64)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return 2
+
+    # Create and run the layout step
+    layout_step = LayoutStep(
+        printer=printer,
+        packer=packer,
+        gap_mm=gap,
+    )
+
+    result = layout_step.process(oriented_parts)
+    plates: list[Plate] = result.metadata.get("plates", [])
+
     if args.dry_run:
         console.print(f"Plates: {len(plates)}")
-        for pl in plates:
-            console.print(f"  Plate {pl.index + 1}: {len(pl.rects)} parts")
+        for plate in plates:
+            console.print(f"  Plate {plate.index + 1}: {plate.part_count} parts")
         return 0
 
-    for pl in plates:
-        out_3mf = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
-        out_js = args.output_dir / f"plate_{pl.index + 1:02d}.json"
-        export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
+    # Export plates using the new domain object
+    for plate in plates:
+        out_3mf = args.output_dir / f"plate_{plate.index + 1:02d}.3mf"
+        out_js = args.output_dir / f"plate_{plate.index + 1:02d}.json"
+        plate.export_3mf(out_3mf, out_js)
         console.print(f"Wrote {out_3mf}")
+
     return 0
