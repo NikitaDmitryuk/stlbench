@@ -17,8 +17,8 @@ def sample_printer() -> Printer:
 
 @pytest.fixture
 def sample_mesh_path() -> Path:
-    # Using a simple cube mesh from the examples
-    return Path("/Users/nikdmitryuk/PycharmProjects/stlbench/examples/gandalf/main/figure.stl")
+    # Using a simple cube mesh from the test assets
+    return Path(__file__).parent / "assets" / "cube.stl"
 
 
 @pytest.fixture
@@ -90,16 +90,20 @@ class TestPart:
         assert part.mesh is not None
 
     def test_extents(self, sample_part: Part):
-        # Check that we get reasonable extents (the actual model is not a unit cube)
+        # Check that we get reasonable extents
         dx, dy, dz = sample_part.extents
         # All dimensions should be positive
         assert dx > 0
         assert dy > 0
         assert dz > 0
-        # Should be reasonable sizes for a 3D model (not tiny or huge)
-        assert dx > 1 and dx < 1000
-        assert dy > 1 and dy < 1000
-        assert dz > 1 and dz < 1000
+        # For our unit cube, dimensions should be around 1.0
+        assert dx >= 1.0
+        assert dy >= 1.0
+        assert dz >= 1.0
+        # Should be reasonable sizes for a 3D model (not huge)
+        assert dx < 1000
+        assert dy < 1000
+        assert dz < 1000
 
     def test_footprint_xy(self, sample_part: Part):
         fw, fh = sample_part.footprint_xy
