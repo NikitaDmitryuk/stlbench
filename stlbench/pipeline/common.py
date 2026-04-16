@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import numpy as np
 import trimesh
 from rich.console import Console
 
@@ -54,12 +53,6 @@ def resolve_algorithm(algorithm: str | None, _settings: AppSettings | None) -> s
     if algorithm is not None:
         return algorithm
     return "rectpack"
-
-
-def rotation_to_4x4(r3: np.ndarray) -> np.ndarray:
-    t = np.eye(4, dtype=np.float64)
-    t[:3, :3] = np.asarray(r3, dtype=np.float64)
-    return t
 
 
 def load_named_meshes(
