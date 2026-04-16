@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
-from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
+from stlbench.core.fit import FitCalculator, aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
@@ -34,6 +34,7 @@ class AutopackRunArgs:
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
     post_fit_scale: float | None
+    allow_rotation: bool
     orient_on: bool
     orient_threshold_deg: float
     dry_run: bool
@@ -134,15 +135,21 @@ def run_autopack(args: AutopackRunArgs) -> int:
             m: trimesh.Trimesh,
         ) -> tuple[tuple[float, float, float], np.ndarray, tuple[float, float, float]]:
             file_d = aabb_edge_lengths(np.asarray(m.bounds))
-            t4, ext = select_orientation_for_scale(
-                m,
-                epx,
-                epy,
-                epz,
-                "sorted",
-                random_samples=ORIENTATION_SAMPLES_DEFAULT,
-                seed=ORIENTATION_SEED_DEFAULT,
-            )
+            if args.allow_rotation:
+                t4, ext = select_orientation_for_scale(
+                    m,
+                    epx,
+                    epy,
+                    epz,
+                    "sorted",
+                    maximize=True,  # Do full search if allow_rotation is True
+                    random_samples=ORIENTATION_SAMPLES_DEFAULT,
+                    seed=ORIENTATION_SEED_DEFAULT,
+                )
+            else:
+                # Use arbitrary rotation around Z axis for better fitting
+                calc = FitCalculator((epx, epy, epz))
+                t4, ext = calc.find_optimal_z_rotation_transform(m.vertices)
             return file_d, t4, ext
 
     # Pre-populate trimesh lazy caches sequentially before threading.

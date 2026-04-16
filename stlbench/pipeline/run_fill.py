@@ -10,7 +10,7 @@ import trimesh
 from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
-from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
+from stlbench.core.fit import FitCalculator, aabb_edge_lengths
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
 from stlbench.export.plate import _ROT_Z_90, mesh_footprint_xy
@@ -33,6 +33,7 @@ class FillRunArgs:
     config_path: Path | None
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
+    allow_rotation: bool
     scale: bool
     orient_on: bool
     orient_threshold_deg: float
@@ -146,7 +147,14 @@ def run_fill(args: FillRunArgs) -> int:
 
     if args.scale:
         dims = aabb_edge_lengths(np.asarray(mesh.bounds))
-        s, _ = compute_global_scale((px, py, pz), [dims], [inp.name], "sorted")
+        if args.allow_rotation:
+            # Use our new function that checks both Z-axis orientations
+            fit_calc = FitCalculator((px, py, pz))
+            s, _ = fit_calc.s_max_for_part_with_z_rotation(*dims)
+        else:
+            # Use arbitrary rotation around Z axis for better fitting
+            fit_calc = FitCalculator((px, py, pz))
+            s, _, _ = fit_calc.s_max_for_part_arbitrary_z_rotation(mesh.vertices)
         pf = st.scaling.post_fit_scale if st else 1.0
         s_final = s * pf
         mesh.apply_scale(s_final)

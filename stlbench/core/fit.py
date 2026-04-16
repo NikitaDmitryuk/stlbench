@@ -78,18 +78,160 @@ class FitCalculator:
             return s_full, xy_label
         return s_full, f"{xy_label}_and_z"
 
+    def s_max_for_part_with_z_rotation(self, ex: float, ey: float, ez: float) -> tuple[float, str]:
+        """
+        Largest uniform scale *s* considering both orientations around Z axis:
+        1. Original orientation: ex along X, ey along Y
+        2. Rotated 90° around Z: ey along X, ex along Y
+        Returns the better scaling factor and orientation info.
+        """
+        self._require_positive_dims((ex, ey, ez), "Part")
+
+        # Original orientation
+        s_z1 = self.printer_z / ez
+        s_xy1 = min(self.printer_x / ex, self.printer_y / ey)
+        s1 = min(s_xy1, s_z1)
+
+        # Rotated 90° around Z
+        s_z2 = self.printer_z / ez
+        s_xy2 = min(self.printer_x / ey, self.printer_y / ex)
+        s2 = min(s_xy2, s_z2)
+
+        # Choose better scale
+        eps = 1e-9
+        if s2 > s1 + eps:
+            # Better with rotation
+            s_full = s2
+            xy_label = "xy_bed_swapped"
+            if s_z2 < s_xy2 - eps:
+                return s_full, "z_build_height"
+            return s_full, xy_label
+        else:
+            # Better without rotation or equal
+            s_full = s1
+            xy_label = "xy_bed"
+            if s_z1 < s_xy1 - eps:
+                return s_full, "z_build_height"
+            return s_full, xy_label
+
+    def s_max_for_part_arbitrary_z_rotation(
+        self, mesh_vertices: np.ndarray, samples: int = 360
+    ) -> tuple[float, float, str]:
+        """
+        Find the optimal scale by rotating the part around Z axis with arbitrary angles.
+
+        Args:
+            mesh_vertices: Array of mesh vertices (n, 3)
+            samples: Number of angle samples to test (default 360 for 1° resolution)
+
+        Returns:
+            tuple of (scale_factor, rotation_angle_rad, limiting_axis)
+        """
+        from ..core.orientation import aabb_extents_after_rotation
+
+        best_scale = 0.0
+        best_angle = 0.0
+        best_axis_label = "xy_bed"
+
+        # Test multiple rotation angles around Z axis
+        for i in range(samples):
+            angle_rad = (2.0 * np.pi * i) / samples
+            # Create rotation matrix around Z axis
+            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+            rotation_matrix = np.array(
+                [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+            )
+
+            # Get extents after rotation
+            ex, ey, ez = aabb_extents_after_rotation(mesh_vertices, rotation_matrix)
+
+            # Calculate scale for this orientation
+            s_z = self.printer_z / ez
+            s_xy = min(self.printer_x / ex, self.printer_y / ey)
+            s_current = min(s_xy, s_z)
+
+            # Update best if this is better
+            if s_current > best_scale:
+                best_scale = s_current
+                best_angle = angle_rad
+                eps = 1e-9
+                best_axis_label = "z_build_height" if s_z < s_xy - eps else "xy_bed"
+
+        return best_scale, best_angle, best_axis_label
+
+    def find_optimal_z_rotation_transform(
+        self, mesh_vertices: np.ndarray, samples: int = 360
+    ) -> tuple[np.ndarray, tuple[float, float, float]]:
+        """
+        Find the optimal rotation around Z axis and return the transformation matrix and resulting extents.
+
+        Args:
+            mesh_vertices: Array of mesh vertices (n, 3)
+            samples: Number of angle samples to test (default 360 for 1° resolution)
+
+        Returns:
+            tuple of (4x4 transformation matrix, (ex, ey, ez) extents)
+        """
+        from ..core.orientation import aabb_extents_after_rotation
+
+        best_scale = 0.0
+        best_angle = 0.0
+        best_extents = (0.0, 0.0, 0.0)
+
+        # Test multiple rotation angles around Z axis
+        for i in range(samples):
+            angle_rad = (2.0 * np.pi * i) / samples
+            # Create rotation matrix around Z axis
+            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+            rotation_matrix = np.array(
+                [[cos_a, -sin_a, 0.0], [sin_a, cos_a, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+            )
+
+            # Get extents after rotation
+            ex, ey, ez = aabb_extents_after_rotation(mesh_vertices, rotation_matrix)
+
+            # Calculate scale for this orientation
+            s_z = self.printer_z / ez
+            s_xy = min(self.printer_x / ex, self.printer_y / ey)
+            s_current = min(s_xy, s_z)
+
+            # Update best if this is better
+            if s_current > best_scale:
+                best_scale = s_current
+                best_angle = angle_rad
+                best_extents = (ex, ey, ez)
+
+        # Create transformation matrix for the best angle
+        cos_a, sin_a = np.cos(best_angle), np.sin(best_angle)
+        transform = np.array(
+            [
+                [cos_a, -sin_a, 0.0, 0.0],
+                [sin_a, cos_a, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+        return transform, best_extents
+
     def compute_global_scale(
         self,
         parts_dims: list[tuple[float, float, float]],
         part_names: list[str],
         method: Method,
         file_dims: list[tuple[float, float, float]] | None = None,
+        use_arbitrary_rotation: bool = False,
+        mesh_vertices_list: list[np.ndarray] | None = None,
     ) -> tuple[float, list[PartScaleReport]]:
         """Uniform scale across parts.
 
         For ``method="sorted"``, each ``parts_dims`` triple is **(dx, dy, dz) along printer
         X, Y, Z** (build height along Z). The per-part limit allows a 90° rotation of the
         XY footprint on the bed (see ``s_max_for_part_printer_axes``).
+
+        If use_arbitrary_rotation is True and mesh_vertices_list is provided, uses arbitrary
+        rotation around Z axis for better fitting.
         """
         if len(parts_dims) != len(part_names):
             raise ValueError("parts_dims and part_names length mismatch.")
@@ -97,6 +239,12 @@ class FitCalculator:
             raise ValueError("No parts to scale.")
         if file_dims is not None and len(file_dims) != len(parts_dims):
             raise ValueError("file_dims length must match parts_dims.")
+        if (
+            use_arbitrary_rotation
+            and mesh_vertices_list is not None
+            and len(mesh_vertices_list) != len(parts_dims)
+        ):
+            raise ValueError("mesh_vertices_list length must match parts_dims.")
 
         reports: list[PartScaleReport] = []
         limits: list[float] = []
@@ -104,24 +252,49 @@ class FitCalculator:
         if method == "sorted":
             for i, (name, dims) in enumerate(zip(part_names, parts_dims, strict=True)):
                 self._require_positive_dims(dims, name)
-                s_lim, axis = self.s_max_for_part_printer_axes(*dims)
-                limits.append(s_lim)
-                fx = fy = fz = None
-                if file_dims is not None:
-                    fx, fy, fz = file_dims[i]
-                reports.append(
-                    PartScaleReport(
-                        name=name,
-                        dx=dims[0],
-                        dy=dims[1],
-                        dz=dims[2],
-                        s_limit=s_lim,
-                        limiting_axis=axis,
-                        file_dx=fx,
-                        file_dy=fy,
-                        file_dz=fz,
+                if use_arbitrary_rotation and mesh_vertices_list is not None:
+                    # Use arbitrary rotation around Z axis
+                    s_lim, angle_rad, axis = self.s_max_for_part_arbitrary_z_rotation(
+                        mesh_vertices_list[i]
                     )
-                )
+                    # For reporting, we still use the original dims but note that rotation was applied
+                    limits.append(s_lim)
+                    fx = fy = fz = None
+                    if file_dims is not None:
+                        fx, fy, fz = file_dims[i]
+                    reports.append(
+                        PartScaleReport(
+                            name=name,
+                            dx=dims[0],
+                            dy=dims[1],
+                            dz=dims[2],
+                            s_limit=s_lim,
+                            limiting_axis=f"z_rotation_{angle_rad:.3f}rad",
+                            file_dx=fx,
+                            file_dy=fy,
+                            file_dz=fz,
+                        )
+                    )
+                else:
+                    # Always check both Z-axis orientations even without allow_rotation flag
+                    s_lim, axis = self.s_max_for_part_with_z_rotation(*dims)
+                    limits.append(s_lim)
+                    fx = fy = fz = None
+                    if file_dims is not None:
+                        fx, fy, fz = file_dims[i]
+                    reports.append(
+                        PartScaleReport(
+                            name=name,
+                            dx=dims[0],
+                            dy=dims[1],
+                            dz=dims[2],
+                            s_limit=s_lim,
+                            limiting_axis=axis,
+                            file_dx=fx,
+                            file_dy=fy,
+                            file_dz=fz,
+                        )
+                    )
         elif method == "conservative":
             p_min = min(self.printer_x, self.printer_y, self.printer_z)
             for i, (name, dims) in enumerate(zip(part_names, parts_dims, strict=True)):
@@ -216,15 +389,22 @@ def compute_global_scale(
     part_names: list[str],
     method: Method,
     file_dims: list[tuple[float, float, float]] | None = None,
+    use_arbitrary_rotation: bool = False,
+    mesh_vertices_list: list[np.ndarray] | None = None,
 ) -> tuple[float, list[PartScaleReport]]:
     """Uniform scale across parts.
 
     For ``method="sorted"``, each ``parts_dims`` triple is **(dx, dy, dz) along printer
     X, Y, Z** (build height along Z). The per-part limit allows a 90° rotation of the
     XY footprint on the bed (see ``s_max_for_part_printer_axes``).
+
+    If use_arbitrary_rotation is True and mesh_vertices_list is provided, uses arbitrary
+    rotation around Z axis for better fitting.
     """
     calculator = FitCalculator(printer_xyz)
-    return calculator.compute_global_scale(parts_dims, part_names, method, file_dims)
+    return calculator.compute_global_scale(
+        parts_dims, part_names, method, file_dims, use_arbitrary_rotation, mesh_vertices_list
+    )
 
 
 def limiting_part_index(reports: list[PartScaleReport], s_max: float) -> int:

@@ -39,6 +39,7 @@ class LayoutRunArgs:
     algorithm: str | None
     recursive: bool
     dry_run: bool
+    allow_rotation: bool = False
     cleanup: bool = False
 
 
