@@ -35,7 +35,7 @@ class ScaleRunArgs:
     printer_xyz: tuple[float, float, float] | None
     post_fit_scale: float | None
     method: str | None
-    allow_rotation: bool = False
+    any_rotation: bool = False
     maximize: bool = False
     scale_factor: float | None = None
     rotation_samples: int | None = None
@@ -51,10 +51,10 @@ def run_scale(args: ScaleRunArgs) -> int:
     st = args.settings
 
     # ── Validation ────────────────────────────────────────────────────────────
-    if args.maximize and not args.allow_rotation:
+    if args.maximize and not args.any_rotation:
         console.print(
-            "[red]--maximize requires --allow-rotation "
-            "(cannot search for a better orientation without enabling rotation)[/red]"
+            "[red]--maximize requires --any-rotation "
+            "(full SO(3) search requires unrestricted orientation)[/red]"
         )
         return 2
 
@@ -105,34 +105,30 @@ def run_scale(args: ScaleRunArgs) -> int:
     file_dims = [aabb_edge_lengths(np.asarray(m.bounds)) for m in meshes]
 
     # ── Rotation search ───────────────────────────────────────────────────────
-    if args.allow_rotation:
+    def _select_orient(mesh: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
+        return select_orientation_for_scale(
+            mesh,
+            px,
+            py,
+            pz,
+            method_s,
+            any_rotation=args.any_rotation,
+            maximize=args.maximize,
+            random_samples=rot_samples,
+            seed=seed,
+        )
 
-        def _select_orient(mesh: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
-            return select_orientation_for_scale(
-                mesh,
-                px,
-                py,
-                pz,
-                method_s,
-                maximize=args.maximize,
-                random_samples=rot_samples,
-                seed=seed,
-            )
-
-        _n = n_workers(len(meshes))
-        if args.verbose:
-            console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
-        with ThreadPoolExecutor(max_workers=_n) as pool:
-            _results = list(pool.map(_select_orient, meshes))
-        transforms: list[np.ndarray] = [r[0] for r in _results]
-        parts_dims: list[tuple[float, float, float]] = [r[1] for r in _results]
-    else:
-        transforms = [np.eye(4, dtype=np.float64) for _ in meshes]
-        parts_dims = list(file_dims)
+    _n = n_workers(len(meshes))
+    if args.verbose:
+        console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
+    with ThreadPoolExecutor(max_workers=_n) as pool:
+        _results = list(pool.map(_select_orient, meshes))
+    transforms: list[np.ndarray] = [r[0] for r in _results]
+    parts_dims: list[tuple[float, float, float]] = [r[1] for r in _results]
 
     del meshes  # free mesh data; export will re-load from disk
 
-    file_dims_for_report = list(file_dims) if args.allow_rotation else None
+    file_dims_for_report = list(file_dims)
 
     # ── Scale computation ─────────────────────────────────────────────────────
     if args.scale_factor is not None:
@@ -168,13 +164,13 @@ def run_scale(args: ScaleRunArgs) -> int:
             console.print(f"Printer profile: {st.printer.name}")
         console.print(f"Printer: {px:.4f} x {py:.4f} x {pz:.4f}")
         console.print(f"Method: {method_s}")
-        if args.allow_rotation:
+        if args.any_rotation:
             mode = "maximize" if args.maximize else "axis-permutations"
             console.print(f"Rotation: {mode}")
             if args.maximize:
                 console.print(f"Rotation samples: {rot_samples}, seed: {seed}")
         else:
-            console.print("Rotation: none")
+            console.print("Rotation: Z-only")
         console.print(f"s_max (geometry fit): {s_max:.6f}")
         console.print(f"post_fit_scale: {post_fit_scale:.6f}")
         console.print(f"s_final (applied): {s_final:.6f}")
@@ -188,7 +184,7 @@ def run_scale(args: ScaleRunArgs) -> int:
         table.add_column("dy", justify="right")
         table.add_column("dz", justify="right")
         table.add_column("s_part", justify="right")
-        if args.allow_rotation:
+        if args.any_rotation:
             table.add_column("fx")
             table.add_column("fy")
             table.add_column("fz")
@@ -200,9 +196,9 @@ def run_scale(args: ScaleRunArgs) -> int:
                 f"{r.dz:.4f}",
                 f"{r.s_limit:.6f}",
             ]
-            if args.allow_rotation and r.file_dx is not None:
+            if args.any_rotation and r.file_dx is not None:
                 row.extend([f"{r.file_dx:.3f}", f"{r.file_dy:.3f}", f"{r.file_dz:.3f}"])
-            elif args.allow_rotation:
+            elif args.any_rotation:
                 row.extend(["", "", ""])
             table.add_row(*row)
         console.print(table)

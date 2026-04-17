@@ -38,6 +38,7 @@ class FillRunArgs:
     orient_threshold_deg: float
     dry_run: bool
     cleanup: bool = False
+    any_rotation: bool = False
 
 
 def _max_copies_on_plate(
@@ -165,7 +166,14 @@ def run_fill(args: FillRunArgs) -> int:
     rot_seed = ORIENTATION_SEED_DEFAULT
 
     ok, transform, fw, fh = select_layout_transform(
-        mesh, px, py, pz, gap, random_samples=rot_samples, seed=rot_seed
+        mesh,
+        px,
+        py,
+        pz,
+        gap,
+        random_samples=rot_samples,
+        seed=rot_seed,
+        any_rotation=args.any_rotation,
     )
     if not ok:
         console.print("[red]Part does not fit on the bed in any orientation.[/red]")

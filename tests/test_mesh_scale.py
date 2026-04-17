@@ -42,7 +42,7 @@ def _make_scale_args(tmp: Path, **kwargs: Any) -> ScaleRunArgs:
         printer_xyz=(100.0, 100.0, 100.0),
         post_fit_scale=None,
         method="sorted",
-        allow_rotation=False,
+        any_rotation=False,
         maximize=False,
         scale_factor=None,
         rotation_samples=None,
@@ -85,17 +85,17 @@ def test_explicit_scale_factor_with_post_fit():
         assert all(abs(v - 10.0) < 1e-3 for v in dims), f"Expected 10³, got {dims}"
 
 
-def test_no_rotation_by_default():
-    """Default (allow_rotation=False): a non-cubic mesh is not reoriented."""
+def test_no_any_rotation_keeps_z_as_tallest():
+    """Default (any_rotation=False, Z-only): a tall thin box stays Z-up, Z is limiting dim."""
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         # Tall thin box: 5×5×80; place in a 100³ printer.
-        # Without rotation, Z=80 is the limiting dim → s = 100/80 = 1.25
-        # With rotation (laying it flat), longest dim goes to XY → s could be larger.
+        # Z-only rotation keeps Z=80 as the height → s = 100/80 = 1.25
+        # any_rotation would lay it flat, producing a larger scale.
         box = trimesh.creation.box(extents=(5.0, 5.0, 80.0))
         box.export(str(d / "tall.stl"))
 
-        rc = run_scale(_make_scale_args(d, allow_rotation=False))
+        rc = run_scale(_make_scale_args(d, any_rotation=False))
         assert rc == 0
 
         out = trimesh.load(str(d / "out" / "tall.stl"), force="mesh")
@@ -104,14 +104,14 @@ def test_no_rotation_by_default():
         assert abs(dims[2] - 100.0) < 1e-2, f"Largest dim should be 100, got {dims[2]:.3f}"
 
 
-def test_allow_rotation_no_maximize_uses_axis_permutations():
-    """allow_rotation=True, maximize=False: tries 6 axis perms, returns a valid fit."""
+def test_any_rotation_no_maximize_uses_axis_permutations():
+    """any_rotation=True, maximize=False: tries 6 axis perms, returns a valid fit."""
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         box = trimesh.creation.box(extents=(5.0, 5.0, 80.0))
         box.export(str(d / "tall.stl"))
 
-        rc = run_scale(_make_scale_args(d, allow_rotation=True, maximize=False))
+        rc = run_scale(_make_scale_args(d, any_rotation=True, maximize=False))
         assert rc == 0
 
         out = trimesh.load(str(d / "out" / "tall.stl"), force="mesh")
@@ -119,11 +119,11 @@ def test_allow_rotation_no_maximize_uses_axis_permutations():
         assert all(v <= 100.0 + 1e-3 for v in dims), f"Part exceeds bed: {dims}"
 
 
-def test_maximize_requires_allow_rotation():
-    """--maximize without --allow-rotation must return exit code 2."""
+def test_maximize_requires_any_rotation():
+    """--maximize without --any-rotation must return exit code 2."""
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         trimesh.creation.box(extents=(10.0, 10.0, 10.0)).export(str(d / "box.stl"))
 
-        rc = run_scale(_make_scale_args(d, allow_rotation=False, maximize=True))
+        rc = run_scale(_make_scale_args(d, any_rotation=False, maximize=True))
         assert rc == 2, f"Expected exit code 2, got {rc}"

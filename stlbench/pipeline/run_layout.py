@@ -35,6 +35,7 @@ class LayoutRunArgs:
     recursive: bool
     dry_run: bool
     cleanup: bool = False
+    any_rotation: bool = False
 
 
 def run_layout(args: LayoutRunArgs) -> int:
@@ -76,6 +77,7 @@ def run_layout(args: LayoutRunArgs) -> int:
             gap,
             random_samples=rot_samples,
             seed=rot_seed,
+            any_rotation=args.any_rotation,
         )
         if not ok:
             bad_layout.append((name, dx, dy, dz))

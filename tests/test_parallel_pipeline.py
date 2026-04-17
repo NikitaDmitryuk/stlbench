@@ -29,7 +29,7 @@ def _write_box(path: Path, extents: tuple[float, float, float]) -> None:
 
 
 def test_run_scale_free_parallel_multiple_parts():
-    """Parallel orientation search (allow_rotation+maximize) produces valid scaled STLs."""
+    """Parallel orientation search (any_rotation+maximize) produces valid scaled STLs."""
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         _write_box(d / "a.stl", (10.0, 20.0, 5.0))
@@ -45,7 +45,7 @@ def test_run_scale_free_parallel_multiple_parts():
                 printer_xyz=(100.0, 100.0, 100.0),
                 post_fit_scale=None,
                 method="sorted",
-                allow_rotation=True,
+                any_rotation=True,
                 maximize=True,
                 rotation_samples=8,  # minimal — keeps test fast
                 no_upscale=False,
@@ -81,7 +81,7 @@ def test_run_scale_fixed_two_pass_export():
                 printer_xyz=(100.0, 100.0, 100.0),
                 post_fit_scale=None,
                 method="sorted",
-                allow_rotation=False,
+                any_rotation=False,
                 rotation_samples=None,
                 no_upscale=False,
                 dry_run=False,
@@ -118,7 +118,7 @@ def test_run_scale_output_ordering():
                 printer_xyz=(100.0, 100.0, 100.0),
                 post_fit_scale=None,
                 method="sorted",
-                allow_rotation=False,
+                any_rotation=False,
                 rotation_samples=None,
                 no_upscale=False,
                 dry_run=False,

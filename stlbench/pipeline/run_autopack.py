@@ -38,6 +38,7 @@ class AutopackRunArgs:
     orient_threshold_deg: float
     dry_run: bool
     recursive: bool
+    any_rotation: bool = False
     verbose: bool = False
     cleanup: bool = False
 
@@ -140,6 +141,7 @@ def run_autopack(args: AutopackRunArgs) -> int:
                 epy,
                 epz,
                 "sorted",
+                any_rotation=args.any_rotation,
                 random_samples=ORIENTATION_SAMPLES_DEFAULT,
                 seed=ORIENTATION_SEED_DEFAULT,
             )

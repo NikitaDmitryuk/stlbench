@@ -175,18 +175,18 @@ def cmd_scale(
         ),
     ] = None,
     method: Annotated[str | None, typer.Option("--method")] = None,
-    allow_rotation: Annotated[
+    any_rotation: Annotated[
         bool,
         typer.Option(
-            "--allow-rotation/--no-allow-rotation",
-            help="Try axis permutations to find a better-fitting orientation.",
+            "--any-rotation/--no-any-rotation",
+            help="Allow any 3D orientation (all axis permutations). By default only Z-axis rotation is searched.",
         ),
     ] = False,
     maximize: Annotated[
         bool,
         typer.Option(
             "--maximize/--no-maximize",
-            help="Use full SO(3) random search to maximise scale factor (requires --allow-rotation).",
+            help="Use full SO(3) random search to maximise scale factor (requires --any-rotation).",
         ),
     ] = False,
     scale_factor: Annotated[
@@ -217,7 +217,7 @@ def cmd_scale(
                 printer_xyz=pr,
                 post_fit_scale=post_fit_scale,
                 method=method,
-                allow_rotation=allow_rotation,
+                any_rotation=any_rotation,
                 maximize=maximize,
                 scale_factor=scale_factor,
                 rotation_samples=rotation_samples,
@@ -254,6 +254,13 @@ def cmd_layout(
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
     ] = False,
+    any_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--any-rotation/--no-any-rotation",
+            help="Allow any 3D orientation when finding layout transform. By default only Z-axis rotation is searched.",
+        ),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -268,6 +275,7 @@ def cmd_layout(
                 recursive=recursive,
                 dry_run=dry_run,
                 cleanup=cleanup,
+                any_rotation=any_rotation,
             )
         )
     )
@@ -305,6 +313,13 @@ def cmd_fill(
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
     ] = False,
+    any_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--any-rotation/--no-any-rotation",
+            help="Allow any 3D orientation when finding layout transform. By default only Z-axis rotation is searched.",
+        ),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -320,6 +335,7 @@ def cmd_fill(
                 orient_threshold_deg=overhang_angle,
                 dry_run=dry_run,
                 cleanup=cleanup,
+                any_rotation=any_rotation,
             )
         )
     )
@@ -365,6 +381,13 @@ def cmd_autopack(
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
     ] = False,
+    any_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--any-rotation/--no-any-rotation",
+            help="Allow any 3D orientation for scale fitting. By default only Z-axis rotation is searched.",
+        ),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -382,6 +405,7 @@ def cmd_autopack(
                 recursive=recursive,
                 verbose=verbose,
                 cleanup=cleanup,
+                any_rotation=any_rotation,
             )
         )
     )
@@ -498,6 +522,13 @@ def cmd_prepare(
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
     ] = False,
+    any_rotation: Annotated[
+        bool,
+        typer.Option(
+            "--any-rotation/--no-any-rotation",
+            help="Allow any 3D orientation for scale fitting step. By default only Z-axis rotation is searched.",
+        ),
+    ] = False,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -518,6 +549,7 @@ def cmd_prepare(
                 grid_step_mm=grid_step,
                 resume=resume,
                 cleanup=cleanup,
+                any_rotation=any_rotation,
             )
         )
     )

@@ -74,7 +74,7 @@ stlbench prepare -i ./parts -o ./plates -c my_printer.toml
 Runs the three preparation steps in the optimal order for resin printing:
 
 1. **Scale** — finds the largest scale factor that fits every part inside the build
-   volume (SO(3) orientation search), then applies a uniform scale to all parts.
+   volume (Z-axis rotation search by default), then applies a uniform scale to all parts.
 2. **Orient** — rotates each scaled part to minimise overhanging surface area,
    constrained so the part still fits the build volume.
 3. **Layout** — packs the oriented parts onto the minimum number of plates,
@@ -130,9 +130,9 @@ Valid step sequences (`layout` must always be last):
 
 | `steps` | What happens |
 |---------|-------------|
-| `["scale", "orient", "layout"]` | SO(3) search → global scale → Tweaker-3 orient → pack |
+| `["scale", "orient", "layout"]` | Z-rotation search → global scale → Tweaker-3 orient → pack |
 | `["orient", "scale", "layout"]` | Tweaker-3 orient → scale from oriented AABB → pack |
-| `["scale", "layout"]` | SO(3) search → global scale → pack |
+| `["scale", "layout"]` | Z-rotation search → global scale → pack |
 | `["orient", "layout"]` | Tweaker-3 orient → pack |
 | `["layout"]` | Pack only (model already prepared) |
 
@@ -165,27 +165,28 @@ stlbench scale -i ./parts -o ./scaled -c my_printer.toml
 Computes a single scale factor so that **every** part fits inside the printer build
 volume. The largest part determines the factor; all parts share the same scale.
 
-By default the model is **not rotated** — scaling is applied in the current
-orientation. Two opt-in flags add rotation behaviour:
+By default the model is rotated around the **Z axis only** (any angle, ~4 096 samples)
+— the original face stays on the bed, but the model is turned to find the best fit in
+the XY plane. Use `--any-rotation` to allow full 3D reorientation:
 
 | Flags | Behaviour |
 |-------|-----------|
-| _(default)_ | Fit to printer in current orientation |
-| `--allow-rotation` | Try the 6 canonical axis permutations (90° rotations), pick the best-fitting one |
-| `--allow-rotation --maximize` | Full SO(3) random search (4 096 samples × 6 permutations) to maximise scale factor |
+| _(default)_ | Z-axis rotation search — keeps the model face-down, optimises XY footprint |
+| `--any-rotation` | Try all 6 canonical axis permutations; model may be placed on any face |
+| `--any-rotation --maximize` | Full SO(3) random search (4 096 samples × 6 permutations) to maximise scale factor |
 | `--scale N` | Apply an explicit factor `N` instead of fitting to the printer; printer config becomes optional |
 
 **Examples:**
 
 ```bash
-# Default: fit to build volume, no rotation
+# Default: Z-rotation search (model stays face-down)
 stlbench scale -i ./parts -o ./scaled -c my_printer.toml
 
-# Lay each part on its best-fitting flat face (axis-aligned only)
-stlbench scale -i ./parts -o ./scaled -c my_printer.toml --allow-rotation
+# Allow any face down — useful when models have no pre-placed supports
+stlbench scale -i ./parts -o ./scaled -c my_printer.toml --any-rotation
 
 # Full rotation search — maximise scale by trying arbitrary orientations (slow)
-stlbench scale -i ./parts -o ./scaled -c my_printer.toml --allow-rotation --maximize
+stlbench scale -i ./parts -o ./scaled -c my_printer.toml --any-rotation --maximize
 
 # Explicit factor: double every part's size, no printer required
 stlbench scale -i ./parts -o ./scaled --scale 2.0
@@ -197,7 +198,7 @@ stlbench scale -i ./parts -o ./scaled --scale 0.8
 stlbench scale -i ./parts -o ./scaled -c my_printer.toml --no-upscale --post-fit-scale 0.95
 ```
 
-Key options: `--scale N`, `--allow-rotation`, `--maximize`, `--no-upscale`,
+Key options: `--scale N`, `--any-rotation`, `--maximize`, `--no-upscale`,
 `--post-fit-scale`, `--method sorted|conservative`, `--dry-run`, `--suffix`, `--recursive`.
 
 ---
@@ -231,7 +232,7 @@ Arranges already-scaled STL files onto rectangular print plates. Exports
 `plate_NN.3mf` + `plate_NN.json` with part positions. Multiple plates are created
 if all parts do not fit on one.
 
-Key options: `--dry-run`, `--gap-mm`, `--algorithm`.
+Key options: `--dry-run`, `--gap-mm`, `--algorithm`, `--any-rotation`.
 
 ---
 
@@ -245,8 +246,8 @@ Binary-searches for the maximum scale factor at which **all** parts fit onto a s
 plate simultaneously. Combines `scale` and `layout` into one step with the goal of
 keeping everything on one plate.
 
-Key options: `--orient/--no-orient`, `--overhang-angle`, `--dry-run`, `--gap-mm`,
-`--post-fit-scale`.
+Key options: `--orient/--no-orient`, `--overhang-angle`, `--any-rotation`, `--dry-run`,
+`--gap-mm`, `--post-fit-scale`.
 
 ---
 
@@ -260,7 +261,7 @@ Packs as many copies of a single STL as possible onto one plate. Add `--scale` t
 fit the part to the bed first, `--orient` to minimise supports before filling.
 
 Key options: `--scale/--no-scale`, `--orient/--no-orient`, `--overhang-angle`,
-`--dry-run`, `--gap-mm`.
+`--any-rotation`, `--dry-run`, `--gap-mm`.
 
 ---
 
@@ -292,7 +293,7 @@ see [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml) for a complete exampl
 | Section      | Keys                                                                          | Purpose                              |
 |--------------|-------------------------------------------------------------------------------|--------------------------------------|
 | `[printer]`  | `name`, `width_mm`, `depth_mm`, `height_mm`                                   | Build volume (required)              |
-| `[scaling]`  | `post_fit_scale` (>0), `allow_rotation`, `maximize`                           | Scale behaviour (see `scale` command) |
+| `[scaling]`  | `post_fit_scale` (>0), `any_rotation`, `maximize`                             | Scale behaviour (see `scale` command) |
 | `[packing]`  | `gap_mm`                                                                      | Surface-to-surface gap between parts |
 | `[pipeline]` | `default_steps`                                                               | Default step list for `job` command  |
 | `[[parts]]`  | `path`, `steps`                                                               | Per-part entries for `job` command   |

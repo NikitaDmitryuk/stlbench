@@ -10,6 +10,12 @@ height_mm = 165.0
 [scaling]
 # Multiplier applied after geometry fit (<1 leaves room for slicer, brim, clearance; 1.0 = none).
 post_fit_scale = 0.95
+# Allow any 3D orientation (all axis permutations) for scale fitting.
+# false = Z-axis rotation only (default). Set true when models have no pre-placed supports.
+any_rotation = false
+# Full SO(3) random search (4096 samples) to maximise scale factor.
+# Requires any_rotation = true. Slow; produces arbitrary tilt angles.
+maximize = false
 
 [packing]
 gap_mm = 5.0

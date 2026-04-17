@@ -82,6 +82,7 @@ class PrepareRunArgs:
     grid_step_mm: float = 2.0
     resume: bool = False
     cleanup: bool = False
+    any_rotation: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +232,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 py,
                 pz,
                 method,  # type: ignore[arg-type]
+                any_rotation=args.any_rotation,
                 random_samples=ORIENTATION_SAMPLES_DEFAULT,
                 seed=ORIENTATION_SEED_DEFAULT,
             )
