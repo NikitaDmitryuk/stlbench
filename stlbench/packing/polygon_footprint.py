@@ -9,7 +9,7 @@ from shapely.geometry.base import BaseGeometry
 # For meshes larger than this, randomly subsample faces before computing the
 # union to keep runtime bounded.  The shadow is still representative because
 # even a random subsample covers the full XY extent of the part.
-_MAX_FACES_EXACT = 20_000
+_MAX_FACES_EXACT = 10_000
 
 
 def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseGeometry:
