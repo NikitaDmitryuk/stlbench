@@ -12,10 +12,15 @@ class OrientationResult:
     score: float
 
 
-def _random_z_rotation_matrix(rng: np.random.Generator) -> np.ndarray:
-    angle = rng.uniform(0.0, 2.0 * np.pi)
-    c, s = np.cos(angle), np.sin(angle)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+def _z_rotation_candidates(n_steps: int = 360) -> list[np.ndarray]:
+    """Return ``n_steps`` evenly-spaced Z-axis rotation matrices (0° … <360°)."""
+    step = 2.0 * np.pi / n_steps
+    result = []
+    for i in range(n_steps):
+        angle = i * step
+        c, s = np.cos(angle), np.sin(angle)
+        result.append(np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64))
+    return result
 
 
 def _random_rotation_matrix(rng: np.random.Generator) -> np.ndarray:
