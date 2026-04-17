@@ -15,7 +15,7 @@ class PrinterSection(BaseModel):
 
 class ScalingSection(BaseModel):
     post_fit_scale: float = Field(default=1.0, gt=0.0)
-    allow_rotation: bool = False
+    any_rotation: bool = False
     maximize: bool = False
 
 
@@ -39,7 +39,7 @@ class StepName(StrEnum):
     * ``["orient", "layout"]`` — Tweaker-3 orient → pack
     * ``["layout"]`` — pack only (model already prepared)
 
-    Rotation during the ``scale`` step is controlled by ``[scaling] allow_rotation``
+    Rotation during the ``scale`` step is controlled by ``[scaling] any_rotation``
     and ``maximize`` in the job TOML (both default to ``false``).
     """
 

@@ -8,10 +8,10 @@ Algorithm overview
 ------------------
 Pass 1 — scale preparation (parallel)
     For parts that include the ``scale`` step:
-    * If ``scale`` comes before ``orient``: optionally search for the best
-      orientation (controlled by ``[scaling] allow_rotation`` and ``maximize``
-      in the job TOML), then read the AABB extents of the (possibly rotated)
-      mesh.  By default no rotation is performed.
+    * If ``scale`` comes before ``orient``: search for the best Z-axis
+      orientation by default (controlled by ``[scaling] any_rotation`` and
+      ``maximize`` in the job TOML; ``any_rotation=true`` enables full 3D
+      search), then read the AABB extents of the (possibly rotated) mesh.
     * If ``orient`` comes before ``scale``: run ``find_min_overhang_rotation()``
       first, apply that orientation, then read the AABB extents of the oriented
       mesh.  No additional rotation search is needed.
@@ -140,32 +140,25 @@ def _pass1_scale_first(
     py: float,
     pz: float,
     method: str,
-    allow_rotation: bool,
+    any_rotation: bool,
     maximize: bool,
     rotation_samples: int,
 ) -> _PartWork:
-    """Prepare mesh for global scale: optionally search for best orientation."""
+    """Prepare mesh for global scale: search for best orientation (Z-only by default)."""
     mesh = load_mesh(pw.abs_path)
-    if allow_rotation:
-        t4, dims = select_orientation_for_scale(
-            mesh,
-            px,
-            py,
-            pz,
-            method,  # type: ignore[arg-type]
-            maximize=maximize,
-            random_samples=rotation_samples,
-            seed=ORIENTATION_SEED_DEFAULT,
-        )
-        mesh.apply_transform(t4)
-        mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
-    else:
-        b = np.asarray(mesh.bounds)
-        dims = (
-            float(b[1, 0] - b[0, 0]),
-            float(b[1, 1] - b[0, 1]),
-            float(b[1, 2] - b[0, 2]),
-        )
+    t4, dims = select_orientation_for_scale(
+        mesh,
+        px,
+        py,
+        pz,
+        method,  # type: ignore[arg-type]
+        any_rotation=any_rotation,
+        maximize=maximize,
+        random_samples=rotation_samples,
+        seed=ORIENTATION_SEED_DEFAULT,
+    )
+    mesh.apply_transform(t4)
+    mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
     pw.pass1_mesh = mesh
     pw.pass1_dims = dims
     return pw
@@ -269,7 +262,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
     py_raw = settings.printer.depth_mm
     pz_raw = settings.printer.height_mm
     post_fit_scale = settings.scaling.post_fit_scale
-    allow_rotation = settings.scaling.allow_rotation
+    any_rotation = settings.scaling.any_rotation
     maximize = settings.scaling.maximize
     gap_mm = settings.packing.gap_mm
     method = "sorted"
@@ -322,7 +315,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         def _submit_pass1(pw: _PartWork):
             if pw.has_scale and pw.scale_before_orient:
                 return _pass1_scale_first(
-                    pw, px, py, pz, method, allow_rotation, maximize, args.rotation_samples
+                    pw, px, py, pz, method, any_rotation, maximize, args.rotation_samples
                 )
             else:
                 # orient-first (either scale-after-orient or orient-only)

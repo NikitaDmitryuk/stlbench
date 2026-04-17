@@ -6,6 +6,7 @@ import trimesh
 from stlbench.core.fit import Method, s_max_for_part_conservative, s_max_for_part_printer_axes
 from stlbench.core.orientation import (
     _random_rotation_matrix,
+    _random_z_rotation_matrix,
     aabb_extents_after_rotation,
     mesh_vertices_for_orientation,
 )
@@ -63,26 +64,36 @@ def select_layout_transform(
     *,
     random_samples: int = 4096,
     seed: int = 0,
+    any_rotation: bool = False,
 ) -> tuple[bool, np.ndarray, float, float]:
     """
-    Find a print orientation: after rotation, printer-axis AABB (X,Y,Z) must fit the bed
-    and Pz, allowing **axis permutation** (which model axis maps to which printer extent).
-    Chooses the smallest XY footprint among valid orientations (for packing).
+    Find a print orientation for layout/packing.
 
-    For each base SO(3) rotation (identity plus ``random_samples`` draws, same RNG idea as
-    scale) try six axis permutations ``P @ R``.
+    By default (``any_rotation=False``) only Z-axis rotations are considered
+    (any angle, ``random_samples`` draws).  The model is never flipped onto a
+    different face — useful when supports are already placed.
 
-    Returns (ok, 4x4 transform, bed X width, bed Y depth) in printer coordinates (Z up).
+    With ``any_rotation=True`` the full SO(3) is searched: ``random_samples``
+    random rotations combined with all six canonical axis permutations, picking
+    the smallest XY footprint among orientations that fit the build volume.
+
+    Returns (ok, 4x4 transform, footprint_width, footprint_height).
     """
     verts = mesh_vertices_for_orientation(mesh)
     rng = np.random.default_rng(seed)
-    perms = _perm_3x3_list()
 
     best: tuple[float, np.ndarray, float, float] | None = None
 
-    bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
-    for _ in range(max(0, random_samples)):
-        bases.append(_random_rotation_matrix(rng))
+    if any_rotation:
+        perms = _perm_3x3_list()
+        bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
+        for _ in range(max(0, random_samples)):
+            bases.append(_random_rotation_matrix(rng))
+    else:
+        perms = [np.eye(3, dtype=np.float64)]
+        bases = [np.eye(3, dtype=np.float64)]
+        for _ in range(max(0, random_samples)):
+            bases.append(_random_z_rotation_matrix(rng))
 
     for r in bases:
         for p in perms:
@@ -110,33 +121,40 @@ def select_orientation_for_scale(
     pz: float,
     method: Method,
     *,
-    maximize: bool = True,
+    any_rotation: bool = False,
+    maximize: bool = False,
     random_samples: int = 4096,
     seed: int = 0,
 ) -> tuple[np.ndarray, tuple[float, float, float]]:
     """
     Search for a print orientation that optimises scale fit.
 
-    When *maximize* is ``True`` (the legacy behaviour), samples ``random_samples``
-    random SO(3) rotations in addition to the six canonical axis permutations and
-    picks the candidate that **maximises** the per-part scale limit.
+    By default (``any_rotation=False``) only Z-axis rotations are searched
+    (any angle, ``random_samples`` draws), keeping the model on its original
+    face.  This is appropriate when supports are already in place.
 
-    When *maximize* is ``False``, only the six canonical axis permutations are
-    evaluated.  The best-fitting one is returned (same tie-break: smaller XY
-    footprint ``ex * ey``).
+    With ``any_rotation=True`` all six canonical axis permutations are tried.
+    Adding ``maximize=True`` (requires ``any_rotation=True``) also samples
+    ``random_samples`` random SO(3) rotations on top of the canonical set.
     """
     verts = mesh_vertices_for_orientation(mesh)
     rng = np.random.default_rng(seed)
-    perms = _perm_3x3_list()
 
     best_key: tuple[float, float] | None = None
     best_t4: np.ndarray | None = None
     best_ext: tuple[float, float, float] | None = None
 
-    bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
-    if maximize:
+    if any_rotation:
+        perms = _perm_3x3_list()
+        bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
+        if maximize:
+            for _ in range(max(0, random_samples)):
+                bases.append(_random_rotation_matrix(rng))
+    else:
+        perms = [np.eye(3, dtype=np.float64)]
+        bases = [np.eye(3, dtype=np.float64)]
         for _ in range(max(0, random_samples)):
-            bases.append(_random_rotation_matrix(rng))
+            bases.append(_random_z_rotation_matrix(rng))
 
     p_min = min(px, py, pz)
     for r in bases:
