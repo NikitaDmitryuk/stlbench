@@ -226,6 +226,12 @@ def run_scale(args: ScaleRunArgs) -> int:
         if not np.allclose(t4, np.eye(4)):
             mesh.apply_transform(t4)
         mesh.apply_scale(s_final)
+        if not np.allclose(t4, np.eye(4)):
+            # Rotation around world origin shifts the mesh's XY position; restore
+            # AABB min to origin so the output sits on the build plate as expected.
+            b = np.asarray(mesh.bounds)
+            if not np.allclose(b[0], np.zeros(3), atol=1e-6):
+                mesh.apply_translation(-b[0])
 
         try:
             mesh.export(out_path)

@@ -6,7 +6,7 @@ import trimesh
 from stlbench.core.fit import Method, s_max_for_part_conservative, s_max_for_part_printer_axes
 from stlbench.core.orientation import (
     _random_rotation_matrix,
-    _random_z_rotation_matrix,
+    _z_rotation_candidates,
     aabb_extents_after_rotation,
     mesh_vertices_for_orientation,
 )
@@ -70,8 +70,8 @@ def select_layout_transform(
     Find a print orientation for layout/packing.
 
     By default (``any_rotation=False``) only Z-axis rotations are considered
-    (any angle, ``random_samples`` draws).  The model is never flipped onto a
-    different face — useful when supports are already placed.
+    (360 deterministic 1° steps).  The model is never flipped onto a different
+    face — useful when supports are already placed.
 
     With ``any_rotation=True`` the full SO(3) is searched: ``random_samples``
     random rotations combined with all six canonical axis permutations, picking
@@ -80,20 +80,18 @@ def select_layout_transform(
     Returns (ok, 4x4 transform, footprint_width, footprint_height).
     """
     verts = mesh_vertices_for_orientation(mesh)
-    rng = np.random.default_rng(seed)
 
     best: tuple[float, np.ndarray, float, float] | None = None
 
     if any_rotation:
+        rng = np.random.default_rng(seed)
         perms = _perm_3x3_list()
         bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
         for _ in range(max(0, random_samples)):
             bases.append(_random_rotation_matrix(rng))
     else:
         perms = [np.eye(3, dtype=np.float64)]
-        bases = [np.eye(3, dtype=np.float64)]
-        for _ in range(max(0, random_samples)):
-            bases.append(_random_z_rotation_matrix(rng))
+        bases = _z_rotation_candidates()
 
     for r in bases:
         for p in perms:
@@ -130,21 +128,21 @@ def select_orientation_for_scale(
     Search for a print orientation that optimises scale fit.
 
     By default (``any_rotation=False``) only Z-axis rotations are searched
-    (any angle, ``random_samples`` draws), keeping the model on its original
-    face.  This is appropriate when supports are already in place.
+    (360 deterministic 1° steps), keeping the model on its original face.
+    This is appropriate when supports are already in place.
 
     With ``any_rotation=True`` all six canonical axis permutations are tried.
     Adding ``maximize=True`` (requires ``any_rotation=True``) also samples
     ``random_samples`` random SO(3) rotations on top of the canonical set.
     """
     verts = mesh_vertices_for_orientation(mesh)
-    rng = np.random.default_rng(seed)
 
     best_key: tuple[float, float] | None = None
     best_t4: np.ndarray | None = None
     best_ext: tuple[float, float, float] | None = None
 
     if any_rotation:
+        rng = np.random.default_rng(seed)
         perms = _perm_3x3_list()
         bases: list[np.ndarray] = [np.eye(3, dtype=np.float64)]
         if maximize:
@@ -152,9 +150,7 @@ def select_orientation_for_scale(
                 bases.append(_random_rotation_matrix(rng))
     else:
         perms = [np.eye(3, dtype=np.float64)]
-        bases = [np.eye(3, dtype=np.float64)]
-        for _ in range(max(0, random_samples)):
-            bases.append(_random_z_rotation_matrix(rng))
+        bases = _z_rotation_candidates()
 
     p_min = min(px, py, pz)
     for r in bases:
