@@ -15,7 +15,12 @@ from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import find_min_overhang_rotation
 from stlbench.export.plate import export_plate_3mf
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.packing.polygon_pack import footprints_to_box_polygons, try_pack_polygons_single_plate
+from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_pack import (
+    footprints_to_box_polygons,
+    pack_polygons_on_plates,
+    try_pack_polygons_single_plate,
+)
 from stlbench.packing.rectpack_plate import PackedPlate
 from stlbench.pipeline.common import (
     load_named_meshes,
@@ -215,9 +220,15 @@ def run_autopack(args: AutopackRunArgs) -> int:
                 scaled_meshes[i] = cleaned
                 console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
 
+    # Repack with exact XY shadows for tighter nesting.
+    # The bisection used bounding boxes (fast); this single pass uses exact shadows.
+    shadows = [mesh_to_xy_shadow(m) for m in scaled_meshes]
+    exact_plates = pack_polygons_on_plates(shadows, epx, epy, gap_mm=gap)
+    final_plate = exact_plates[0] if exact_plates else plate
+
     out_3mf = args.output_dir / "autopack_plate.3mf"
     out_json = args.output_dir / "autopack_plate.json"
-    export_plate_3mf(scaled_meshes, plate, out_3mf, names=list(names), out_manifest=out_json)
+    export_plate_3mf(scaled_meshes, final_plate, out_3mf, names=list(names), out_manifest=out_json)
     console.print(f"Wrote {out_3mf}")
     console.print(f"Wrote {out_json}")
     return 0

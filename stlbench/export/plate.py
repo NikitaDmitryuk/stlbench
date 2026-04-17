@@ -9,32 +9,32 @@ import trimesh
 
 from stlbench.packing.rectpack_plate import PackedPlate
 
-_ROT_Z_90 = np.array(
-    trimesh.transformations.rotation_matrix(np.pi / 2.0, [0.0, 0.0, 1.0]),
-    dtype=np.float64,
-)
 
-
-def _place_rect_local(m: trimesh.Trimesh, r: object, rot_z_90: np.ndarray) -> trimesh.Trimesh:
+def _place_rect_local(m: trimesh.Trimesh, r: object) -> trimesh.Trimesh:
     """Move mesh so its bounding-box minimum is at the origin.
 
-    Applies 90° Z rotation when ``r.rotated`` is True, then re-centres.
-    The plate-level (x, y) translation is NOT baked in — it goes into the
-    scene item transform instead.
+    Applies a Z rotation of ``r.rotation_deg`` degrees (if non-zero) then
+    re-centres.  The plate-level (x, y) translation is NOT baked in — it goes
+    into the scene item transform instead.
     """
     m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), -float(m.bounds[0][2])])
-    if getattr(r, "rotated", False):
-        m.apply_transform(rot_z_90)
+    angle_deg: float = float(getattr(r, "rotation_deg", 0.0))
+    if abs(angle_deg) > 1e-9:
+        rot = np.array(
+            trimesh.transformations.rotation_matrix(np.radians(angle_deg), [0.0, 0.0, 1.0]),
+            dtype=np.float64,
+        )
+        m.apply_transform(rot)
         m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
     return m
 
 
-def _place_rect(m: trimesh.Trimesh, r: object, rot_z_90: np.ndarray) -> trimesh.Trimesh:
-    """Translate mesh to origin, optionally rotate 90° Z, then place at rect (x, y).
+def _place_rect(m: trimesh.Trimesh, r: object) -> trimesh.Trimesh:
+    """Translate mesh to origin, rotate by rotation_deg around Z, then place at rect (x, y).
 
     Used by the STL exporter where positions must be baked into vertices.
     """
-    m = _place_rect_local(m, r, rot_z_90)
+    m = _place_rect_local(m, r)
     m.apply_translation([getattr(r, "x", 0.0), getattr(r, "y", 0.0), 0.0])
     return m
 
@@ -61,7 +61,7 @@ def export_plate_3mf(
     for r in plate.rects:
         if r.part_index < 0 or r.part_index >= len(meshes):
             continue
-        m = _place_rect_local(meshes[r.part_index].copy(), r, _ROT_Z_90)
+        m = _place_rect_local(meshes[r.part_index].copy(), r)
 
         base = (
             names[r.part_index]
@@ -89,7 +89,7 @@ def export_plate_3mf(
                 "y_mm": r.y,
                 "footprint_w_mm": r.width,
                 "footprint_h_mm": r.height,
-                "rotated_90": r.rotated,
+                "rotation_deg": r.rotation_deg,
             }
         )
 
@@ -119,7 +119,7 @@ def export_plate_stl(
     for r in plate.rects:
         if r.part_index < 0 or r.part_index >= len(meshes):
             continue
-        m = _place_rect(meshes[r.part_index].copy(), r, _ROT_Z_90)
+        m = _place_rect(meshes[r.part_index].copy(), r)
         placed.append(m)
         manifest_parts.append(
             {
@@ -128,7 +128,7 @@ def export_plate_stl(
                 "y_mm": r.y,
                 "footprint_w_mm": r.width,
                 "footprint_h_mm": r.height,
-                "rotated_90": r.rotated,
+                "rotation_deg": r.rotation_deg,
             }
         )
     if not placed:

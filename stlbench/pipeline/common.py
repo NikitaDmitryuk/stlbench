@@ -50,12 +50,6 @@ def resolve_gap(gap_mm: float | None, settings: AppSettings | None) -> float:
     return DEFAULT_PACKING_GAP_MM
 
 
-def resolve_algorithm(algorithm: str | None, _settings: AppSettings | None) -> str:
-    if algorithm is not None:
-        return algorithm
-    return "rectpack"
-
-
 def rotation_to_4x4(r3: np.ndarray) -> np.ndarray:
     t = np.eye(4, dtype=np.float64)
     t[:3, :3] = np.asarray(r3, dtype=np.float64)
