@@ -247,7 +247,6 @@ def cmd_layout(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
-    algorithm: Annotated[str | None, typer.Option("--algorithm")] = None,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     cleanup: Annotated[
@@ -271,7 +270,6 @@ def cmd_layout(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
-                algorithm=algorithm,
                 recursive=recursive,
                 dry_run=dry_run,
                 cleanup=cleanup,

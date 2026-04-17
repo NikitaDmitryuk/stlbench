@@ -12,7 +12,7 @@ class PackedRect:
     y: float
     width: float
     height: float
-    rotated: bool = False
+    rotation_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,7 @@ def _pack_subset(
                     y=float(r.y),
                     width=float(r.width) - g,
                     height=float(r.height) - g,
-                    rotated=was_rotated,
+                    rotation_deg=90.0 if was_rotated else 0.0,
                 )
             )
 

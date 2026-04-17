@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import trimesh
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.mesh_cleanup import remove_small_components
@@ -14,10 +23,9 @@ from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
 from stlbench.packing.rectpack_plate import int_bin_dims_mm
-from stlbench.packing.shelf import build_packable_parts, greedy_shelf_plates
 from stlbench.pipeline.common import (
     load_named_meshes,
-    resolve_algorithm,
+    n_workers,
     resolve_gap,
     resolve_printer,
     resolve_settings,
@@ -31,11 +39,21 @@ class LayoutRunArgs:
     config_path: Path | None
     printer_xyz: tuple[float, float, float] | None
     gap_mm: float | None
-    algorithm: str | None
     recursive: bool
     dry_run: bool
     cleanup: bool = False
     any_rotation: bool = False
+
+
+def _make_progress(console: Console) -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    )
 
 
 def run_layout(args: LayoutRunArgs) -> int:
@@ -49,13 +67,13 @@ def run_layout(args: LayoutRunArgs) -> int:
         return 2
 
     gap = resolve_gap(args.gap_mm, st)
-    algo = resolve_algorithm(args.algorithm, st)
 
     loaded = load_named_meshes(args.input_dir, args.recursive, console)
     if loaded is None:
         return 1
     _paths, names, meshes = loaded
 
+    n_parts = len(meshes)
     dims_list: list[tuple[float, float, float]] = []
     for m in meshes:
         dx, dy, dz = mesh_footprint_xy(m)
@@ -67,23 +85,27 @@ def run_layout(args: LayoutRunArgs) -> int:
     bw, bh = int_bin_dims_mm(px, py)
     bad_layout: list[tuple[str, float, float, float]] = []
     layout_plans: list[tuple[np.ndarray, float, float] | None] = []
-    for m, name in zip(meshes, names, strict=True):
-        dx, dy, dz = mesh_footprint_xy(m)
-        ok, t, fw, fh = select_layout_transform(
-            m,
-            px,
-            py,
-            pz,
-            gap,
-            random_samples=rot_samples,
-            seed=rot_seed,
-            any_rotation=args.any_rotation,
-        )
-        if not ok:
-            bad_layout.append((name, dx, dy, dz))
-            layout_plans.append(None)
-        else:
-            layout_plans.append((t, fw, fh))
+
+    with _make_progress(console) as progress:
+        ptask = progress.add_task("Finding orientations…", total=n_parts)
+        for m, name in zip(meshes, names, strict=True):
+            dx, dy, dz = mesh_footprint_xy(m)
+            ok, t, fw, fh = select_layout_transform(
+                m,
+                px,
+                py,
+                pz,
+                gap,
+                random_samples=rot_samples,
+                seed=rot_seed,
+                any_rotation=args.any_rotation,
+            )
+            if not ok:
+                bad_layout.append((name, dx, dy, dz))
+                layout_plans.append(None)
+            else:
+                layout_plans.append((t, fw, fh))
+            progress.update(ptask, advance=1, description=f"Orient: {name}")
 
     if bad_layout:
         console.print(
@@ -108,18 +130,6 @@ def run_layout(args: LayoutRunArgs) -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if algo == "shelf":
-        packable, bad = build_packable_parts(names, dims_list, px, py, pz)
-        if bad:
-            console.print("Heuristic says these do not fit:", ", ".join(bad))
-        groups = greedy_shelf_plates(packable, px, py)
-        for i, g in enumerate(groups, 1):
-            console.print(f"Plate {i} (shelf): {', '.join(g)}")
-        console.print(
-            "[dim]Shelf mode does not export STL; use: stlbench layout ... --algorithm rectpack[/dim]"
-        )
-        return 0
-
     if args.cleanup:
         for i, m in enumerate(oriented_meshes):
             cleaned, n_rem = remove_small_components(m)
@@ -127,17 +137,44 @@ def run_layout(args: LayoutRunArgs) -> int:
                 oriented_meshes[i] = cleaned
                 console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
 
-    shadows = [mesh_to_xy_shadow(m) for m in oriented_meshes]
-    plates = pack_polygons_on_plates(shadows, px, py, gap_mm=gap)
+    shadows = []
+    with _make_progress(console) as progress:
+        ptask = progress.add_task("Computing footprints…", total=n_parts)
+        for i, m in enumerate(oriented_meshes):
+            shadows.append(mesh_to_xy_shadow(m))
+            progress.update(ptask, advance=1, description=f"Footprint: {names[i]}")
+
+    with _make_progress(console) as progress:
+        ptask = progress.add_task("Packing…", total=n_parts)
+        plates = pack_polygons_on_plates(
+            shadows,
+            px,
+            py,
+            gap_mm=gap,
+            on_placed=lambda: progress.advance(ptask),
+        )
+
+    console.print(f"Plates: {len(plates)}")
+    for pl in plates:
+        console.print(f"  Plate {pl.index + 1}: {len(pl.rects)} parts")
+
     if args.dry_run:
-        console.print(f"Plates: {len(plates)}")
-        for pl in plates:
-            console.print(f"  Plate {pl.index + 1}: {len(pl.rects)} parts")
         return 0
 
-    for pl in plates:
+    def _export_plate(pl) -> Path:
         out_3mf = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
         out_js = args.output_dir / f"plate_{pl.index + 1:02d}.json"
         export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
-        console.print(f"Wrote {out_3mf}")
+        return out_3mf
+
+    _np = n_workers(len(plates))
+    with _make_progress(console) as progress:
+        ptask = progress.add_task("Exporting plates…", total=len(plates))
+        with ThreadPoolExecutor(max_workers=_np) as pool:
+            futs = [pool.submit(_export_plate, pl) for pl in plates]
+            for fut in as_completed(futs):
+                out_path = fut.result()
+                console.print(f"Wrote {out_path}")
+                progress.advance(ptask)
+
     return 0

@@ -125,11 +125,11 @@ def test_gap_is_enforced_between_two_rects():
     from stlbench.packing.polygon_pack import _normalize
 
     def placed(r):
-        s = _normalize(polys[r.part_index])
-        if r.rotated:
-            from shapely import affinity as aff
+        from shapely import affinity as aff
 
-            s = _normalize(aff.rotate(s, 90, origin=(0, 0)))
+        s = _normalize(polys[r.part_index])
+        if abs(r.rotation_deg) > 1e-9:
+            s = _normalize(aff.rotate(s, r.rotation_deg, origin=(0, 0)))
         return affinity.translate(s, r.x, r.y)
 
     p0 = placed(r0)
@@ -195,12 +195,13 @@ def test_single_plate_oversized_part_returns_none():
 
 
 def test_rotation_allows_tall_part_to_fit():
-    """Part 10×90 on 100×50 bed: fits only when rotated to 90×10."""
+    """Part 10×90 on 100×50 bed: does not fit at 0° but fits after rotation."""
     polys = [_box_poly(10.0, 90.0)]
     plates = pack_polygons_on_plates(polys, bed_w=100.0, bed_h=50.0, gap_mm=1.0)
     assert len(plates) == 1
     assert len(plates[0].rects) == 1
-    assert plates[0].rects[0].rotated is True
+    # Some non-zero rotation must have been applied to make the part fit.
+    assert abs(plates[0].rects[0].rotation_deg) > 1e-6
 
 
 # ---------------------------------------------------------------------------

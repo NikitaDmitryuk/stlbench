@@ -13,7 +13,7 @@ from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SE
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
-from stlbench.export.plate import _ROT_Z_90, mesh_footprint_xy
+from stlbench.export.plate import mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
@@ -89,7 +89,7 @@ def _max_copies_on_plate(
                     y=float(r.y),
                     width=float(r.width) - gap_mm,
                     height=float(r.height) - gap_mm,
-                    rotated=was_rotated,
+                    rotation_deg=90.0 if was_rotated else 0.0,
                 )
             )
 
@@ -204,8 +204,14 @@ def run_fill(args: FillRunArgs) -> int:
         m.apply_translation(
             [-float(m.bounds[0][0]), -float(m.bounds[0][1]), -float(m.bounds[0][2])]
         )
-        if r.rotated:
-            m.apply_transform(_ROT_Z_90)
+        if abs(r.rotation_deg) > 1e-9:
+            rot = np.array(
+                trimesh.transformations.rotation_matrix(
+                    np.radians(r.rotation_deg), [0.0, 0.0, 1.0]
+                ),
+                dtype=np.float64,
+            )
+            m.apply_transform(rot)
             m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
         t = np.eye(4, dtype=np.float64)
         t[0, 3] = r.x
@@ -233,7 +239,7 @@ def run_fill(args: FillRunArgs) -> int:
                 "y_mm": r.y,
                 "footprint_w_mm": r.width,
                 "footprint_h_mm": r.height,
-                "rotated_90": r.rotated,
+                "rotation_deg": r.rotation_deg,
             }
             for i, r in enumerate(plate.rects)
         ],
