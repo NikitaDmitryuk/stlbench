@@ -31,7 +31,7 @@ from shapely.prepared import prep
 
 from stlbench.packing.rectpack_plate import PackedPlate, PackedRect
 
-_PLACEMENT_ROTATION_COUNT = 36
+_PLACEMENT_ROTATION_COUNT = 15
 _PLACEMENT_ANGLES: tuple[float, ...] = tuple(
     360.0 * i / _PLACEMENT_ROTATION_COUNT for i in range(_PLACEMENT_ROTATION_COUNT)
 )
