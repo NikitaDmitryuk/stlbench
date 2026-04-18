@@ -39,6 +39,14 @@ _PLACEMENT_ANGLES: tuple[float, ...] = tuple(
 # Clipper integer scale: 1 unit = 1 µm → coordinates in range ±2^31
 _CLIPPER_SCALE = 1_000
 
+# NFP computation uses simplified polygons to keep MinkowskiSum fast.
+# Simplification tolerance in mm — gaps remain accurate to within this value.
+_NFP_SIMPLIFY_TOL: float = 1.0
+# Buffer arc resolution (segments per quarter-circle) for the forbidden zone.
+# 2 → 8-sided circle approximation; keeps vertex counts low at the cost of
+# ~0.1 mm corner rounding at typical gap sizes (≥ 1 mm).
+_NFP_BUFFER_RESOLUTION: int = 2
+
 
 def _normalize(poly: BaseGeometry) -> BaseGeometry:
     """Translate *poly* so its bounding-box lower-left corner is at the origin."""
@@ -183,9 +191,12 @@ def _try_place_one(
         inner_nfp = shapely_box(0.0, 0.0, max(x_max, 1e-6), max(y_max, 1e-6))
 
         if placed_buffered:
+            # Simplify the rotated shadow before Minkowski sum — the NFP
+            # only needs to be accurate to _NFP_SIMPLIFY_TOL, not sub-mm.
+            s_nfp = s.simplify(_NFP_SIMPLIFY_TOL, preserve_topology=True)
             outer_nfps: list[BaseGeometry] = []
             for buf in placed_buffered:
-                nfp = _outer_nfp(buf, s)
+                nfp = _outer_nfp(buf, s_nfp)
                 if nfp is not None and not nfp.is_empty:
                     outer_nfps.append(nfp)
             if outer_nfps:
@@ -220,6 +231,8 @@ def _try_place_one(
             best_w = w
             best_h = h
             best_candidate = candidate
+            if ty < 1e-6:
+                break  # y=0 is optimal; no later rotation can do better
 
     if best_pos is None or best_candidate is None:
         return None
@@ -270,7 +283,10 @@ def _pack_plate(
         if result is not None:
             rect, placed_poly = result
             rects.append(rect)
-            buffered = placed_poly.buffer(gap_mm)
+            # Simplify shadow before buffering: fewer vertices → much faster
+            # MinkowskiSum in subsequent placements.
+            simple = placed_poly.simplify(_NFP_SIMPLIFY_TOL, preserve_topology=True)
+            buffered = simple.buffer(gap_mm, quad_segs=_NFP_BUFFER_RESOLUTION)
             placed_buffered.append(buffered)
             forbidden = buffered if forbidden is None else forbidden.union(buffered)
             if len(rects) % _FORBIDDEN_SIMPLIFY_EVERY == 0 and forbidden is not None:
