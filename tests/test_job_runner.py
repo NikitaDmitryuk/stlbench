@@ -9,17 +9,7 @@ import pytest
 from stlbench.config.schema import AppSettings, PartSpec, PipelineSection, StepName
 from stlbench.pipeline.run_job import JobRunArgs, run_job
 
-# ---------------------------------------------------------------------------
-# Paths to real STL assets shipped with the repo
-# ---------------------------------------------------------------------------
-
-_EXAMPLES = Path(__file__).parent.parent / "examples" / "gandalf"
-_SCALED_DIR = _EXAMPLES / "scaled"
-_SWORD = _SCALED_DIR / "sword.stl"
-_STAFF = _SCALED_DIR / "staff.stl"
-_FIGURE = _SCALED_DIR / "figure.stl"
-
-# Printer profile that fits the already-scaled example parts without further scaling
+# Printer profile that fits the synthetic example parts without further scaling
 _PRINTER_WIDE = (200.0, 200.0, 220.0)
 
 # ---------------------------------------------------------------------------
@@ -165,85 +155,78 @@ def _run(
     return run_job(args)
 
 
-@pytest.mark.skipif(not _SWORD.exists(), reason="Example STL assets not found")
-def test_job_layout_only(tmp_path):
+def test_job_layout_only(tmp_path, stl_assets):
     """All parts with steps=['layout'] — no scale or orient."""
     rc = _run(
         tmp_path,
         parts=[
-            (_SWORD, ["layout"]),
-            (_STAFF, ["layout"]),
+            (stl_assets["sword"], ["layout"]),
+            (stl_assets["staff"], ["layout"]),
         ],
     )
     assert rc == 0
 
 
-@pytest.mark.skipif(not _SWORD.exists(), reason="Example STL assets not found")
-def test_job_full_pipeline(tmp_path):
+def test_job_full_pipeline(tmp_path, stl_assets):
     """Default full pipeline (scale → orient → layout)."""
     rc = _run(
         tmp_path,
         parts=[
-            (_SWORD, None),
-            (_STAFF, None),
+            (stl_assets["sword"], None),
+            (stl_assets["staff"], None),
         ],
         default_steps=["scale", "orient", "layout"],
     )
     assert rc == 0
 
 
-@pytest.mark.skipif(not _SWORD.exists(), reason="Example STL assets not found")
-def test_job_mixed(tmp_path):
+def test_job_mixed(tmp_path, stl_assets):
     """Mix: one part needs full pipeline, another just layout."""
     rc = _run(
         tmp_path,
         parts=[
-            (_FIGURE, None),  # default → scale + orient + layout
-            (_SWORD, ["layout"]),  # already prepared, just pack
+            (stl_assets["figure"], None),  # default → scale + orient + layout
+            (stl_assets["sword"], ["layout"]),  # already prepared, just pack
         ],
         default_steps=["scale", "orient", "layout"],
     )
     assert rc == 0
 
 
-@pytest.mark.skipif(not _SWORD.exists(), reason="Example STL assets not found")
-def test_job_scale_only_no_orient(tmp_path):
+def test_job_scale_only_no_orient(tmp_path, stl_assets):
     """steps=['scale', 'layout'] — scale but skip overhang orientation."""
     rc = _run(
         tmp_path,
-        parts=[(_SWORD, ["scale", "layout"])],
+        parts=[(stl_assets["sword"], ["scale", "layout"])],
     )
     assert rc == 0
 
 
-@pytest.mark.skipif(not _SWORD.exists(), reason="Example STL assets not found")
-def test_job_orient_before_scale(tmp_path):
+def test_job_orient_before_scale(tmp_path, stl_assets):
     """steps=['orient', 'scale', 'layout'] — orient first, then scale."""
     rc = _run(
         tmp_path,
-        parts=[(_SWORD, ["orient", "scale", "layout"])],
+        parts=[(stl_assets["sword"], ["orient", "scale", "layout"])],
     )
     assert rc == 0
 
 
-@pytest.mark.skipif(not _SWORD.exists(), reason="Example STL assets not found")
-def test_job_orient_only(tmp_path):
+def test_job_orient_only(tmp_path, stl_assets):
     """steps=['orient', 'layout'] — orient for overhangs, no scaling."""
     rc = _run(
         tmp_path,
-        parts=[(_SWORD, ["orient", "layout"])],
+        parts=[(stl_assets["sword"], ["orient", "layout"])],
     )
     assert rc == 0
 
 
-@pytest.mark.skipif(not _SWORD.exists(), reason="Example STL assets not found")
-def test_job_writes_files(tmp_path):
+def test_job_writes_files(tmp_path, stl_assets):
     """With dry_run=False the output 3MF and JSON files must be created."""
     rc = _run(
         tmp_path,
         parts=[
-            (_SWORD, ["layout"]),
-            (_STAFF, ["layout"]),
+            (stl_assets["sword"], ["layout"]),
+            (stl_assets["staff"], ["layout"]),
         ],
         dry_run=False,
     )

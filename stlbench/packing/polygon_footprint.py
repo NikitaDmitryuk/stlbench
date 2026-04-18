@@ -6,10 +6,12 @@ import trimesh
 from shapely.geometry import MultiPoint, Polygon
 from shapely.geometry.base import BaseGeometry
 
-# For meshes larger than this, randomly subsample faces before computing the
-# union to keep runtime bounded.  The shadow is still representative because
-# even a random subsample covers the full XY extent of the part.
-_MAX_FACES_EXACT = 10_000
+# Threshold above which we skip the union-of-triangles approach and use the
+# convex hull of all XY vertices instead.  Random face subsampling fails for
+# large meshes with non-uniform face density: e.g. a standing figure has most
+# faces on nearly-vertical surfaces that project to zero-area 2D triangles,
+# so the sampled union covers only a tiny patch instead of the full footprint.
+_MAX_FACES_UNION = 10_000
 
 
 def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseGeometry:
@@ -20,8 +22,9 @@ def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseG
     concave pockets (L-shapes, U-brackets, etc.) so the packer can interlock
     parts and achieve higher plate density.
 
-    For meshes with more than ``_MAX_FACES_EXACT`` faces a seeded random
-    subsample is used; the footprint is still accurate to ±simplify_tol mm.
+    For meshes with more than ``_MAX_FACES_UNION`` faces, the convex hull of
+    all XY vertices is used instead (random face subsampling gives incorrect
+    results when face density is non-uniform).
 
     Parameters
     ----------
@@ -37,12 +40,22 @@ def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseG
     if len(xy) < 3 or len(mesh.faces) == 0:
         return MultiPoint(xy).convex_hull
 
+    # Large meshes: use convex hull of ALL XY vertices.  Always correct and
+    # O(n log n); the union-of-triangles path fails for non-uniform meshes.
+    if len(mesh.faces) > _MAX_FACES_UNION:
+        try:
+            from scipy.spatial import ConvexHull  # noqa: PLC0415
+
+            hull = ConvexHull(xy)
+            shadow: BaseGeometry = Polygon(xy[hull.vertices])
+        except Exception:
+            shadow = MultiPoint(xy).convex_hull
+        if simplify_tol > 0 and not shadow.is_empty:
+            shadow = shadow.simplify(simplify_tol, preserve_topology=True)
+        return shadow
+
     try:
         faces = mesh.faces
-        if len(faces) > _MAX_FACES_EXACT:
-            rng = np.random.default_rng(0)
-            idx = rng.choice(len(faces), _MAX_FACES_EXACT, replace=False)
-            faces = faces[idx]  # type: ignore[assignment]
 
         # Build F closed triangle rings: shape (F, 4, 2) — first vertex repeated.
         coords_2d: np.ndarray = xy[faces]  # (F, 3, 2)
@@ -67,7 +80,7 @@ def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseG
         if len(polys) == 0:
             raise ValueError("no valid triangles after degenerate filter")
 
-        shadow: BaseGeometry = shapely.union_all(polys)
+        shadow = shapely.union_all(polys)
 
         # Remove internal holes — a through-hole in the part does not create
         # usable space for another part on the same build plate.
