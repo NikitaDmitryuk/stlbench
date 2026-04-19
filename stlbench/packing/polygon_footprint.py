@@ -11,7 +11,7 @@ from shapely.geometry.base import BaseGeometry
 # large meshes with non-uniform face density: e.g. a standing figure has most
 # faces on nearly-vertical surfaces that project to zero-area 2D triangles,
 # so the sampled union covers only a tiny patch instead of the full footprint.
-_MAX_FACES_UNION = 10_000
+_MAX_FACES_UNION = 20_000
 
 
 def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseGeometry:
