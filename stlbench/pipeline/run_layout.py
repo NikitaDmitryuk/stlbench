@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,16 +19,20 @@ from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SE
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_layout_transform
-from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_footprint import mesh_to_packing_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
 from stlbench.packing.rectpack_plate import int_bin_dims_mm
 from stlbench.pipeline.common import (
+    finish_profile,
     load_named_meshes,
-    n_workers,
+    resolve_edge_margin,
     resolve_gap,
+    resolve_orientation_policy,
+    resolve_orientation_scale_tolerance,
     resolve_printer,
     resolve_settings,
 )
+from stlbench.profiling import ProfileOptions, make_profiler
 
 
 @dataclass
@@ -43,6 +46,11 @@ class LayoutRunArgs:
     dry_run: bool
     cleanup: bool = False
     any_rotation: bool = False
+    orientation_policy: str | None = None
+    orientation_scale_tolerance: float | None = None
+    rotation_samples: int | None = None
+    profile_options: ProfileOptions | None = None
+    edge_margin_mm: float | None = None
 
 
 def _make_progress(console: Console) -> Progress:
@@ -58,19 +66,41 @@ def _make_progress(console: Console) -> Progress:
 
 def run_layout(args: LayoutRunArgs) -> int:
     console = Console(stderr=True)
+    profile_metadata: dict[str, object] = {
+        "input_dir": str(args.input_dir),
+        "dry_run": args.dry_run,
+        "any_rotation": args.any_rotation,
+    }
+    profiler = make_profiler(
+        command="layout",
+        output_base=args.output_dir,
+        options=args.profile_options,
+        metadata=profile_metadata,
+    )
+    profiler.start()
     st = resolve_settings(args.config_path)
 
     try:
         px, py, pz = resolve_printer(args.printer_xyz, st)
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
-        return 2
+        return finish_profile(profiler, console, 2)
 
     gap = resolve_gap(args.gap_mm, st)
+    edge_margin = resolve_edge_margin(args.edge_margin_mm, st)
+    epx = px - 2.0 * edge_margin
+    epy = py - 2.0 * edge_margin
+    try:
+        orientation_policy = resolve_orientation_policy(args.orientation_policy)
+        scale_tolerance = resolve_orientation_scale_tolerance(args.orientation_scale_tolerance)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return finish_profile(profiler, console, 2)
 
-    loaded = load_named_meshes(args.input_dir, args.recursive, console)
+    with profiler.stage("load meshes"):
+        loaded = load_named_meshes(args.input_dir, args.recursive, console)
     if loaded is None:
-        return 1
+        return finish_profile(profiler, console, 1)
     _paths, names, meshes = loaded
 
     n_parts = len(meshes)
@@ -79,26 +109,34 @@ def run_layout(args: LayoutRunArgs) -> int:
         dx, dy, dz = mesh_footprint_xy(m)
         dims_list.append((dx, dy, dz))
 
-    rot_samples = ORIENTATION_SAMPLES_DEFAULT
+    rot_samples = (
+        int(args.rotation_samples)
+        if args.rotation_samples is not None
+        else ORIENTATION_SAMPLES_DEFAULT
+    )
     rot_seed = ORIENTATION_SEED_DEFAULT
 
-    bw, bh = int_bin_dims_mm(px, py)
+    bw, bh = int_bin_dims_mm(epx, epy)
     bad_layout: list[tuple[str, float, float, float]] = []
     layout_plans: list[tuple[np.ndarray, float, float] | None] = []
 
-    with _make_progress(console) as progress:
+    with profiler.stage("orientation selection"), _make_progress(console) as progress:
         ptask = progress.add_task("Finding orientations…", total=n_parts)
         for m, name in zip(meshes, names, strict=True):
             dx, dy, dz = mesh_footprint_xy(m)
-            ok, t, fw, fh = select_layout_transform(
+            ok, t, fw, fh = profiler.profiled_call(
+                "layout.select_orientation",
+                select_layout_transform,
                 m,
-                px,
-                py,
+                epx,
+                epy,
                 pz,
                 gap,
                 random_samples=rot_samples,
                 seed=rot_seed,
                 any_rotation=args.any_rotation,
+                policy=orientation_policy,
+                scale_tolerance=scale_tolerance,
             )
             if not ok:
                 bad_layout.append((name, dx, dy, dz))
@@ -118,7 +156,7 @@ def run_layout(args: LayoutRunArgs) -> int:
         console.print(
             "[dim]Try smaller packing.gap_mm / scaling.post_fit_scale or split the model.[/dim]"
         )
-        return 1
+        return finish_profile(profiler, console, 1)
 
     oriented_meshes: list[trimesh.Trimesh] = []
     for m, plan in zip(meshes, layout_plans, strict=True):
@@ -131,35 +169,46 @@ def run_layout(args: LayoutRunArgs) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.cleanup:
-        for i, m in enumerate(oriented_meshes):
-            cleaned, n_rem = remove_small_components(m)
-            if n_rem:
-                oriented_meshes[i] = cleaned
-                console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
+        with profiler.stage("cleanup"):
+            for i, m in enumerate(oriented_meshes):
+                cleaned, n_rem = remove_small_components(m)
+                if n_rem:
+                    oriented_meshes[i] = cleaned
+                    console.print(
+                        f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]"
+                    )
 
     shadows = []
-    with _make_progress(console) as progress:
+    with profiler.stage("footprint computation"), _make_progress(console) as progress:
         ptask = progress.add_task("Computing footprints…", total=n_parts)
         for i, m in enumerate(oriented_meshes):
-            shadows.append(mesh_to_xy_shadow(m))
+            shadows.append(profiler.profiled_call("layout.footprint", mesh_to_packing_shadow, m))
             progress.update(ptask, advance=1, description=f"Footprint: {names[i]}")
 
-    with _make_progress(console) as progress:
+    with profiler.stage("packing"), _make_progress(console) as progress:
         ptask = progress.add_task("Packing…", total=n_parts)
-        plates = pack_polygons_on_plates(
+        part_heights = [mesh_footprint_xy(m)[2] for m in oriented_meshes]
+        packing_metadata: dict[str, object] = {}
+        plates = profiler.profiled_call(
+            "layout.packing",
+            pack_polygons_on_plates,
             shadows,
             px,
             py,
             gap_mm=gap,
             on_placed=lambda: progress.advance(ptask),
+            part_heights=part_heights,
+            metadata=packing_metadata,
+            edge_margin_mm=edge_margin,
         )
+    profile_metadata["packing"] = packing_metadata
 
     console.print(f"Plates: {len(plates)}")
     for pl in plates:
         console.print(f"  Plate {pl.index + 1}: {len(pl.rects)} parts")
 
     if args.dry_run:
-        return 0
+        return finish_profile(profiler, console, 0)
 
     def _export_plate(pl) -> Path:
         out_3mf = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
@@ -167,14 +216,11 @@ def run_layout(args: LayoutRunArgs) -> int:
         export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
         return out_3mf
 
-    _np = n_workers(len(plates))
-    with _make_progress(console) as progress:
+    with profiler.stage("export"), _make_progress(console) as progress:
         ptask = progress.add_task("Exporting plates…", total=len(plates))
-        with ThreadPoolExecutor(max_workers=_np) as pool:
-            futs = [pool.submit(_export_plate, pl) for pl in plates]
-            for fut in as_completed(futs):
-                out_path = fut.result()
-                console.print(f"Wrote {out_path}")
-                progress.advance(ptask)
+        for pl in plates:
+            out_path = profiler.profiled_call("layout.export", _export_plate, pl)
+            console.print(f"Wrote {out_path}")
+            progress.advance(ptask)
 
-    return 0
+    return finish_profile(profiler, console, 0)

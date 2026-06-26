@@ -18,8 +18,64 @@ Score = overhang_area - 0.5 * bottom_area   (lower is better)
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import trimesh
+
+from stlbench.config.defaults import (
+    DEFAULT_LONG_PART_HIGH_ANGLE_PENALTY_ABOVE_DEG,
+    DEFAULT_LONG_PART_LOW_ANGLE_PENALTY_BELOW_DEG,
+    DEFAULT_LONG_PART_TARGET_ANGLE_MAX_DEG,
+    DEFAULT_LONG_PART_TARGET_ANGLE_MIN_DEG,
+    DEFAULT_RESIN_BALANCE,
+)
+
+
+@dataclass(frozen=True)
+class ResinOrientationOptions:
+    resin_balance: str = DEFAULT_RESIN_BALANCE
+    long_part_target_angle_min_deg: float = DEFAULT_LONG_PART_TARGET_ANGLE_MIN_DEG
+    long_part_target_angle_max_deg: float = DEFAULT_LONG_PART_TARGET_ANGLE_MAX_DEG
+    long_part_low_angle_penalty_below_deg: float = DEFAULT_LONG_PART_LOW_ANGLE_PENALTY_BELOW_DEG
+    long_part_high_angle_penalty_above_deg: float = DEFAULT_LONG_PART_HIGH_ANGLE_PENALTY_ABOVE_DEG
+
+    def __post_init__(self) -> None:
+        if self.resin_balance not in {"balanced", "stability", "compact"}:
+            raise ValueError(
+                f"resin_balance must be balanced, stability, or compact; got {self.resin_balance!r}."
+            )
+        if self.long_part_target_angle_min_deg > self.long_part_target_angle_max_deg:
+            raise ValueError("long part target min angle must be <= max angle.")
+        if self.long_part_low_angle_penalty_below_deg > self.long_part_target_angle_min_deg:
+            raise ValueError("long part low angle threshold must be <= target min angle.")
+        if self.long_part_high_angle_penalty_above_deg < self.long_part_target_angle_max_deg:
+            raise ValueError("long part high angle threshold must be >= target max angle.")
+
+
+@dataclass(frozen=True)
+class OrientationStabilityMetrics:
+    overhang_score: float
+    height_mm: float
+    center_z_ratio: float
+    long_axis_z: float
+    long_axis_angle_from_bed_deg: float
+    pca_aspect: float
+    pca_line_ratio: float
+    stability_score: float
+    support_score_delta: float
+    xy_footprint_area_mm2: float
+    support_contact_proxy: float
+    surface_damage_proxy: float
+    salient_down_area_ratio: float
+    flat_safe_down_area_ratio: float
+    source_up_dot_build_up: float
+    upside_down_penalty: float
+    angle_band_penalty: float
+    vertical_penalty: float
+    horizontal_penalty: float
+    selection_reason: str
+
 
 # ---------------------------------------------------------------------------
 # Rotation helpers
@@ -192,6 +248,248 @@ def _batch_fits_printer(
     tol = 1e-6
     fits: np.ndarray = (dz <= pz + tol) & (xy_lo <= bed_lo + tol) & (xy_hi <= bed_hi + tol)
     return fits
+
+
+def _mesh_vertices_for_stability(mesh: trimesh.Trimesh, max_vertices: int = 80_000) -> np.ndarray:
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if len(vertices) <= max_vertices:
+        return vertices
+    sel = np.linspace(0, len(vertices) - 1, num=max_vertices, dtype=int)
+    return np.asarray(vertices[sel], dtype=np.float64)
+
+
+def _unit_or_default(value: np.ndarray | None, default: tuple[float, float, float]) -> np.ndarray:
+    if value is None:
+        out = np.array(default, dtype=np.float64)
+    else:
+        out = np.asarray(value, dtype=np.float64)
+    norm = float(np.linalg.norm(out))
+    if norm <= 1e-12:
+        return np.array(default, dtype=np.float64)
+    return out / norm
+
+
+def _face_saliency(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Cheap geometry-only proxy for visible/detail-rich faces.
+
+    High values mean the local surface normal varies from adjacent faces, which
+    catches relief/curvature better than area alone. Large flat faces remain
+    low-saliency and are therefore safer places for support scars.
+    """
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)
+    saliency = np.zeros(len(normals), dtype=np.float64)
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    if len(adjacency) == 0:
+        return saliency
+    dots = np.einsum("ij,ij->i", normals[adjacency[:, 0]], normals[adjacency[:, 1]])
+    variation = 1.0 - np.clip(np.abs(dots), 0.0, 1.0)
+    np.maximum.at(saliency, adjacency[:, 0], variation)
+    np.maximum.at(saliency, adjacency[:, 1], variation)
+    areas = np.asarray(mesh.area_faces, dtype=np.float64)
+    median_area = float(np.median(areas)) if len(areas) else 0.0
+    area_scale = median_area / np.maximum(areas, 1e-12) if median_area > 0 else 1.0
+    return np.clip(saliency * 0.3 * np.minimum(area_scale, 2.0), 0.0, 1.0)
+
+
+def _subsample_surface_data(
+    mesh: trimesh.Trimesh,
+    max_faces: int = 50_000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)
+    areas = np.asarray(mesh.area_faces, dtype=np.float64)
+    saliency = _face_saliency(mesh)
+    n_faces = len(normals)
+    if max_faces >= n_faces:
+        return normals, areas, saliency
+
+    total_area = float(areas.sum())
+    probs = areas / total_area
+    rng = np.random.default_rng(0)
+    idx = rng.choice(n_faces, max_faces, replace=False, p=probs)
+    sub_areas = areas[idx]
+    scale = total_area / float(sub_areas.sum())
+    return normals[idx], sub_areas * scale, saliency[idx]
+
+
+def _principal_axis_stats(vertices: np.ndarray) -> tuple[np.ndarray, float, float]:
+    centered = vertices - vertices.mean(axis=0)
+    if centered.shape[0] < 3:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64), 1.0, 1.0
+    cov = np.cov(centered, rowvar=False)
+    vals, vecs = np.linalg.eigh(cov)
+    order = np.argsort(vals)
+    vals = np.maximum(vals[order], 0.0)
+    vecs = vecs[:, order]
+    axis = vecs[:, -1]
+    norm = float(np.linalg.norm(axis))
+    axis = np.array([1.0, 0.0, 0.0], dtype=np.float64) if norm <= 1e-12 else axis / norm
+    aspect = float(np.sqrt(vals[-1] / max(vals[0], 1e-12))) if vals[-1] > 0 else 1.0
+    line_ratio = float(np.sqrt(vals[-2] / max(vals[-1], 1e-12))) if vals[-1] > 0 else 1.0
+    return axis.astype(np.float64, copy=False), max(1.0, aspect), line_ratio
+
+
+def _principal_axis(vertices: np.ndarray) -> tuple[np.ndarray, float]:
+    axis, aspect, _line_ratio = _principal_axis_stats(vertices)
+    return axis, aspect
+
+
+def _stability_metrics(
+    mesh: trimesh.Trimesh,
+    rotation: np.ndarray,
+    overhang_value: float,
+    best_overhang_value: float,
+    printer_dims: tuple[float, float, float] | None,
+    vertices: np.ndarray,
+    principal_axis: np.ndarray,
+    pca_aspect: float,
+    pca_line_ratio: float,
+    centroid: np.ndarray,
+    total_area: float,
+    face_normals: np.ndarray,
+    face_areas: np.ndarray,
+    face_saliency: np.ndarray,
+    cos_t: float,
+    options: ResinOrientationOptions,
+    source_up: np.ndarray | None,
+) -> OrientationStabilityMetrics:
+    rotated = vertices @ rotation.T
+    lo = rotated.min(axis=0)
+    hi = rotated.max(axis=0)
+    extents = hi - lo
+    height = float(extents[2])
+    pz = printer_dims[2] if printer_dims is not None else max(height, 1e-9)
+    height_ratio = height / max(float(pz), 1e-9)
+    c = rotation @ centroid
+    center_z_ratio = float(np.clip((c[2] - lo[2]) / max(height, 1e-9), 0.0, 1.0))
+    long_axis = rotation @ principal_axis
+    long_axis_z = float(abs(long_axis[2]) / max(np.linalg.norm(long_axis), 1e-12))
+    long_axis_angle = float(np.degrees(np.arcsin(np.clip(long_axis_z, 0.0, 1.0))))
+    xy_footprint_area = float(extents[0] * extents[1])
+    support_norm = overhang_value / max(total_area, 1e-9)
+    nz = face_normals @ rotation[2]
+    support_contact_proxy = float(
+        np.sum(face_areas[(nz < -0.2) & (nz > -0.99)]) / max(total_area, 1e-9)
+    )
+    source_up_vec = _unit_or_default(source_up, (0.0, 0.0, 1.0))
+    final_source_up = rotation @ source_up_vec
+    source_up_dot_build_up = float(np.clip(final_source_up[2], -1.0, 1.0))
+    upside_down_penalty = max(0.0, 0.5 - source_up_dot_build_up) ** 2
+    support_need = np.clip((-nz - 0.2) / 0.8, 0.0, 1.0)
+    source_top_weight = np.clip(face_normals @ source_up_vec, 0.0, 1.0)
+    surface_weight = 0.25 + 1.50 * face_saliency + 1.00 * source_top_weight
+    surface_damage_proxy = float(
+        np.sum(face_areas * support_need * surface_weight) / max(total_area, 1e-9)
+    )
+    salient_down_area_ratio = float(
+        np.sum(face_areas * support_need * face_saliency) / max(total_area, 1e-9)
+    )
+    flat_safe_mask = (nz < -0.99) & (face_saliency < 0.15) & (source_top_weight < 0.25)
+    flat_safe_down_area_ratio = float(np.sum(face_areas[flat_safe_mask]) / max(total_area, 1e-9))
+
+    is_long = pca_aspect >= 3.0 and pca_line_ratio <= 0.55
+    target_min = options.long_part_target_angle_min_deg
+    target_max = options.long_part_target_angle_max_deg
+    low_cut = options.long_part_low_angle_penalty_below_deg
+    high_cut = options.long_part_high_angle_penalty_above_deg
+    horizontal_penalty = 0.0
+    vertical_penalty = 0.0
+    angle_band_penalty = 0.0
+    if is_long:
+        if long_axis_angle < target_min:
+            angle_band_penalty = ((target_min - long_axis_angle) / max(target_min, 1.0)) ** 2
+        elif long_axis_angle > target_max:
+            angle_band_penalty = ((long_axis_angle - target_max) / max(90.0 - target_max, 1.0)) ** 2
+        if long_axis_angle < low_cut:
+            horizontal_penalty = ((low_cut - long_axis_angle) / max(low_cut, 1.0)) ** 2
+        if long_axis_angle > high_cut:
+            vertical_penalty = ((long_axis_angle - high_cut) / max(90.0 - high_cut, 1.0)) ** 2
+
+    long_penalty = 0.0
+    if is_long:
+        long_penalty = max(0.0, long_axis_z - 0.57) ** 2 * min(10.0, pca_aspect / 1.5)
+
+    dims_sorted = np.sort(extents)
+    flat_ratio = float(dims_sorted[0] / max(dims_sorted[2], 1e-9))
+    flat_vertical_penalty = 0.0
+    if flat_ratio < 0.35 and pca_aspect >= 2.0:
+        flat_vertical_penalty = max(0.0, long_axis_z - 0.45) ** 2 * 4.0
+
+    footprint_norm = xy_footprint_area / max(
+        printer_dims[0] * printer_dims[1] if printer_dims is not None else xy_footprint_area,
+        1e-9,
+    )
+    if options.resin_balance == "stability":
+        support_w, footprint_w, height_w, center_w, contact_w = 1.00, 0.35, 0.35, 0.35, 0.80
+        angle_w, hard_angle_w = 2.8, 2.4
+        surface_w, upside_w = 1.70, 1.60
+    elif options.resin_balance == "compact":
+        support_w, footprint_w, height_w, center_w, contact_w = 0.65, 1.60, 0.20, 0.20, 0.60
+        angle_w, hard_angle_w = 1.6, 1.5
+        surface_w, upside_w = 0.75, 0.75
+    else:
+        support_w, footprint_w, height_w, center_w, contact_w = 0.80, 1.10, 0.25, 0.25, 0.90
+        angle_w, hard_angle_w = 2.2, 2.0
+        surface_w, upside_w = 1.20, 1.10
+    if not is_long:
+        footprint_w *= 0.30
+        height_w *= 3.0
+        center_w *= 1.8
+        contact_w *= 0.50
+        surface_w *= 1.35
+        upside_w *= 1.35
+    elif options.resin_balance == "compact":
+        footprint_w *= 8.0
+        height_w *= 0.50
+
+    long_contact = support_contact_proxy * (1.0 if is_long else 0.35)
+    stability_score = (
+        support_w * support_norm
+        + footprint_w * footprint_norm
+        + height_w * height_ratio
+        + center_w * center_z_ratio
+        + contact_w * long_contact
+        + angle_w * angle_band_penalty
+        + hard_angle_w * (horizontal_penalty + vertical_penalty)
+        + surface_w * surface_damage_proxy
+        + upside_w * upside_down_penalty
+        + long_penalty
+        + flat_vertical_penalty
+    )
+    selection_reason = "pure_overhang"
+    if is_long and target_min <= long_axis_angle <= target_max:
+        selection_reason = "long_part_target_band"
+    elif is_long and (angle_band_penalty > 0 or horizontal_penalty > 0 or vertical_penalty > 0):
+        selection_reason = "balanced_long_part"
+    elif flat_vertical_penalty > 0:
+        selection_reason = "flat_plate_stability"
+    elif upside_down_penalty <= 1e-6 and source_up_dot_build_up > 0.35:
+        selection_reason = "source_up_preserved"
+    elif surface_damage_proxy < 0.20:
+        selection_reason = "surface_damage_avoided"
+    elif upside_down_penalty > 0.0 or surface_damage_proxy > 0.45:
+        selection_reason = "support_overrode_surface"
+    return OrientationStabilityMetrics(
+        overhang_score=overhang_value,
+        height_mm=height,
+        center_z_ratio=center_z_ratio,
+        long_axis_z=long_axis_z,
+        long_axis_angle_from_bed_deg=long_axis_angle,
+        pca_aspect=pca_aspect,
+        pca_line_ratio=pca_line_ratio,
+        stability_score=stability_score,
+        support_score_delta=overhang_value - best_overhang_value,
+        xy_footprint_area_mm2=xy_footprint_area,
+        support_contact_proxy=support_contact_proxy,
+        surface_damage_proxy=surface_damage_proxy,
+        salient_down_area_ratio=salient_down_area_ratio,
+        flat_safe_down_area_ratio=flat_safe_down_area_ratio,
+        source_up_dot_build_up=source_up_dot_build_up,
+        upside_down_penalty=upside_down_penalty,
+        angle_band_penalty=angle_band_penalty,
+        vertical_penalty=vertical_penalty,
+        horizontal_penalty=horizontal_penalty,
+        selection_reason=selection_reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +729,100 @@ def find_min_overhang_rotation(
         best_R = fallback_R
 
     return best_R, overhang_score(mesh, best_R, cos_t=cos_t)
+
+
+def find_stable_overhang_rotation(
+    mesh: trimesh.Trimesh,
+    overhang_threshold_deg: float = 45.0,
+    n_candidates: int = 200,
+    printer_dims: tuple[float, float, float] | None = None,
+    *,
+    support_tolerance_ratio: float = 0.20,
+    resin_options: ResinOrientationOptions | None = None,
+    source_up: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, OrientationStabilityMetrics]:
+    """Find an overhang-good orientation with a stability-aware tie-break.
+
+    The pure overhang optimum is used as the support baseline.  Among candidate
+    orientations whose support score is within ``support_tolerance_ratio`` of
+    total mesh area, choose the one with lower height, lower center of mass,
+    and less-vertical principal axis for long/thin parts.
+    """
+    options = resin_options or ResinOrientationOptions()
+    cos_t = float(np.cos(np.radians(overhang_threshold_deg)))
+    best_overhang_R, best_overhang = find_min_overhang_rotation(
+        mesh,
+        overhang_threshold_deg=overhang_threshold_deg,
+        n_candidates=n_candidates,
+        printer_dims=printer_dims,
+    )
+
+    fn, af, face_saliency = _subsample_surface_data(mesh)
+    total_area = float(np.sum(mesh.area_faces))
+    candidates = _build_candidates(mesh, n_candidates)
+    rotations = np.array([_rotation_from_to(cand, _DOWN) for cand in candidates])
+    raw_scores = _batch_overhang_scores(fn, af, rotations, cos_t)
+
+    all_rotations = [best_overhang_R]
+    all_scores = [best_overhang]
+    for rotation, score in zip(rotations, raw_scores, strict=True):
+        score_f = float(score)
+        if score_f <= best_overhang + support_tolerance_ratio * max(total_area, 1.0) and (
+            printer_dims is None or _fits_printer(mesh, rotation, *printer_dims)
+        ):
+            all_rotations.append(rotation)
+            all_scores.append(score_f)
+
+    vertices = _mesh_vertices_for_stability(mesh)
+    principal_axis, pca_aspect, pca_line_ratio = _principal_axis_stats(vertices)
+    centroid = np.asarray(mesh.centroid, dtype=np.float64)
+    metrics = [
+        _stability_metrics(
+            mesh,
+            rotation,
+            score,
+            best_overhang,
+            printer_dims,
+            vertices,
+            principal_axis,
+            pca_aspect,
+            pca_line_ratio,
+            centroid,
+            total_area,
+            fn,
+            af,
+            face_saliency,
+            cos_t,
+            options,
+            source_up,
+        )
+        for rotation, score in zip(all_rotations, all_scores, strict=True)
+    ]
+    in_target_band = [
+        i
+        for i, m in enumerate(metrics)
+        if (
+            m.pca_aspect >= 3.0
+            and options.long_part_target_angle_min_deg
+            <= m.long_axis_angle_from_bed_deg
+            <= options.long_part_target_angle_max_deg
+        )
+    ]
+    if in_target_band and options.resin_balance == "balanced":
+        # For long parts the target angle band exists to avoid both failure modes:
+        # fully horizontal "support along the whole shaft" and near-vertical fragile tips.
+        candidates_idx = in_target_band
+    else:
+        candidates_idx = list(range(len(all_rotations)))
+    best_idx = min(
+        candidates_idx,
+        key=lambda i: (
+            metrics[i].stability_score,
+            metrics[i].overhang_score,
+            metrics[i].height_mm,
+        ),
+    )
+    return all_rotations[best_idx], metrics[best_idx].overhang_score, metrics[best_idx]
 
 
 def rotation_to_transform4(rotation: np.ndarray) -> np.ndarray:

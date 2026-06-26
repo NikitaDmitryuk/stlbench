@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from stlbench.config.schema import (
     AppSettings,
+    OrientationSection,
     PackingSection,
     PipelineSection,
     PrinterSection,
@@ -20,8 +21,9 @@ def sample_app_settings() -> AppSettings:
             depth_mm=77.76,
             height_mm=165.0,
         ),
-        scaling=ScalingSection(post_fit_scale=0.95),
-        packing=PackingSection(gap_mm=5.0),
+        scaling=ScalingSection(post_fit_scale=0.95, any_rotation=True, maximize=True),
+        packing=PackingSection(gap_mm=10.0),
+        orientation=OrientationSection(),
     )
 
 
@@ -44,6 +46,7 @@ def render_sample_config_toml() -> str:
     p = s.printer
     sc = s.scaling
     pk = s.packing
+    ori = s.orientation
 
     lines = [
         "# Typical SLA build volume (example: ELEGOO Mars 5 Ultra,",
@@ -60,14 +63,26 @@ def render_sample_config_toml() -> str:
         f"post_fit_scale = {_toml_number(sc.post_fit_scale)}",
         "# Allow any 3D orientation (all axis permutations) for scale fitting.",
         "# false = Z-axis rotation only (default).",
-        "any_rotation = false",
+        f"any_rotation = {str(sc.any_rotation).lower()}",
         "# Full SO(3) random search (4096 samples) to maximise scale factor.",
         "# Requires any_rotation = true. Slow; produces arbitrary tilt angles.",
-        "maximize = false",
+        f"maximize = {str(sc.maximize).lower()}",
         "",
         "[packing]",
         "# Surface-to-surface gap between parts on the bed (mm).",
         f"gap_mm = {_toml_number(pk.gap_mm)}",
+        "# Keep parts away from the platform edge to leave room for support bases.",
+        f"edge_margin_mm = {_toml_number(pk.edge_margin_mm)}",
+        "",
+        "[orientation]",
+        '# Resin orientation balance: "balanced", "stability", or "compact".',
+        f"resin_balance = {_toml_str(ori.resin_balance)}",
+        "# Preferred long/thin part angle from the bed, in degrees.",
+        f"long_part_target_angle_min_deg = {_toml_number(ori.long_part_target_angle_min_deg)}",
+        f"long_part_target_angle_max_deg = {_toml_number(ori.long_part_target_angle_max_deg)}",
+        "# Soft guardrails outside the preferred band.",
+        f"long_part_low_angle_penalty_below_deg = {_toml_number(ori.long_part_low_angle_penalty_below_deg)}",
+        f"long_part_high_angle_penalty_above_deg = {_toml_number(ori.long_part_high_angle_penalty_above_deg)}",
         "",
     ]
     return "\n".join(lines)
@@ -79,6 +94,7 @@ def render_sample_job_toml() -> str:
     p = s.printer
     sc = s.scaling
     pk = s.packing
+    ori = s.orientation
     pl = PipelineSection()
     steps_str = "[" + ", ".join(f'"{step.value}"' for step in pl.default_steps) + "]"
 
@@ -97,14 +113,24 @@ def render_sample_job_toml() -> str:
         f"post_fit_scale = {_toml_number(sc.post_fit_scale)}",
         "# Allow any 3D orientation (all axis permutations) for scale fitting.",
         "# false = Z-axis rotation only (default).",
-        "any_rotation = false",
+        f"any_rotation = {str(sc.any_rotation).lower()}",
         "# Full SO(3) random search (4096 samples) to maximise scale factor.",
         "# Requires any_rotation = true. Slow; produces arbitrary tilt angles.",
-        "maximize = false",
+        f"maximize = {str(sc.maximize).lower()}",
         "",
         "[packing]",
         "# Surface-to-surface gap between parts on the bed (mm).",
         f"gap_mm = {_toml_number(pk.gap_mm)}",
+        "# Keep parts away from the platform edge to leave room for support bases.",
+        f"edge_margin_mm = {_toml_number(pk.edge_margin_mm)}",
+        "",
+        "[orientation]",
+        '# Resin orientation balance: "balanced", "stability", or "compact".',
+        f"resin_balance = {_toml_str(ori.resin_balance)}",
+        f"long_part_target_angle_min_deg = {_toml_number(ori.long_part_target_angle_min_deg)}",
+        f"long_part_target_angle_max_deg = {_toml_number(ori.long_part_target_angle_max_deg)}",
+        f"long_part_low_angle_penalty_below_deg = {_toml_number(ori.long_part_low_angle_penalty_below_deg)}",
+        f"long_part_high_angle_penalty_above_deg = {_toml_number(ori.long_part_high_angle_penalty_above_deg)}",
         "",
         "[pipeline]",
         "# Default step sequence for parts that do not specify their own 'steps'.",

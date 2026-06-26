@@ -1,12 +1,13 @@
 # stlbench Examples
 
-## Gandalf (3-part model)
+## Local model examples
 
-The `gandalf/` directory contains a three-part model of Gandalf stored via Git LFS:
-`figure.stl`, `staff.stl`, and `sword.stl`. The `gandalf/scaled/` subdirectory holds
-pre-scaled versions of these parts.
+The commands below use a three-part model layout as an example:
+`examples/gandalf/main/figure.stl`, `staff.stl`, and `sword.stl`.
 
-> **Git LFS:** Run `git lfs pull` if the STL files appear as text pointer files.
+STL/3MF model files are intentionally **not committed** to the repository. Put your
+own local models under the shown paths, or replace the paths with your own dataset.
+Generated output directories are ignored by git.
 
 All commands below are run from the **repository root** (next to `stlbench/` and
 `examples/`), and use the included ELEGOO Mars 5 Ultra config.

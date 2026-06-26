@@ -52,13 +52,18 @@ from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import PartSpec, StepName
 from stlbench.core.fit import compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
-from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
-from stlbench.export.plate import export_plate_3mf
+from stlbench.core.overhang import (
+    ResinOrientationOptions,
+    apply_min_overhang_orientation,
+    find_stable_overhang_rotation,
+)
+from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_footprint import mesh_to_packing_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
-from stlbench.pipeline.common import n_workers
+from stlbench.pipeline.common import finish_profile, n_workers, resolve_resin_orientation_options
 from stlbench.pipeline.mesh_io import load_mesh
+from stlbench.profiling import ProfileOptions, make_profiler
 
 
 @dataclass
@@ -72,6 +77,9 @@ class JobRunArgs:
     verbose: bool = False
     dry_run: bool = False
     cleanup: bool = False
+    profile_options: ProfileOptions | None = None
+    edge_margin_mm: float | None = None
+    resin_balance: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +99,7 @@ class _PartWork:
     # Filled by Pass 1 (for parts with scale step)
     pass1_mesh: trimesh.Trimesh | None = None  # mesh in scale/orient state after pass 1
     pass1_dims: tuple[float, float, float] | None = None  # AABB (dx, dy, dz) for s_max
+    source_up: np.ndarray | None = None
 
     # Filled by Pass 3
     final_mesh: trimesh.Trimesh | None = None
@@ -161,6 +170,7 @@ def _pass1_scale_first(
     mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
     pw.pass1_mesh = mesh
     pw.pass1_dims = dims
+    pw.source_up = t4[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
     return pw
 
 
@@ -171,22 +181,26 @@ def _pass1_orient_first(
     pz: float,
     overhang_threshold_deg: float,
     n_candidates: int,
+    resin_options: ResinOrientationOptions,
 ) -> _PartWork:
     """Tweaker-3 orient, then derive scale dims from the oriented AABB."""
     mesh = load_mesh(pw.abs_path)
     _ = mesh.face_normals  # warm caches before any concurrent use
     _ = mesh.area_faces
-    rotation, _ = find_min_overhang_rotation(
+    rotation, _, _metrics = find_stable_overhang_rotation(
         mesh,
         overhang_threshold_deg=overhang_threshold_deg,
         n_candidates=n_candidates,
         printer_dims=(px, py, pz),
+        resin_options=resin_options,
+        source_up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
     )
     oriented = apply_min_overhang_orientation(mesh, rotation)
     b = np.asarray(oriented.bounds)
     dims = (float(b[1, 0] - b[0, 0]), float(b[1, 1] - b[0, 1]), float(b[1, 2] - b[0, 2]))
     pw.pass1_mesh = oriented  # already at z=0 from apply_min_overhang_orientation
     pw.pass1_dims = dims
+    pw.source_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     return pw
 
 
@@ -203,6 +217,7 @@ def _pass3_apply(
     pz: float,
     overhang_threshold_deg: float,
     n_candidates: int,
+    resin_options: ResinOrientationOptions,
 ) -> _PartWork:
     """Apply the remaining pipeline steps to produce the final mesh."""
     if pw.has_scale and pw.scale_before_orient:
@@ -214,11 +229,13 @@ def _pass3_apply(
         if pw.has_orient:
             _ = mesh.face_normals
             _ = mesh.area_faces
-            rotation, _ = find_min_overhang_rotation(
+            rotation, _, _metrics = find_stable_overhang_rotation(
                 mesh,
                 overhang_threshold_deg=overhang_threshold_deg,
                 n_candidates=n_candidates,
                 printer_dims=(px, py, pz),
+                resin_options=resin_options,
+                source_up=pw.source_up,
             )
             mesh = apply_min_overhang_orientation(mesh, rotation)
 
@@ -246,17 +263,26 @@ def _pass3_apply(
 
 def run_job(args: JobRunArgs) -> int:  # noqa: C901
     console = Console(stderr=True)
+    profile_metadata: dict[str, object] = {"job_path": str(args.job_path), "dry_run": args.dry_run}
+    profiler = make_profiler(
+        command="job",
+        output_base=args.output_dir,
+        options=args.profile_options,
+        metadata=profile_metadata,
+    )
+    profiler.start()
 
     # ── Load job file ───────────────────────────────────────────────────────
-    try:
-        settings = load_app_settings(args.job_path)
-    except (FileNotFoundError, ValueError) as e:
-        console.print(f"[red]{e}[/red]")
-        return 2
+    with profiler.stage("load job"):
+        try:
+            settings = load_app_settings(args.job_path)
+        except (FileNotFoundError, ValueError) as e:
+            console.print(f"[red]{e}[/red]")
+            return finish_profile(profiler, console, 2)
 
     if not settings.parts:
         console.print("[red]Job file has no [[parts]] entries.[/red]")
-        return 2
+        return finish_profile(profiler, console, 2)
 
     px_raw = settings.printer.width_mm
     py_raw = settings.printer.depth_mm
@@ -265,14 +291,21 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
     any_rotation = settings.scaling.any_rotation
     maximize = settings.scaling.maximize
     gap_mm = settings.packing.gap_mm
+    edge_margin_mm = (
+        settings.packing.edge_margin_mm if args.edge_margin_mm is None else args.edge_margin_mm
+    )
+    resin_options = resolve_resin_orientation_options(args.resin_balance, settings)
     method = "sorted"
 
     px, py, pz = px_raw, py_raw, pz_raw
+    epx, epy = px - 2.0 * edge_margin_mm, py - 2.0 * edge_margin_mm
 
     if settings.printer.name:
         console.print(f"Printer: {settings.printer.name}")
     console.print(f"Build volume: {px:.1f} × {py:.1f} × {pz:.1f} mm")
-    console.print(f"Gap: {gap_mm} mm  |  post_fit_scale: {post_fit_scale}")
+    console.print(
+        f"Gap: {gap_mm} mm  |  edge margin: {edge_margin_mm} mm  |  post_fit_scale: {post_fit_scale}"
+    )
 
     default_steps = settings.pipeline.default_steps
     base_dir = args.job_path.parent
@@ -283,7 +316,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         abs_path = (base_dir / spec.path).resolve()
         if not abs_path.exists():
             console.print(f"[red]Part not found: {abs_path}[/red]")
-            return 2
+            return finish_profile(profiler, console, 2)
         steps = spec.effective_steps(default_steps)
         works.append(
             _PartWork(
@@ -315,18 +348,29 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         def _submit_pass1(pw: _PartWork):
             if pw.has_scale and pw.scale_before_orient:
                 return _pass1_scale_first(
-                    pw, px, py, pz, method, any_rotation, maximize, args.rotation_samples
+                    pw, epx, epy, pz, method, any_rotation, maximize, args.rotation_samples
                 )
             else:
                 # orient-first (either scale-after-orient or orient-only)
                 return _pass1_orient_first(
-                    pw, px, py, pz, args.overhang_threshold_deg, args.n_orient_candidates
+                    pw,
+                    epx,
+                    epy,
+                    pz,
+                    args.overhang_threshold_deg,
+                    args.n_orient_candidates,
+                    resin_options,
                 )
 
-        with _make_progress(console) as progress:
+        with (
+            profiler.stage("pass 1 orientation / scale search"),
+            _make_progress(console) as progress,
+        ):
             ptask = progress.add_task("Pass 1…", total=len(all_pass1))
             with ThreadPoolExecutor(max_workers=_n) as pool:
-                futs = {pool.submit(_submit_pass1, pw): pw for pw in all_pass1}
+                futs = {
+                    profiler.submit(pool, "job.pass1", _submit_pass1, pw): pw for pw in all_pass1
+                }
                 for fut in as_completed(futs):
                     try:
                         fut.result()  # result written in-place to pw
@@ -335,7 +379,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                         if args.verbose:
                             console.print_exception()
                         console.print(f"[red]Pass 1 failed for {orig.label!r}: {e}[/red]")
-                        return 1
+                        return finish_profile(profiler, console, 1)
                     progress.advance(ptask)
 
     # ── Pass 2: global scale ────────────────────────────────────────────────
@@ -346,16 +390,17 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         scale_names = [pw.label for pw in scale_works]
         assert all(d is not None for d in scale_dims)
 
-        try:
-            s_max, reports = compute_global_scale(
-                (px, py, pz),
-                scale_dims,  # type: ignore[arg-type]
-                scale_names,
-                method,  # type: ignore[arg-type]
-            )
-        except ValueError as e:
-            console.print(f"[red]{e}[/red]")
-            return 1
+        with profiler.stage("pass 2 global scale"):
+            try:
+                s_max, reports = compute_global_scale(
+                    (epx, epy, pz),
+                    scale_dims,  # type: ignore[arg-type]
+                    scale_names,
+                    method,  # type: ignore[arg-type]
+                )
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                return finish_profile(profiler, console, 1)
 
         s_final = s_max * post_fit_scale
         console.print(f"s_max={s_max:.6f}  ×  post_fit={post_fit_scale}  →  s_final={s_final:.6f}")
@@ -377,13 +422,20 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
 
     def _submit_pass3(pw: _PartWork) -> _PartWork:
         return _pass3_apply(
-            pw, s_final, px, py, pz, args.overhang_threshold_deg, args.n_orient_candidates
+            pw,
+            s_final,
+            epx,
+            epy,
+            pz,
+            args.overhang_threshold_deg,
+            args.n_orient_candidates,
+            resin_options,
         )
 
-    with _make_progress(console) as progress:
+    with profiler.stage("pass 3 apply pipeline"), _make_progress(console) as progress:
         ptask = progress.add_task("Applying pipeline…", total=len(works))
         with ThreadPoolExecutor(max_workers=_n3) as pool:
-            futs3 = {pool.submit(_submit_pass3, pw): pw for pw in works}
+            futs3 = {profiler.submit(pool, "job.pass3", _submit_pass3, pw): pw for pw in works}
             for fut3 in as_completed(futs3):
                 try:
                     fut3.result()
@@ -392,20 +444,21 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                     if args.verbose:
                         console.print_exception()
                     console.print(f"[red]Pass 3 failed for {orig.label!r}: {e}[/red]")
-                    return 1
+                    return finish_profile(profiler, console, 1)
                 progress.advance(ptask)
 
     final_meshes: list[trimesh.Trimesh] = [pw.final_mesh for pw in works]  # type: ignore[misc]
     final_names: list[str] = [pw.label for pw in works]
 
     if args.cleanup:
-        for i, m in enumerate(final_meshes):
-            cleaned, n_rem = remove_small_components(m)
-            if n_rem:
-                final_meshes[i] = cleaned
-                console.print(
-                    f"[dim]cleanup: {final_names[i]} — removed {n_rem} tiny component(s)[/dim]"
-                )
+        with profiler.stage("cleanup"):
+            for i, m in enumerate(final_meshes):
+                cleaned, n_rem = remove_small_components(m)
+                if n_rem:
+                    final_meshes[i] = cleaned
+                    console.print(
+                        f"[dim]cleanup: {final_names[i]} — removed {n_rem} tiny component(s)[/dim]"
+                    )
 
     # ── Pass 4: pack and export ─────────────────────────────────────────────
     console.print("\n[bold]Pass 4  Layout[/bold]")
@@ -425,25 +478,33 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                 f"[red]Part {name!r} ({dx:.1f}×{dy:.1f} mm) does not fit "
                 f"on bed {px:.1f}×{py:.1f} mm.[/red]"
             )
-            return 1
+            return finish_profile(profiler, console, 1)
 
     shadows = []
-    with _make_progress(console) as progress:
+    with profiler.stage("pass 4 footprint computation"), _make_progress(console) as progress:
         ptask = progress.add_task("Computing footprints…", total=len(final_meshes))
         for i, m in enumerate(final_meshes):
-            shadows.append(mesh_to_xy_shadow(m))
+            shadows.append(profiler.profiled_call("job.footprint", mesh_to_packing_shadow, m))
             progress.update(ptask, advance=1, description=f"Footprint: {final_names[i]}")
 
-    with _make_progress(console) as progress:
+    with profiler.stage("pass 4 packing"), _make_progress(console) as progress:
         ptask = progress.add_task("Packing…", total=len(final_meshes))
-        plates = pack_polygons_on_plates(
+        part_heights = [mesh_footprint_xy(m)[2] for m in final_meshes]
+        packing_metadata: dict[str, object] = {}
+        plates = profiler.profiled_call(
+            "job.packing",
+            pack_polygons_on_plates,
             shadows,
             px,
             py,
             gap_mm=gap_mm,
             grid_step_mm=args.grid_step_mm,
             on_placed=lambda: progress.advance(ptask),
+            part_heights=part_heights,
+            metadata=packing_metadata,
+            edge_margin_mm=edge_margin_mm,
         )
+    profile_metadata["packing"] = packing_metadata
 
     console.print(f"Plates: {len(plates)}")
     for pl in plates:
@@ -451,7 +512,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
 
     if args.dry_run:
         console.print("[dim]Dry-run: no files written.[/dim]")
-        return 0
+        return finish_profile(profiler, console, 0)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -461,14 +522,11 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         export_plate_3mf(final_meshes, pl, out_3mf, names=final_names, out_manifest=out_js)
         return out_3mf
 
-    _np = n_workers(len(plates))
-    with _make_progress(console) as progress:
+    with profiler.stage("pass 4 export"), _make_progress(console) as progress:
         ptask = progress.add_task("Exporting plates…", total=len(plates))
-        with ThreadPoolExecutor(max_workers=_np) as pool:
-            futs_ex = [pool.submit(_export_plate, pl) for pl in plates]
-            for fut_ex in as_completed(futs_ex):
-                out_path = fut_ex.result()
-                console.print(f"Wrote {out_path}")
-                progress.advance(ptask)
+        for pl in plates:
+            out_path = profiler.profiled_call("job.export", _export_plate, pl)
+            console.print(f"Wrote {out_path}")
+            progress.advance(ptask)
 
-    return 0
+    return finish_profile(profiler, console, 0)

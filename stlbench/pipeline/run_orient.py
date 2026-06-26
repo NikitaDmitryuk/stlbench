@@ -15,7 +15,14 @@ from stlbench.core.overhang import (
     find_min_overhang_rotation,
     overhang_score,
 )
-from stlbench.pipeline.common import load_named_meshes, n_workers, resolve_printer, resolve_settings
+from stlbench.pipeline.common import (
+    finish_profile,
+    load_named_meshes,
+    n_workers,
+    resolve_printer,
+    resolve_settings,
+)
+from stlbench.profiling import ProfileOptions, make_profiler
 
 _IDENTITY = np.eye(3, dtype=np.float64)
 
@@ -33,10 +40,18 @@ class OrientRunArgs:
     recursive: bool
     suffix: str
     verbose: bool = False
+    profile_options: ProfileOptions | None = None
 
 
 def run_orient(args: OrientRunArgs) -> int:
     console = Console(stderr=True)
+    profiler = make_profiler(
+        command="orient",
+        output_base=args.output_dir,
+        options=args.profile_options,
+        metadata={"input_dir": str(args.input_dir), "dry_run": args.dry_run},
+    )
+    profiler.start()
     st = args.settings or resolve_settings(args.config_path)
 
     # Printer dims are optional for orient: when provided, orientations that
@@ -47,15 +62,16 @@ def run_orient(args: OrientRunArgs) -> int:
             px, py, pz = resolve_printer(args.printer_xyz, st)
         except ValueError as e:
             console.print(f"[red]{e}[/red]")
-            return 2
+            return finish_profile(profiler, console, 2)
         printer_dims = (px, py, pz)
         if st and st.printer.name:
             console.print(f"Printer: {st.printer.name}")
         console.print(f"Build volume: {px:.1f} × {py:.1f} × {pz:.1f} mm")
 
-    loaded = load_named_meshes(args.input_dir, args.recursive, console)
+    with profiler.stage("load meshes"):
+        loaded = load_named_meshes(args.input_dir, args.recursive, console)
     if loaded is None:
-        return 1
+        return finish_profile(profiler, console, 1)
     paths, names, meshes = loaded
 
     table = Table(show_header=True, header_style="bold")
@@ -83,8 +99,8 @@ def run_orient(args: OrientRunArgs) -> int:
     _n = n_workers(len(meshes))
     if args.verbose:
         console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
-    with ThreadPoolExecutor(max_workers=_n) as pool:
-        _or = list(pool.map(_orient_one, meshes))
+    with profiler.stage("overhang search"), ThreadPoolExecutor(max_workers=_n) as pool:
+        _or = list(profiler.map(pool, "orient.search", _orient_one, meshes))
 
     results = []
     for path, name, mesh, (sb, sa, pct, rotation) in zip(paths, names, meshes, _or, strict=True):
@@ -95,7 +111,7 @@ def run_orient(args: OrientRunArgs) -> int:
     console.print(f"Overhang threshold: {args.overhang_threshold_deg}°")
 
     if args.dry_run:
-        return 0
+        return finish_profile(profiler, console, 0)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -112,17 +128,18 @@ def run_orient(args: OrientRunArgs) -> int:
         apply_min_overhang_orientation(mesh, rotation).export(out_path)
         return out_path
 
-    try:
-        _ne = n_workers(len(results))
-        if args.verbose:
-            console.print(f"[dim]export: {_ne} workers for {len(results)} meshes[/dim]")
-        with ThreadPoolExecutor(max_workers=_ne) as pool:
-            for out_path in pool.map(_export_one, results):
-                console.print(f"Wrote {out_path}")
-    except (OSError, ValueError) as e:
-        if args.verbose:
-            console.print_exception()
-        console.print(f"[red]Failed to export: {e}[/red]")
-        return 1
+    with profiler.stage("export"):
+        try:
+            _ne = n_workers(len(results))
+            if args.verbose:
+                console.print(f"[dim]export: {_ne} workers for {len(results)} meshes[/dim]")
+            with ThreadPoolExecutor(max_workers=_ne) as pool:
+                for out_path in profiler.map(pool, "orient.export", _export_one, results):
+                    console.print(f"Wrote {out_path}")
+        except (OSError, ValueError) as e:
+            if args.verbose:
+                console.print_exception()
+            console.print(f"[red]Failed to export: {e}[/red]")
+            return finish_profile(profiler, console, 1)
 
-    return 0
+    return finish_profile(profiler, console, 0)

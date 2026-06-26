@@ -1,4 +1,4 @@
-"""Full preparation pipeline: scale → orient → layout, all in memory.
+"""Full preparation pipeline: scale → orient → layout.
 
 Order rationale
 ---------------
@@ -22,9 +22,12 @@ without re-running the expensive orientation search.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,27 +43,42 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from rich.table import Table
+from shapely.geometry.base import BaseGeometry
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import (
+    ResinOrientationOptions,
     apply_min_overhang_orientation,
-    find_min_overhang_rotation,
+    find_stable_overhang_rotation,
     overhang_score,
 )
-from stlbench.export.plate import export_plate_3mf
+from stlbench.export.plate import clear_mesh_cache, export_plate_3mf_lazy
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_footprint import mesh_to_packing_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
+from stlbench.packing.rectpack_plate import PackedPlate
 from stlbench.pipeline.common import (
-    load_named_meshes,
-    n_workers,
+    finish_profile,
+    resolve_edge_margin,
     resolve_gap,
     resolve_printer,
+    resolve_resin_orientation_options,
     resolve_settings,
 )
-from stlbench.pipeline.mesh_io import load_mesh
+from stlbench.pipeline.mesh_io import (
+    SUPPORTED_EXTENSIONS,
+    collect_mesh_paths,
+    load_mesh,
+    load_mesh_with_info,
+)
+from stlbench.pipeline.resource_planner import (
+    DEFAULT_MEMORY_BUDGET_FRACTION,
+    choose_export_workers,
+    make_prepare_worker_plan,
+)
+from stlbench.profiling import ProfileOptions, make_profiler
 
 _IDENTITY3 = np.eye(3, dtype=np.float64)
 
@@ -83,6 +101,59 @@ class PrepareRunArgs:
     resume: bool = False
     cleanup: bool = False
     any_rotation: bool = False
+    workers: str = "auto"
+    profile_options: ProfileOptions | None = None
+    edge_margin_mm: float | None = None
+    resin_balance: str | None = None
+
+
+@dataclass(frozen=True)
+class PreparedMeshRef:
+    index: int
+    name: str
+    source_path: Path
+    cache_path: Path
+    dims: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class _ScaleOrientJob:
+    index: int
+    path: Path
+    px: float
+    py: float
+    pz: float
+    method: str
+    any_rotation: bool
+
+
+@dataclass(frozen=True)
+class _PrepareCacheJob:
+    index: int
+    path: Path
+    name: str
+    cache_dir: Path
+    scale_transform: np.ndarray
+    source_up: np.ndarray
+    scale: float
+    overhang_threshold_deg: float
+    n_orient_candidates: int
+    printer_xyz: tuple[float, float, float]
+    cleanup: bool
+    resin_options: ResinOrientationOptions
+
+
+@dataclass(frozen=True)
+class _ExportPlateJob:
+    plate: PackedPlate
+    refs: tuple[PreparedMeshRef, ...]
+    output_dir: Path
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _FootprintJob:
+    ref: PreparedMeshRef
 
 
 # ---------------------------------------------------------------------------
@@ -100,24 +171,22 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _save_orient_cache(
+def _cache_mesh_name(index: int, name: str) -> str:
+    return f"{index:03d}_{Path(name).stem}_oriented.stl"
+
+
+def _write_orient_cache_meta(
     cache_dir: Path,
     paths: list[Path],
     names: list[str],
-    oriented_meshes: list[trimesh.Trimesh],
+    mesh_files: list[str],
 ) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     meta: dict = {
         "input_files": {str(p): _file_sha256(p) for p in paths},
         "names": names,
+        "mesh_files": mesh_files,
     }
-    mesh_files: list[str] = []
-    for name, mesh in zip(names, oriented_meshes, strict=True):
-        stem = Path(name).stem
-        out = cache_dir / f"{stem}_oriented.stl"
-        mesh.export(str(out))
-        mesh_files.append(out.name)
-    meta["mesh_files"] = mesh_files
     (cache_dir / _CACHE_META_NAME).write_text(json.dumps(meta, indent=2))
 
 
@@ -125,7 +194,7 @@ def _load_orient_cache(
     cache_dir: Path,
     paths: list[Path],
     console: Console,
-) -> tuple[list[str], list[trimesh.Trimesh]] | None:
+) -> tuple[list[str], list[PreparedMeshRef]] | None:
     meta_path = cache_dir / _CACHE_META_NAME
     if not meta_path.exists():
         return None
@@ -144,13 +213,146 @@ def _load_orient_cache(
 
     names: list[str] = meta.get("names", [])
     mesh_files: list[str] = meta.get("mesh_files", [])
-    oriented: list[trimesh.Trimesh] = []
-    for fname in mesh_files:
+    refs: list[PreparedMeshRef] = []
+    for index, (name, source_path, fname) in enumerate(zip(names, paths, mesh_files, strict=True)):
         stl_path = cache_dir / fname
         if not stl_path.exists():
             return None
-        oriented.append(load_mesh(stl_path))
-    return names, oriented
+        mesh = load_mesh(stl_path)
+        bounds = np.asarray(mesh.bounds)
+        dims = tuple(float(v) for v in bounds[1] - bounds[0])
+        clear_mesh_cache(mesh)
+        refs.append(
+            PreparedMeshRef(
+                index=index,
+                name=name,
+                source_path=source_path,
+                cache_path=stl_path,
+                dims=dims,  # type: ignore[arg-type]
+            )
+        )
+        del mesh
+    gc.collect()
+    return names, refs
+
+
+def _scale_orientation_worker(
+    job: _ScaleOrientJob,
+) -> tuple[int, np.ndarray, tuple[float, float, float], bool, float]:
+    start = time.perf_counter()
+    m, has_multiple = load_mesh_with_info(job.path)
+    try:
+        transform, dims = select_orientation_for_scale(
+            m,
+            job.px,
+            job.py,
+            job.pz,
+            job.method,  # type: ignore[arg-type]
+            any_rotation=job.any_rotation,
+            random_samples=ORIENTATION_SAMPLES_DEFAULT,
+            seed=ORIENTATION_SEED_DEFAULT,
+            compute_printability_metrics=False,
+        )
+    finally:
+        clear_mesh_cache(m)
+        del m
+        gc.collect()
+    return job.index, transform, dims, has_multiple, time.perf_counter() - start
+
+
+def _prepare_cache_worker(
+    job: _PrepareCacheJob,
+) -> tuple[int, float, float, float, PreparedMeshRef, dict[str, float | str], float]:
+    start = time.perf_counter()
+    mesh = load_mesh(job.path)
+    try:
+        mesh.apply_transform(job.scale_transform)
+        mesh.apply_scale(job.scale)
+        mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
+        sb = overhang_score(mesh, _IDENTITY3, job.overhang_threshold_deg)
+        rotation, sa, metrics = find_stable_overhang_rotation(
+            mesh,
+            overhang_threshold_deg=job.overhang_threshold_deg,
+            n_candidates=job.n_orient_candidates,
+            printer_dims=job.printer_xyz,
+            resin_options=job.resin_options,
+            source_up=job.source_up,
+        )
+        metrics_payload: dict[str, float | str] = {
+            "selected_height_mm": metrics.height_mm,
+            "center_z_ratio": metrics.center_z_ratio,
+            "long_axis_angle_from_bed_deg": metrics.long_axis_angle_from_bed_deg,
+            "long_axis_z": metrics.long_axis_z,
+            "pca_aspect": metrics.pca_aspect,
+            "pca_line_ratio": metrics.pca_line_ratio,
+            "stability_score": metrics.stability_score,
+            "support_score_delta": metrics.support_score_delta,
+            "xy_footprint_area_mm2": metrics.xy_footprint_area_mm2,
+            "support_contact_proxy": metrics.support_contact_proxy,
+            "surface_damage_proxy": metrics.surface_damage_proxy,
+            "salient_down_area_ratio": metrics.salient_down_area_ratio,
+            "flat_safe_down_area_ratio": metrics.flat_safe_down_area_ratio,
+            "source_up_dot_build_up": metrics.source_up_dot_build_up,
+            "upside_down_penalty": metrics.upside_down_penalty,
+            "angle_band_penalty": metrics.angle_band_penalty,
+            "vertical_penalty": metrics.vertical_penalty,
+            "horizontal_penalty": metrics.horizontal_penalty,
+            "selection_reason": metrics.selection_reason,
+        }
+        pct = (sb - sa) / max(abs(sb), 1.0) * 100.0
+        oriented = apply_min_overhang_orientation(mesh, rotation)
+        if job.cleanup:
+            oriented, _n_removed = remove_small_components(oriented)
+        bounds = np.asarray(oriented.bounds)
+        dims_raw = bounds[1] - bounds[0]
+        dims = (float(dims_raw[0]), float(dims_raw[1]), float(dims_raw[2]))
+        out = job.cache_dir / _cache_mesh_name(job.index, job.name)
+        oriented.export(str(out))
+        clear_mesh_cache(oriented)
+        ref = PreparedMeshRef(
+            index=job.index,
+            name=job.name,
+            source_path=job.path,
+            cache_path=out,
+            dims=dims,
+        )
+        return job.index, sb, sa, pct, ref, metrics_payload, time.perf_counter() - start
+    finally:
+        clear_mesh_cache(mesh)
+        del mesh
+        gc.collect()
+
+
+def _export_plate_worker(job: _ExportPlateJob) -> tuple[Path, float]:
+    start = time.perf_counter()
+    refs_by_index = {ref.index: ref for ref in job.refs}
+    out_3mf = job.output_dir / f"plate_{job.plate.index + 1:02d}.3mf"
+    out_js = job.output_dir / f"plate_{job.plate.index + 1:02d}.json"
+
+    def _load_part(part_index: int) -> trimesh.Trimesh:
+        return load_mesh(refs_by_index[part_index].cache_path)
+
+    export_plate_3mf_lazy(
+        _load_part,
+        job.plate,
+        out_3mf,
+        names=list(job.names),
+        out_manifest=out_js,
+    )
+    gc.collect()
+    return out_3mf, time.perf_counter() - start
+
+
+def _footprint_worker(job: _FootprintJob) -> tuple[int, BaseGeometry, float]:
+    start = time.perf_counter()
+    mesh = load_mesh(job.ref.cache_path)
+    try:
+        shadow = mesh_to_packing_shadow(mesh)
+    finally:
+        clear_mesh_cache(mesh)
+        del mesh
+        gc.collect()
+    return job.ref.index, shadow, time.perf_counter() - start
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +371,15 @@ def _make_progress(console: Console) -> Progress:
     )
 
 
+def _fmt_bytes(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    gib = value / (1024**3)
+    if gib >= 1:
+        return f"{gib:.1f} GiB"
+    return f"{value / (1024**2):.1f} MiB"
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -176,13 +387,26 @@ def _make_progress(console: Console) -> Progress:
 
 def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     console = Console(stderr=True)
+    profile_metadata: dict[str, object] = {
+        "input_dir": str(args.input_dir),
+        "dry_run": args.dry_run,
+        "resume": args.resume,
+        "any_rotation": args.any_rotation,
+    }
+    profiler = make_profiler(
+        command="prepare",
+        output_base=args.output_dir,
+        options=args.profile_options,
+        metadata=profile_metadata,
+    )
+    profiler.start()
     st = resolve_settings(args.config_path)
 
     try:
         px_raw, py_raw, pz_raw = resolve_printer(args.printer_xyz, st)
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
-        return 2
+        return finish_profile(profiler, console, 2)
 
     post_fit_scale = (
         float(args.post_fit_scale)
@@ -190,75 +414,134 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         else (st.scaling.post_fit_scale if st else 1.0)
     )
     gap = resolve_gap(args.gap_mm, st)
+    edge_margin = resolve_edge_margin(args.edge_margin_mm, st)
+    resin_options = resolve_resin_orientation_options(args.resin_balance, st)
     method: str = args.method or "sorted"
 
     px, py, pz = px_raw, py_raw, pz_raw
+    epx = px - 2.0 * edge_margin
+    epy = py - 2.0 * edge_margin
 
     if st and st.printer.name:
         console.print(f"Printer: {st.printer.name}")
     console.print(f"Build volume: {px:.1f} × {py:.1f} × {pz:.1f} mm")
-    console.print(f"Gap: {gap} mm  |  post_fit_scale: {post_fit_scale}")
+    console.print(
+        f"Gap: {gap} mm  |  edge margin: {edge_margin} mm  |  post_fit_scale: {post_fit_scale}"
+    )
 
-    loaded = load_named_meshes(args.input_dir, args.recursive, console)
-    if loaded is None:
-        return 1
-    _paths, names, meshes = loaded
+    with profiler.stage("collect inputs"):
+        paths = collect_mesh_paths(args.input_dir, args.recursive)
+    if not paths:
+        exts = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        console.print(f"[red]No mesh files ({exts}) found under {args.input_dir}[/red]")
+        return finish_profile(profiler, console, 1)
+    names = [
+        str(p.relative_to(args.input_dir)) if p.is_relative_to(args.input_dir) else p.name
+        for p in paths
+    ]
+    try:
+        worker_plan = make_prepare_worker_plan(
+            paths,
+            requested_workers=args.workers,
+            memory_budget_fraction=DEFAULT_MEMORY_BUDGET_FRACTION,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return finish_profile(profiler, console, 2)
+    profile_metadata["resource_plan"] = worker_plan.to_json()
+    profile_metadata["orientation_options"] = {
+        "resin_balance": resin_options.resin_balance,
+        "long_part_target_angle_min_deg": resin_options.long_part_target_angle_min_deg,
+        "long_part_target_angle_max_deg": resin_options.long_part_target_angle_max_deg,
+        "long_part_low_angle_penalty_below_deg": resin_options.long_part_low_angle_penalty_below_deg,
+        "long_part_high_angle_penalty_above_deg": resin_options.long_part_high_angle_penalty_above_deg,
+    }
+    if args.verbose:
+        console.print(
+            "[dim]workers: "
+            f"scale={worker_plan.scale_workers} "
+            f"orient={worker_plan.orient_workers} "
+            f"footprint={worker_plan.footprint_workers} "
+            f"export=auto  "
+            f"RAM budget={_fmt_bytes(worker_plan.memory_budget_bytes)}  "
+            f"largest model={_fmt_bytes(worker_plan.input.largest_bytes)}[/dim]"
+        )
 
-    cache_dir = args.output_dir / "cache"
+    temp_cache: tempfile.TemporaryDirectory[str] | None = None
+    if args.dry_run and not args.resume:
+        temp_cache = tempfile.TemporaryDirectory(prefix="stlbench-prepare-")
+        cache_dir = Path(temp_cache.name)
+    else:
+        cache_dir = args.output_dir / "cache"
 
     # ──────────────────────────────────────────────────────────────────────────
     # Fast path: resume from orient cache
     # ──────────────────────────────────────────────────────────────────────────
-    oriented_meshes: list[trimesh.Trimesh] | None = None
+    prepared_refs: list[PreparedMeshRef] | None = None
     if args.resume:
-        cached = _load_orient_cache(cache_dir, _paths, console)
+        with profiler.stage("cache load"):
+            cached = _load_orient_cache(cache_dir, paths, console)
         if cached is not None:
-            names, oriented_meshes = cached
+            names, prepared_refs = cached
             console.print(
-                f"[green]Resumed from cache[/green] ({len(oriented_meshes)} meshes, "
+                f"[green]Resumed from cache[/green] ({len(prepared_refs)} meshes, "
                 f"skipping scale + orient steps)."
             )
 
-    if oriented_meshes is None:
+    if prepared_refs is None:
         # ──────────────────────────────────────────────────────────────────────
         # Step 1 – Scale
         # ──────────────────────────────────────────────────────────────────────
         console.print("\n[bold]1 / 3  Scale[/bold]")
 
-        def _select_orient(m: trimesh.Trimesh) -> tuple[np.ndarray, tuple[float, float, float]]:
-            return select_orientation_for_scale(
-                m,
-                px,
-                py,
-                pz,
-                method,  # type: ignore[arg-type]
-                any_rotation=args.any_rotation,
-                random_samples=ORIENTATION_SAMPLES_DEFAULT,
-                seed=ORIENTATION_SEED_DEFAULT,
-            )
-
-        _n = n_workers(len(meshes))
+        _n = worker_plan.scale_workers
         if args.verbose:
-            console.print(f"[dim]scale-orient: {_n} workers for {len(meshes)} meshes[/dim]")
+            console.print(f"[dim]scale-orient: {_n} workers for {len(paths)} meshes[/dim]")
 
-        _so: list = [None] * len(meshes)
-        with _make_progress(console) as progress:
-            ptask = progress.add_task("Finding scale orientations…", total=len(meshes))
-            with ThreadPoolExecutor(max_workers=_n) as pool:
-                futs_so = {pool.submit(_select_orient, m): i for i, m in enumerate(meshes)}
+        _so: list = [None] * len(paths)
+        with profiler.stage("scale orientation search"), _make_progress(console) as progress:
+            ptask = progress.add_task("Finding scale orientations…", total=len(paths))
+            with ProcessPoolExecutor(max_workers=_n, max_tasks_per_child=1) as scale_pool:
+                futs_so = {
+                    scale_pool.submit(
+                        _scale_orientation_worker,
+                        _ScaleOrientJob(
+                            index=idx,
+                            path=path,
+                            px=epx,
+                            py=epy,
+                            pz=pz,
+                            method=method,
+                            any_rotation=args.any_rotation,
+                        ),
+                    ): idx
+                    for idx, path in enumerate(paths)
+                }
                 for fut_so in as_completed(futs_so):
                     idx = futs_so[fut_so]
-                    _so[idx] = fut_so.result()
+                    try:
+                        _idx, transform, dims, has_multiple, duration_s = fut_so.result()
+                    except (OSError, ValueError, TypeError) as e:
+                        console.print(f"[red]Failed to load {paths[idx]}: {e}[/red]")
+                        return finish_profile(profiler, console, 1)
+                    profiler.record_worker("prepare.scale_orientation", duration_s)
+                    _so[idx] = (transform, dims)
+                    if has_multiple:
+                        console.print(
+                            f"[yellow]Warning: {names[idx]!r} contains multiple surfaces — "
+                            f"model may be broken (surfaces merged for processing).[/yellow]"
+                        )
                     progress.update(ptask, advance=1, description=f"Scale orient: {names[idx]}")
 
         scale_transforms = [r[0] for r in _so]
         oriented_dims = [r[1] for r in _so]
 
-        try:
-            s_max, reports = compute_global_scale((px, py, pz), oriented_dims, names, method)  # type: ignore[arg-type]
-        except ValueError as e:
-            console.print(f"[red]{e}[/red]")
-            return 1
+        with profiler.stage("scale computation"):
+            try:
+                s_max, reports = compute_global_scale((px, py, pz), oriented_dims, names, method)  # type: ignore[arg-type]
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                return finish_profile(profiler, console, 1)
 
         s_final = s_max * post_fit_scale
         lim_name = reports[0].name
@@ -273,29 +556,6 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             table.add_row(r.name, f"{sd[0]:.2f} × {sd[1]:.2f} × {sd[2]:.2f}")
         console.print(table)
 
-        def _apply_scale(m_t4: tuple[trimesh.Trimesh, np.ndarray]) -> trimesh.Trimesh:
-            m, t4 = m_t4
-            m2 = m.copy()
-            m2.apply_transform(t4)
-            m2.apply_scale(s_final)
-            m2.apply_translation([0.0, 0.0, -float(np.asarray(m2.bounds)[0, 2])])
-            return m2
-
-        scaled_meshes_list: list = [None] * len(meshes)
-        with _make_progress(console) as progress:
-            ptask = progress.add_task("Applying scale…", total=len(meshes))
-            with ThreadPoolExecutor(max_workers=_n) as pool:
-                futs_sc = {
-                    pool.submit(_apply_scale, (m, t)): i
-                    for i, (m, t) in enumerate(zip(meshes, scale_transforms, strict=True))
-                }
-                for fut_sc in as_completed(futs_sc):
-                    idx = futs_sc[fut_sc]
-                    scaled_meshes_list[idx] = fut_sc.result()
-                    progress.update(ptask, advance=1, description=f"Scaling: {names[idx]}")
-        scaled_meshes: list[trimesh.Trimesh] = scaled_meshes_list
-        del meshes
-
         # ──────────────────────────────────────────────────────────────────────
         # Step 2 – Orient for minimum supports
         # ──────────────────────────────────────────────────────────────────────
@@ -306,63 +566,100 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         orient_table.add_column("before", justify="right")
         orient_table.add_column("after", justify="right")
         orient_table.add_column("Δ", justify="right")
+        stability_table = Table(show_header=True, header_style="bold")
+        stability_table.add_column("part", max_width=42)
+        stability_table.add_column("height", justify="right")
+        stability_table.add_column("center_z", justify="right")
+        stability_table.add_column("axis angle", justify="right")
+        stability_table.add_column("contact", justify="right")
+        stability_table.add_column("damage", justify="right")
+        stability_table.add_column("up", justify="right")
+        stability_table.add_column("footprint", justify="right")
+        stability_table.add_column("score", justify="right")
+        stability_table.add_column("reason")
 
-        def _orient_one(mesh: trimesh.Trimesh) -> tuple[float, float, float, trimesh.Trimesh]:
-            sb = overhang_score(mesh, _IDENTITY3, args.overhang_threshold_deg)
-            rotation, sa = find_min_overhang_rotation(
-                mesh,
-                overhang_threshold_deg=args.overhang_threshold_deg,
-                n_candidates=args.n_orient_candidates,
-                printer_dims=(px, py, pz),
-            )
-            pct = (sb - sa) / max(abs(sb), 1.0) * 100.0
-            return sb, sa, pct, apply_min_overhang_orientation(mesh, rotation)
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Pre-populate trimesh lazy caches sequentially to prevent concurrent
-        # cache-initialization races and to reduce peak memory during threading.
-        for mesh in scaled_meshes:
-            _ = mesh.face_normals
-            _ = mesh.area_faces
-
-        _n2 = n_workers(len(scaled_meshes))
+        _n2 = worker_plan.orient_workers
         if args.verbose:
-            console.print(f"[dim]orient: {_n2} workers for {len(scaled_meshes)} meshes[/dim]")
-        _total = len(scaled_meshes)
-        _or: list = [None] * _total
+            console.print(f"[dim]orient: {_n2} workers for {len(paths)} meshes[/dim]")
 
-        with _make_progress(console) as progress:
-            ptask = progress.add_task("Orienting parts…", total=_total)
-            with ThreadPoolExecutor(max_workers=_n2) as pool:
+        _prepared: list[
+            tuple[float, float, float, PreparedMeshRef, dict[str, float | str]] | None
+        ] = [None] * len(paths)
+        with profiler.stage("scale/orient/cache"), _make_progress(console) as progress:
+            ptask = progress.add_task("Orienting parts…", total=len(paths))
+            with ProcessPoolExecutor(max_workers=_n2, max_tasks_per_child=1) as orient_pool:
                 future_to_idx = {
-                    pool.submit(_orient_one, scaled_meshes[i]): i for i in range(_total)
+                    orient_pool.submit(
+                        _prepare_cache_worker,
+                        _PrepareCacheJob(
+                            index=idx,
+                            path=path,
+                            name=names[idx],
+                            cache_dir=cache_dir,
+                            scale_transform=scale_transforms[idx],
+                            source_up=scale_transforms[idx][:3, :3]
+                            @ np.array([0.0, 0.0, 1.0], dtype=np.float64),
+                            scale=s_final,
+                            overhang_threshold_deg=args.overhang_threshold_deg,
+                            n_orient_candidates=args.n_orient_candidates,
+                            printer_xyz=(epx, epy, pz),
+                            cleanup=args.cleanup,
+                            resin_options=resin_options,
+                        ),
+                    ): idx
+                    for idx, path in enumerate(paths)
                 }
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx.pop(future)
                     try:
-                        _or[idx] = future.result()
+                        _idx, sb, sa, pct, ref, metrics_payload, duration_s = future.result()
                     except Exception as e:
                         if args.verbose:
                             console.print_exception()
                         console.print(
                             f"[red]orient failed for part {idx} ({names[idx]}): {e}[/red]"
                         )
-                        return 1
-                    scaled_meshes[idx] = None  # type: ignore[call-overload]  # release as soon as done
+                        return finish_profile(profiler, console, 1)
+                    profiler.record_worker("prepare.scale_orient_cache", duration_s)
+                    _prepared[idx] = (sb, sa, pct, ref, metrics_payload)
                     progress.update(ptask, advance=1, description=f"Oriented: {names[idx]}")
-        del scaled_meshes
 
-        oriented_meshes = []
-        for name, (sb, sa, pct, oriented) in zip(names, _or, strict=True):
+        prepared_refs = []
+        mesh_files: list[str] = []
+        orientation_metrics: list[dict[str, object]] = []
+        for name, row in zip(names, _prepared, strict=True):
+            assert row is not None
+            sb, sa, pct, ref, metrics_payload = row
             orient_table.add_row(name, f"{sb:.1f}", f"{sa:.1f}", f"{pct:+.0f}%")
-            oriented_meshes.append(oriented)
-        del _or
+            stability_table.add_row(
+                name,
+                f"{float(metrics_payload['selected_height_mm']):.2f}",
+                f"{float(metrics_payload['center_z_ratio']):.3f}",
+                f"{float(metrics_payload['long_axis_angle_from_bed_deg']):.1f}°",
+                f"{float(metrics_payload['support_contact_proxy']):.3f}",
+                f"{float(metrics_payload['surface_damage_proxy']):.3f}",
+                f"{float(metrics_payload['source_up_dot_build_up']):.2f}",
+                f"{float(metrics_payload['xy_footprint_area_mm2']):.0f}",
+                f"{float(metrics_payload['stability_score']):.3f}",
+                str(metrics_payload["selection_reason"]),
+            )
+            orientation_metrics.append({"part": name, **metrics_payload})
+            prepared_refs.append(ref)
+            mesh_files.append(ref.cache_path.name)
+        profile_metadata["orientation_stability"] = orientation_metrics
+        del _prepared
+        gc.collect()
 
         console.print(orient_table)
+        if args.verbose:
+            console.print(stability_table)
 
-        # Save intermediate results so --resume can skip steps 1–2 next run.
         if not args.dry_run:
             try:
-                _save_orient_cache(cache_dir, _paths, names, oriented_meshes)
+                with profiler.stage("cache metadata save"):
+                    _write_orient_cache_meta(cache_dir, paths, names, mesh_files)
                 console.print(f"[dim]Orient cache saved → {cache_dir}[/dim]")
             except Exception as exc:
                 console.print(f"[yellow]Warning: could not save orient cache: {exc}[/yellow]")
@@ -371,72 +668,117 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     # Step 3 – Layout
     # ──────────────────────────────────────────────────────────────────────────
     console.print("\n[bold]3 / 3  Layout[/bold]")
+    assert prepared_refs is not None
 
     # Pre-check: each part must fit the bed in at least one orientation before packing.
-    for name, m in zip(names, oriented_meshes, strict=True):
-        b = np.asarray(m.bounds)
-        dx = float(b[1, 0] - b[0, 0])
-        dy = float(b[1, 1] - b[0, 1])
-        if not ((dx <= px and dy <= py) or (dy <= px and dx <= py)):
+    epx = px - 2.0 * edge_margin
+    epy = py - 2.0 * edge_margin
+    for ref in prepared_refs:
+        dx, dy, _dz = ref.dims
+        if not ((dx <= epx and dy <= epy) or (dy <= epx and dx <= epy)):
             console.print(
-                f"[red]Part {name!r} ({dx:.1f}×{dy:.1f} mm) does not fit "
-                f"on bed {px:.1f}×{py:.1f} mm.[/red]"
+                f"[red]Part {ref.name!r} ({dx:.1f}×{dy:.1f} mm) does not fit "
+                f"on bed {epx:.1f}×{epy:.1f} mm after edge margin.[/red]"
             )
-            return 1
+            return finish_profile(profiler, console, 1)
 
-    n_parts = len(oriented_meshes)
+    n_parts = len(prepared_refs)
 
-    if args.cleanup:
-        for i, m in enumerate(oriented_meshes):
-            cleaned, n_rem = remove_small_components(m)
-            if n_rem:
-                oriented_meshes[i] = cleaned
-                console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
-
-    shadows = []
-    with _make_progress(console) as progress:
+    shadows: list[BaseGeometry | None] = [None] * n_parts
+    with profiler.stage("footprint computation"), _make_progress(console) as progress:
         ptask = progress.add_task("Computing footprints…", total=n_parts)
-        for i, m in enumerate(oriented_meshes):
-            shadows.append(mesh_to_xy_shadow(m))
-            progress.update(ptask, advance=1, description=f"Footprint: {names[i]}")
+        with ProcessPoolExecutor(
+            max_workers=worker_plan.footprint_workers,
+            max_tasks_per_child=1,
+        ) as footprint_pool:
+            footprint_futures = {
+                footprint_pool.submit(_footprint_worker, _FootprintJob(ref=ref)): ref
+                for ref in prepared_refs
+            }
+            for footprint_future in as_completed(footprint_futures):
+                ref = footprint_futures[footprint_future]
+                idx, shadow, duration_s = footprint_future.result()
+                profiler.record_worker("prepare.footprint", duration_s)
+                shadows[idx] = shadow
+                progress.update(ptask, advance=1, description=f"Footprint: {ref.name}")
+    packed_shadows = [s for s in shadows if s is not None]
+    part_heights = [ref.dims[2] for ref in prepared_refs]
+    packing_metadata: dict[str, object] = {}
 
-    with _make_progress(console) as progress:
+    with profiler.stage("packing"), _make_progress(console) as progress:
         ptask = progress.add_task("Packing…", total=n_parts)
-        plates = pack_polygons_on_plates(
-            shadows,
+        plates = profiler.profiled_call(
+            "prepare.packing",
+            pack_polygons_on_plates,
+            packed_shadows,
             px,
             py,
             gap_mm=gap,
             grid_step_mm=args.grid_step_mm,
             on_placed=lambda: progress.advance(ptask),
+            part_heights=part_heights,
+            metadata=packing_metadata,
+            edge_margin_mm=edge_margin,
         )
+    profile_metadata["packing"] = packing_metadata
 
     console.print(f"Plates: {len(plates)}")
     for pl in plates:
         console.print(f"  Plate {pl.index + 1}: {len(pl.rects)} parts")
 
     if args.dry_run:
-        return 0
+        rc = finish_profile(profiler, console, 0)
+        if temp_cache is not None:
+            temp_cache.cleanup()
+        return rc
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _export_plate(pl) -> Path:
-        out_3mf = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
-        out_js = args.output_dir / f"plate_{pl.index + 1:02d}.json"
-        export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
-        return out_3mf
-
-    _np = n_workers(len(plates))
+    export_refs = tuple(prepared_refs)
+    output_names = tuple(ref.name for ref in prepared_refs)
+    ref_size_by_index = {ref.index: ref.cache_path.stat().st_size for ref in prepared_refs}
+    plate_part_bytes = [
+        sum(ref_size_by_index.get(rect.part_index, 0) for rect in plate.rects) for plate in plates
+    ]
+    export_workers = choose_export_workers(
+        plate_part_bytes=plate_part_bytes,
+        requested_workers=args.workers,
+        memory_budget_bytes=worker_plan.memory_budget_bytes,
+        cpu_cap=worker_plan.cpu_cap,
+    )
+    profile_metadata["resource_plan"] = {
+        **worker_plan.to_json(),
+        "export_workers": export_workers,
+        "export_plate_bytes": plate_part_bytes,
+    }
     if args.verbose:
-        console.print(f"[dim]export: {_np} workers for {len(plates)} plates[/dim]")
+        console.print(
+            f"[dim]export: {export_workers} workers for {len(plates)} plates "
+            f"(largest plate={_fmt_bytes(max(plate_part_bytes, default=0))})[/dim]"
+        )
 
-    with _make_progress(console) as progress:
+    with profiler.stage("export"), _make_progress(console) as progress:
         ptask = progress.add_task("Exporting plates…", total=len(plates))
-        with ThreadPoolExecutor(max_workers=_np) as pool:
-            futs_ex = [pool.submit(_export_plate, pl) for pl in plates]
-            for fut_ex in as_completed(futs_ex):
-                out_path = fut_ex.result()
+        with ProcessPoolExecutor(
+            max_workers=export_workers,
+            max_tasks_per_child=1,
+        ) as export_pool:
+            export_futures = {
+                export_pool.submit(
+                    _export_plate_worker,
+                    _ExportPlateJob(
+                        plate=pl,
+                        refs=export_refs,
+                        output_dir=args.output_dir,
+                        names=output_names,
+                    ),
+                ): pl
+                for pl in plates
+            }
+            for export_future in as_completed(export_futures):
+                out_path, duration_s = export_future.result()
+                profiler.record_worker("prepare.export", duration_s)
                 console.print(f"Wrote {out_path}")
                 progress.advance(ptask)
 
-    return 0
+    return finish_profile(profiler, console, 0)

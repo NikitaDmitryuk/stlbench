@@ -162,9 +162,5 @@ def mesh_vertices_for_orientation(mesh: object, max_vertices: int = 80_000) -> n
     v = np.asarray(mesh.vertices, dtype=np.float64)
     if v.shape[0] <= max_vertices:
         return v
-    try:
-        hull = mesh.convex_hull
-        return np.asarray(hull.vertices, dtype=np.float64)
-    except Exception:
-        sel = np.linspace(0, v.shape[0] - 1, num=min(max_vertices, v.shape[0]), dtype=int)
-        return np.asarray(v[sel], dtype=np.float64)
+    sel = np.linspace(0, v.shape[0] - 1, num=min(max_vertices, v.shape[0]), dtype=int)
+    return np.asarray(v[sel], dtype=np.float64)

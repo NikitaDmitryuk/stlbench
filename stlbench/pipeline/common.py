@@ -7,10 +7,18 @@ import numpy as np
 import trimesh
 from rich.console import Console
 
-from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
+from stlbench.config.defaults import (
+    DEFAULT_EDGE_MARGIN_MM,
+    DEFAULT_PACKING_GAP_MM,
+    DEFAULT_RESIN_BALANCE,
+    ORIENTATION_POLICY_DEFAULT,
+    ORIENTATION_SCALE_TOLERANCE_DEFAULT,
+)
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import AppSettings
+from stlbench.core.overhang import ResinOrientationOptions
 from stlbench.pipeline.mesh_io import SUPPORTED_EXTENSIONS, collect_mesh_paths, load_mesh_with_info
+from stlbench.profiling import Profiler
 
 
 def n_workers(n_items: int) -> int:
@@ -48,6 +56,44 @@ def resolve_gap(gap_mm: float | None, settings: AppSettings | None) -> float:
     if settings is not None:
         return settings.packing.gap_mm
     return DEFAULT_PACKING_GAP_MM
+
+
+def resolve_edge_margin(edge_margin_mm: float | None, settings: AppSettings | None) -> float:
+    if edge_margin_mm is not None:
+        return float(edge_margin_mm)
+    if settings is not None:
+        return settings.packing.edge_margin_mm
+    return DEFAULT_EDGE_MARGIN_MM
+
+
+def resolve_resin_orientation_options(
+    resin_balance: str | None,
+    settings: AppSettings | None,
+) -> ResinOrientationOptions:
+    if settings is not None:
+        source = settings.orientation
+        return ResinOrientationOptions(
+            resin_balance=resin_balance or source.resin_balance,
+            long_part_target_angle_min_deg=source.long_part_target_angle_min_deg,
+            long_part_target_angle_max_deg=source.long_part_target_angle_max_deg,
+            long_part_low_angle_penalty_below_deg=source.long_part_low_angle_penalty_below_deg,
+            long_part_high_angle_penalty_above_deg=source.long_part_high_angle_penalty_above_deg,
+        )
+    return ResinOrientationOptions(resin_balance=resin_balance or DEFAULT_RESIN_BALANCE)
+
+
+def resolve_orientation_policy(policy: str | None) -> str:
+    out = policy or ORIENTATION_POLICY_DEFAULT
+    if out not in {"printable", "max-scale"}:
+        raise ValueError("--orientation-policy must be printable or max-scale.")
+    return out
+
+
+def resolve_orientation_scale_tolerance(value: float | None) -> float:
+    out = ORIENTATION_SCALE_TOLERANCE_DEFAULT if value is None else float(value)
+    if not (0 < out <= 1):
+        raise ValueError("--orientation-scale-tolerance must be in (0, 1].")
+    return out
 
 
 def rotation_to_4x4(r3: np.ndarray) -> np.ndarray:
@@ -89,3 +135,9 @@ def load_named_meshes(
         names.append(name)
         meshes.append(m)
     return paths, names, meshes
+
+
+def finish_profile(profiler: Profiler, console: Console, return_code: int) -> int:
+    status = "ok" if return_code == 0 else "error"
+    profiler.finish(status=status, return_code=return_code, console=console)
+    return return_code
