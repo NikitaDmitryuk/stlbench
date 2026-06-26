@@ -216,13 +216,23 @@ __marimo__/
 .streamlit/secrets.toml
 
 # stlbench example outputs
+*.stl
+*.3mf
+*.obj
+*.ply
+*.glb
+*.gltf
+examples/kratos/
+examples/roman/
 examples/gandalf/scaled/
+examples/gandalf/oriented/
 examples/gandalf/plates/
+examples/gandalf/job_out/
 examples/gandalf/autopack/
 examples/gandalf/fill_*/
 examples/gandalf/prepare/
 
 # macOS
 .DS_Store
-.idea
+.idea/
 trash/

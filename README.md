@@ -83,7 +83,47 @@ Runs the three preparation steps in the optimal order for resin printing:
 Exports one `plate_NN.3mf` + `plate_NN.json` manifest per plate.
 
 Key options: `--overhang-angle` (default 45°), `--orient-candidates` (default 200),
-`--gap-mm`, `--post-fit-scale`, `--dry-run`, `--recursive`, `--resume`.
+`--gap-mm`, `--edge-margin-mm`, `--resin-balance`, `--workers`,
+`--post-fit-scale`, `--dry-run`, `--recursive`, `--resume`, `--profile`.
+
+## Orientation and packing principles
+
+`prepare`, `job`, and `autopack --orient` use a resin-oriented multi-objective
+heuristic. The goals are ordered by practical printing risk:
+
+1. **Hard safety constraints** — every candidate orientation must fit the printer
+   volume, and final layout must keep strict `gap_mm`, `edge_margin_mm`, and bed
+   bounds. If a part cannot fit inside the effective bed, the run fails instead of
+   silently writing an unsafe plate.
+2. **Support-aware orientation** — candidates are scored by downward overhang area
+   and support-contact proxy. Large flat low-detail areas are considered safer
+   places for support scars than curved or high-relief surfaces.
+3. **Source-up and surface protection** — the original STL `+Z` direction is treated
+   as the model's natural "up". The scorer penalises candidates that put the original
+   top or high-saliency detail toward the build plate, so figurine heads, faces, and
+   visible surfaces are less likely to receive supports when comparable alternatives
+   exist.
+4. **Long thin parts** — line-like parts such as spears are kept in a balanced
+   `30–50°` angle band by default. This avoids both failure modes: almost vertical
+   tips with too few supports, and fully horizontal shafts with supports along the
+   whole length.
+5. **Plate count and layout quality** — after orientation, layout first minimises the
+   number of plates, then tries to keep similar-height parts together, then spreads
+   parts across the available area. The packer validates every accepted placement
+   with real polygon clearances before export.
+
+The main user-facing orientation knob is `resin_balance`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `balanced` | Default. Keeps the trade-off between support quality, plate count, and cleanup effort. |
+| `stability` | Gives more weight to support/surface safety, allowing somewhat larger footprints. |
+| `compact` | Gives more weight to footprint and plate count, while still penalising high-damage surfaces. |
+
+Profiling (`--profile`) writes `profile.json`, `profile.txt`, and `profile.pstats`.
+The JSON includes orientation diagnostics such as `source_up_dot_build_up`,
+`surface_damage_proxy`, `support_contact_proxy`, selected height, long-axis angle,
+and the `selection_reason` used for each part.
 
 ---
 
@@ -140,7 +180,7 @@ Global scale is computed once across **all** parts that include the `scale` step
 they all receive exactly the same scale factor.
 
 Key options: `--candidates`, `--overhang-angle`, `--rotation-samples`,
-`--grid-step`, `--dry-run`, `--verbose`.
+`--grid-step`, `--edge-margin-mm`, `--resin-balance`, `--dry-run`, `--verbose`.
 
 ---
 
@@ -212,7 +252,10 @@ stlbench orient -i ./parts -o ./oriented -c my_printer.toml
 For each STL file, searches for the rotation that minimises overhanging surface area
 (faces whose downward angle exceeds the threshold). Uses a two-phase search: discrete
 evaluation of candidate orientations derived from the model's face normals, followed
-by Nelder-Mead local refinement. The result is written with the bottom at z = 0.
+by Nelder-Mead local refinement. The standalone `orient` command is intentionally
+support-focused; the richer resin balance and surface-protection heuristics are used
+by the full pipeline commands that know the scale/layout context. The result is
+written with the bottom at z = 0.
 
 When `--config` or `--printer` is supplied, the search is constrained to orientations
 that fit inside the build volume.
@@ -232,7 +275,7 @@ Arranges already-scaled STL files onto rectangular print plates. Exports
 `plate_NN.3mf` + `plate_NN.json` with part positions. Multiple plates are created
 if all parts do not fit on one.
 
-Key options: `--dry-run`, `--gap-mm`, `--algorithm`, `--any-rotation`.
+Key options: `--dry-run`, `--gap-mm`, `--edge-margin-mm`, `--any-rotation`.
 
 ---
 
@@ -247,7 +290,7 @@ plate simultaneously. Combines `scale` and `layout` into one step with the goal 
 keeping everything on one plate.
 
 Key options: `--orient/--no-orient`, `--overhang-angle`, `--any-rotation`, `--dry-run`,
-`--gap-mm`, `--post-fit-scale`.
+`--gap-mm`, `--edge-margin-mm`, `--resin-balance`, `--post-fit-scale`.
 
 ---
 
@@ -271,8 +314,9 @@ Key options: `--scale/--no-scale`, `--orient/--no-orient`, `--overhang-angle`,
 stlbench config init -o my_printer.toml
 ```
 
-Writes a printer profile TOML with `[printer]`, `[scaling]`, and `[packing]` sections.
-Use `--stdout` to print without saving, or `--force` to overwrite.
+Writes a printer profile TOML with `[printer]`, `[scaling]`, `[packing]`, and
+`[orientation]` sections. Use `--stdout` to print without saving, or `--force` to
+overwrite.
 
 ### `config job` — Create a job-file template
 
@@ -281,8 +325,9 @@ stlbench config job -o job.toml
 ```
 
 Writes a job-file template with all sections pre-filled: `[printer]`, `[scaling]`,
-`[packing]`, `[pipeline]`, and two commented-out `[[parts]]` examples. Edit the file,
-fill in your STL paths, then run `stlbench job job.toml -o ./plates`.
+`[packing]`, `[orientation]`, `[pipeline]`, and two commented-out `[[parts]]`
+examples. Edit the file, fill in your STL paths, then run
+`stlbench job job.toml -o ./plates`.
 
 ## Configuration
 
@@ -294,7 +339,8 @@ see [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml) for a complete exampl
 |--------------|-------------------------------------------------------------------------------|--------------------------------------|
 | `[printer]`  | `name`, `width_mm`, `depth_mm`, `height_mm`                                   | Build volume (required)              |
 | `[scaling]`  | `post_fit_scale` (>0), `any_rotation`, `maximize`                             | Scale behaviour (see `scale` command) |
-| `[packing]`  | `gap_mm`                                                                      | Surface-to-surface gap between parts |
+| `[packing]`  | `gap_mm`, `edge_margin_mm`                                                    | Part-to-part gap and inset from bed edge |
+| `[orientation]` | `resin_balance`, long-part angle thresholds                               | Resin orientation trade-offs |
 | `[pipeline]` | `default_steps`                                                               | Default step list for `job` command  |
 | `[[parts]]`  | `path`, `steps`                                                               | Per-part entries for `job` command   |
 

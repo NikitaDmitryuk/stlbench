@@ -6,12 +6,20 @@ import pytest
 import trimesh
 from shapely.geometry import Polygon, box
 
-from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_footprint import mesh_to_packing_shadow, mesh_to_xy_shadow
 from stlbench.packing.polygon_pack import (
+    _compact_plates,
+    _grid_fallback_place,
+    _height_score,
+    _poly_to_int,
+    _spread_score,
+    _within_bed,
     footprints_to_box_polygons,
     pack_polygons_on_plates,
+    placed_polygon_from_rect,
     try_pack_polygons_single_plate,
 )
+from stlbench.packing.rectpack_plate import PackedPlate, PackedRect
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,6 +51,39 @@ def _flat_box_mesh(w: float, h: float, z: float = 1.0) -> trimesh.Trimesh:
     return mesh
 
 
+def _placed_polygons(plate, polys):
+    return [placed_polygon_from_rect(polys[r.part_index], r) for r in plate.rects]
+
+
+def _min_distance_on_plate(plate, polys) -> float:
+    placed = _placed_polygons(plate, polys)
+    out = float("inf")
+    for i, p0 in enumerate(placed):
+        for p1 in placed[i + 1 :]:
+            out = min(out, p0.distance(p1))
+    return out
+
+
+def _corner_plate_with_center_space() -> tuple[list[Polygon], PackedPlate]:
+    polys = [
+        _box_poly(20.0, 20.0),
+        _box_poly(20.0, 20.0),
+        _box_poly(20.0, 20.0),
+        _box_poly(20.0, 20.0),
+        _box_poly(8.0, 8.0),
+    ]
+    plate = PackedPlate(
+        index=0,
+        rects=(
+            PackedRect(part_index=0, x=0.0, y=0.0, width=20.0, height=20.0),
+            PackedRect(part_index=1, x=80.0, y=0.0, width=20.0, height=20.0),
+            PackedRect(part_index=2, x=0.0, y=40.0, width=20.0, height=20.0),
+            PackedRect(part_index=3, x=80.0, y=40.0, width=20.0, height=20.0),
+        ),
+    )
+    return polys, plate
+
+
 # ---------------------------------------------------------------------------
 # polygon_footprint.mesh_to_xy_shadow
 # ---------------------------------------------------------------------------
@@ -61,6 +102,29 @@ def test_shadow_is_not_empty():
     shadow = mesh_to_xy_shadow(mesh)
     assert not shadow.is_empty
     assert shadow.area > 0
+
+
+def test_packing_shadow_is_conservative_and_compact():
+    mesh = _flat_box_mesh(20.0, 30.0)
+    exact = mesh_to_xy_shadow(mesh, simplify_tol=0.0)
+    packing = mesh_to_packing_shadow(mesh, simplify_tol=0.25)
+
+    assert packing.area == pytest.approx(exact.area, abs=40.0)
+    assert packing.bounds == pytest.approx(exact.bounds, abs=0.5)
+    assert len(packing.exterior.coords) <= len(exact.exterior.coords) + 16
+
+
+def test_packing_shadow_bounds_do_not_shrink_exact_mesh_bounds():
+    mesh = _flat_box_mesh(20.0, 30.0)
+    exact = mesh_to_xy_shadow(mesh, simplify_tol=0.0)
+    packing = mesh_to_packing_shadow(mesh, simplify_tol=0.25)
+
+    eminx, eminy, emaxx, emaxy = exact.bounds
+    pminx, pminy, pmaxx, pmaxy = packing.bounds
+    assert pminx <= eminx + 1e-9
+    assert pminy <= eminy + 1e-9
+    assert pmaxx >= emaxx - 1e-9
+    assert pmaxy >= emaxy - 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +160,39 @@ def test_parts_overflow_to_second_plate():
     assert len(plates) >= 2
 
 
+def test_balanced_strategy_groups_similar_heights_without_more_plates():
+    polys = [_box_poly(40.0, 20.0) for _ in range(4)]
+    heights = [100.0, 10.0, 95.0, 8.0]
+
+    greedy = pack_polygons_on_plates(
+        polys,
+        bed_w=90.0,
+        bed_h=30.0,
+        gap_mm=5.0,
+        part_heights=heights,
+        strategy="greedy",
+    )
+    balanced = pack_polygons_on_plates(
+        polys,
+        bed_w=90.0,
+        bed_h=30.0,
+        gap_mm=5.0,
+        part_heights=heights,
+    )
+
+    assert len(balanced) == len(greedy) == 2
+    assert _height_score(balanced, heights) < _height_score(greedy, heights)
+
+
+def test_part_heights_none_keeps_old_api_shape():
+    polys = [_box_poly(10.0, 10.0), _box_poly(20.0, 5.0)]
+
+    plates = pack_polygons_on_plates(polys, bed_w=100.0, bed_h=100.0, gap_mm=1.0)
+
+    assert len(plates) == 1
+    assert sorted(r.part_index for r in plates[0].rects) == [0, 1]
+
+
 def test_oversized_part_raises():
     polys = [_box_poly(200.0, 10.0)]
     with pytest.raises(RuntimeError, match="does not fit"):
@@ -105,6 +202,39 @@ def test_oversized_part_raises():
 def test_empty_input_returns_empty():
     plates = pack_polygons_on_plates([], bed_w=100.0, bed_h=100.0, gap_mm=1.0)
     assert plates == []
+
+
+def test_edge_margin_offsets_final_rects_inside_full_bed():
+    polys = [_box_poly(20.0, 20.0), _box_poly(15.0, 10.0)]
+
+    plates = pack_polygons_on_plates(
+        polys,
+        bed_w=60.0,
+        bed_h=50.0,
+        gap_mm=2.0,
+        edge_margin_mm=2.0,
+    )
+
+    assert len(plates) == 1
+    for placed in _placed_polygons(plates[0], polys):
+        minx, miny, maxx, maxy = placed.bounds
+        assert minx >= 2.0 - 1e-6
+        assert miny >= 2.0 - 1e-6
+        assert maxx <= 58.0 + 1e-6
+        assert maxy <= 48.0 + 1e-6
+
+
+def test_edge_margin_reduces_printable_area_for_fit_check():
+    polys = [_box_poly(97.0, 20.0)]
+
+    with pytest.raises(RuntimeError, match="after edge margin"):
+        pack_polygons_on_plates(
+            polys,
+            bed_w=100.0,
+            bed_h=50.0,
+            gap_mm=1.0,
+            edge_margin_mm=2.0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -118,23 +248,115 @@ def test_gap_is_enforced_between_two_rects():
     polys = [_box_poly(40.0, 40.0), _box_poly(40.0, 40.0)]
     plates = pack_polygons_on_plates(polys, bed_w=100.0, bed_h=100.0, gap_mm=gap)
     assert len(plates) == 1
-    r0, r1 = plates[0].rects[0], plates[0].rects[1]
-    # Reconstruct placed polygons from PackedRect position.
-    from shapely import affinity
+    assert _min_distance_on_plate(plates[0], polys) >= gap - 1e-3
 
-    from stlbench.packing.polygon_pack import _normalize
 
-    def placed(r):
-        from shapely import affinity as aff
+def test_strict_gap_is_enforced_for_rotated_complex_polygons():
+    gap = 5.0
+    polys = [
+        _l_shape_poly(outer=55.0, inner=30.0),
+        Polygon([(0, 0), (42, 4), (38, 30), (6, 34)]),
+        _box_poly(22.0, 18.0),
+        Polygon([(0, 0), (30, 0), (22, 16), (4, 20)]),
+    ]
 
-        s = _normalize(polys[r.part_index])
-        if abs(r.rotation_deg) > 1e-9:
-            s = _normalize(aff.rotate(s, r.rotation_deg, origin=(0, 0)))
-        return affinity.translate(s, r.x, r.y)
+    plates = pack_polygons_on_plates(polys, bed_w=120.0, bed_h=90.0, gap_mm=gap)
 
-    p0 = placed(r0)
-    p1 = placed(r1)
-    assert p0.distance(p1) >= gap - 1e-3
+    for plate in plates:
+        if len(plate.rects) > 1:
+            assert _min_distance_on_plate(plate, polys) >= gap - 1e-3
+
+
+def test_grid_fallback_finds_interior_free_space():
+    polys, plate = _corner_plate_with_center_space()
+    placed = _placed_polygons(plate, polys)
+
+    result = _grid_fallback_place(
+        polys[4],
+        4,
+        placed,
+        bed_w=100.0,
+        bed_h=60.0,
+        gap_mm=10.0,
+        grid_step_mm=2.0,
+    )
+
+    assert result is not None
+    rect, placed_poly = result
+    assert rect.part_index == 4
+    assert all(placed_poly.distance(existing) >= 10.0 - 1e-3 for existing in placed)
+
+
+def test_sparse_tail_plate_is_compacted_when_gap_allows():
+    polys, first_plate = _corner_plate_with_center_space()
+    second_plate = PackedPlate(
+        index=1,
+        rects=(PackedRect(part_index=4, x=0.0, y=0.0, width=8.0, height=8.0),),
+    )
+
+    compacted = _compact_plates(
+        [first_plate, second_plate],
+        polys,
+        bed_w=100.0,
+        bed_h=60.0,
+        gap_mm=10.0,
+        grid_step_mm=2.0,
+    )
+
+    assert len(compacted) == 1
+    assert len(compacted[0].rects) == 5
+    assert _min_distance_on_plate(compacted[0], polys) >= 10.0 - 1e-3
+
+
+def test_reflow_preserves_gap_and_does_not_reduce_spread():
+    polys = [_box_poly(10.0, 10.0) for _ in range(4)]
+
+    greedy = pack_polygons_on_plates(
+        polys,
+        bed_w=80.0,
+        bed_h=80.0,
+        gap_mm=5.0,
+        strategy="greedy",
+    )
+    balanced = pack_polygons_on_plates(
+        polys,
+        bed_w=80.0,
+        bed_h=80.0,
+        gap_mm=5.0,
+        strategy="balanced",
+    )
+
+    assert len(balanced) == len(greedy)
+    assert _spread_score(balanced, polys) >= _spread_score(greedy, polys)
+    for plate in balanced:
+        assert _min_distance_on_plate(plate, polys) >= 5.0 - 1e-3
+        for placed in _placed_polygons(plate, polys):
+            assert _within_bed(placed, bed_w=80.0, bed_h=80.0)
+
+
+def test_placed_polygon_from_rect_matches_rect_transform():
+    poly = _box_poly(10.0, 20.0)
+    plates = pack_polygons_on_plates([poly], bed_w=100.0, bed_h=100.0, gap_mm=5.0)
+    rect = plates[0].rects[0]
+
+    placed = placed_polygon_from_rect(poly, rect)
+
+    minx, miny, maxx, maxy = placed.bounds
+    assert minx == pytest.approx(rect.x)
+    assert miny == pytest.approx(rect.y)
+    assert maxx - minx == pytest.approx(rect.width)
+    assert maxy - miny == pytest.approx(rect.height)
+
+
+def test_candidate_must_stay_inside_bed_bounds():
+    assert _within_bed(_box_poly(10.0, 10.0), bed_w=10.0, bed_h=10.0)
+    assert not _within_bed(box(0.0, 0.0, 10.002, 10.0), bed_w=10.0, bed_h=10.0)
+
+
+def test_poly_to_int_rounds_instead_of_truncating():
+    poly = Polygon([(0.0006, 0.0), (1.0004, 0.0), (0.0, 1.0006)])
+
+    assert _poly_to_int(poly) == [(1, 0), (1000, 0), (0, 1001)]
 
 
 # ---------------------------------------------------------------------------

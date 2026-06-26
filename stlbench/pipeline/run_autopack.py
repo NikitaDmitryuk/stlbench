@@ -12,10 +12,10 @@ from rich.table import Table
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
-from stlbench.core.overhang import find_min_overhang_rotation
-from stlbench.export.plate import export_plate_3mf
+from stlbench.core.overhang import find_stable_overhang_rotation
+from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.packing.polygon_footprint import mesh_to_xy_shadow
+from stlbench.packing.polygon_footprint import mesh_to_packing_shadow
 from stlbench.packing.polygon_pack import (
     footprints_to_box_polygons,
     pack_polygons_on_plates,
@@ -23,12 +23,18 @@ from stlbench.packing.polygon_pack import (
 )
 from stlbench.packing.rectpack_plate import PackedPlate
 from stlbench.pipeline.common import (
+    finish_profile,
     load_named_meshes,
     n_workers,
+    resolve_edge_margin,
     resolve_gap,
+    resolve_orientation_policy,
+    resolve_orientation_scale_tolerance,
     resolve_printer,
+    resolve_resin_orientation_options,
     resolve_settings,
 )
+from stlbench.profiling import ProfileOptions, make_profiler
 
 
 @dataclass
@@ -44,8 +50,15 @@ class AutopackRunArgs:
     dry_run: bool
     recursive: bool
     any_rotation: bool = False
+    maximize: bool = False
+    orientation_policy: str | None = None
+    orientation_scale_tolerance: float | None = None
+    rotation_samples: int | None = None
     verbose: bool = False
     cleanup: bool = False
+    profile_options: ProfileOptions | None = None
+    edge_margin_mm: float | None = None
+    resin_balance: str | None = None
 
 
 def _try_pack_all(
@@ -91,27 +104,58 @@ def _bisect_scale(
 
 def run_autopack(args: AutopackRunArgs) -> int:
     console = Console(stderr=True)
+    profile_metadata: dict[str, object] = {
+        "input_dir": str(args.input_dir),
+        "dry_run": args.dry_run,
+        "any_rotation": args.any_rotation,
+        "maximize": args.maximize,
+    }
+    profiler = make_profiler(
+        command="autopack",
+        output_base=args.output_dir,
+        options=args.profile_options,
+        metadata=profile_metadata,
+    )
+    profiler.start()
     st = resolve_settings(args.config_path)
+
+    if args.maximize and not args.any_rotation:
+        console.print("[red]--maximize requires --any-rotation[/red]")
+        return finish_profile(profiler, console, 2)
 
     try:
         px, py, pz = resolve_printer(args.printer_xyz, st)
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
-        return 2
+        return finish_profile(profiler, console, 2)
 
     gap = resolve_gap(args.gap_mm, st)
+    edge_margin = resolve_edge_margin(args.edge_margin_mm, st)
+    resin_options = resolve_resin_orientation_options(args.resin_balance, st)
     post_fit_scale = (
         float(args.post_fit_scale)
         if args.post_fit_scale is not None
         else (st.scaling.post_fit_scale if st else 1.0)
     )
+    try:
+        orientation_policy = resolve_orientation_policy(args.orientation_policy)
+        scale_tolerance = resolve_orientation_scale_tolerance(args.orientation_scale_tolerance)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return finish_profile(profiler, console, 2)
+    rot_samples = (
+        int(args.rotation_samples)
+        if args.rotation_samples is not None
+        else ORIENTATION_SAMPLES_DEFAULT
+    )
 
-    loaded = load_named_meshes(args.input_dir, args.recursive, console)
+    with profiler.stage("load meshes"):
+        loaded = load_named_meshes(args.input_dir, args.recursive, console)
     if loaded is None:
-        return 1
+        return finish_profile(profiler, console, 1)
     _paths, names, meshes = loaded
 
-    epx, epy, epz = px, py, pz
+    epx, epy, epz = px - 2.0 * edge_margin, py - 2.0 * edge_margin, pz
 
     # Find best print orientation per mesh and collect raw file dims in one pass.
     # --orient: minimise overhangs (support-optimised) → use oriented AABB dims.
@@ -123,10 +167,12 @@ def run_autopack(args: AutopackRunArgs) -> int:
             m: trimesh.Trimesh,
         ) -> tuple[tuple[float, float, float], np.ndarray, tuple[float, float, float]]:
             file_d = aabb_edge_lengths(np.asarray(m.bounds))
-            rotation, _ = find_min_overhang_rotation(
+            rotation, _, _metrics = find_stable_overhang_rotation(
                 m,
                 overhang_threshold_deg=args.orient_threshold_deg,
                 printer_dims=(epx, epy, epz),
+                resin_options=resin_options,
+                source_up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
             )
             t4 = np.eye(4, dtype=np.float64)
             t4[:3, :3] = rotation
@@ -147,8 +193,11 @@ def run_autopack(args: AutopackRunArgs) -> int:
                 epz,
                 "sorted",
                 any_rotation=args.any_rotation,
-                random_samples=ORIENTATION_SAMPLES_DEFAULT,
+                maximize=args.maximize,
+                random_samples=rot_samples,
                 seed=ORIENTATION_SEED_DEFAULT,
+                policy=orientation_policy,  # type: ignore[arg-type]
+                scale_tolerance=scale_tolerance,
             )
             return file_d, t4, ext
 
@@ -160,24 +209,26 @@ def run_autopack(args: AutopackRunArgs) -> int:
     _n = n_workers(len(meshes))
     if args.verbose:
         console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
-    with ThreadPoolExecutor(max_workers=_n) as pool:
-        _results = list(pool.map(_orient_one, meshes))
+    with profiler.stage("orientation search"), ThreadPoolExecutor(max_workers=_n) as pool:
+        _results = list(profiler.map(pool, "autopack.orientation", _orient_one, meshes))
 
     dims_list: list[tuple[float, float, float]] = [r[0] for r in _results]
     orient_transforms: list[np.ndarray] = [r[1] for r in _results]
     oriented_dims: list[tuple[float, float, float]] = [r[2] for r in _results]
 
-    s_upper, _ = compute_global_scale((epx, epy, epz), oriented_dims, names, "sorted")
-    s_upper *= post_fit_scale
+    with profiler.stage("scale upper bound"):
+        s_upper, _ = compute_global_scale((epx, epy, epz), oriented_dims, names, "sorted")
+        s_upper *= post_fit_scale
 
     # (ex, ey) is the XY footprint after the orientation transform
     base_footprints: list[tuple[float, float]] = [(ex, ey) for ex, ey, _ez in oriented_dims]
 
-    s_best, plate = _bisect_scale(base_footprints, epx, epy, gap, s_upper)
+    with profiler.stage("bbox pack bisection"):
+        s_best, plate = _bisect_scale(base_footprints, epx, epy, gap, s_upper)
 
     if plate is None or s_best <= 0:
         console.print("[red]Cannot fit all parts on one plate at any scale.[/red]")
-        return 1
+        return finish_profile(profiler, console, 1)
 
     console.print(f"Optimal scale (all parts on one plate): {s_best:.6f}")
     console.print(f"Parts: {len(names)}")
@@ -194,7 +245,7 @@ def run_autopack(args: AutopackRunArgs) -> int:
     console.print(table)
 
     if args.dry_run:
-        return 0
+        return finish_profile(profiler, console, 0)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,27 +259,56 @@ def run_autopack(args: AutopackRunArgs) -> int:
 
     if args.verbose:
         console.print(f"[dim]scale: {_n} workers for {len(meshes)} meshes[/dim]")
-    with ThreadPoolExecutor(max_workers=_n) as pool:
+    with profiler.stage("apply scale"), ThreadPoolExecutor(max_workers=_n) as pool:
         scaled_meshes: list[trimesh.Trimesh] = list(
-            pool.map(_apply_scale, zip(meshes, orient_transforms, strict=True))
+            profiler.map(
+                pool,
+                "autopack.apply_scale",
+                _apply_scale,
+                zip(meshes, orient_transforms, strict=True),
+            )
         )
 
     if args.cleanup:
-        for i, m in enumerate(scaled_meshes):
-            cleaned, n_rem = remove_small_components(m)
-            if n_rem:
-                scaled_meshes[i] = cleaned
-                console.print(f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]")
+        with profiler.stage("cleanup"):
+            for i, m in enumerate(scaled_meshes):
+                cleaned, n_rem = remove_small_components(m)
+                if n_rem:
+                    scaled_meshes[i] = cleaned
+                    console.print(
+                        f"[dim]cleanup: {names[i]} — removed {n_rem} tiny component(s)[/dim]"
+                    )
 
     # Repack with exact XY shadows for tighter nesting.
     # The bisection used bounding boxes (fast); this single pass uses exact shadows.
-    shadows = [mesh_to_xy_shadow(m) for m in scaled_meshes]
-    exact_plates = pack_polygons_on_plates(shadows, epx, epy, gap_mm=gap)
-    final_plate = exact_plates[0] if exact_plates else plate
+    with profiler.stage("exact footprint computation"):
+        shadows = [
+            profiler.profiled_call("autopack.exact_footprint", mesh_to_packing_shadow, m)
+            for m in scaled_meshes
+        ]
+    with profiler.stage("exact packing"):
+        part_heights = [mesh_footprint_xy(m)[2] for m in scaled_meshes]
+        packing_metadata: dict[str, object] = {}
+        exact_plates = profiler.profiled_call(
+            "autopack.exact_packing",
+            pack_polygons_on_plates,
+            shadows,
+            px,
+            py,
+            gap_mm=gap,
+            part_heights=part_heights,
+            metadata=packing_metadata,
+            edge_margin_mm=edge_margin,
+        )
+        profile_metadata["packing"] = packing_metadata
+        final_plate = exact_plates[0] if exact_plates else plate
 
-    out_3mf = args.output_dir / "autopack_plate.3mf"
-    out_json = args.output_dir / "autopack_plate.json"
-    export_plate_3mf(scaled_meshes, final_plate, out_3mf, names=list(names), out_manifest=out_json)
+    with profiler.stage("export"):
+        out_3mf = args.output_dir / "autopack_plate.3mf"
+        out_json = args.output_dir / "autopack_plate.json"
+        export_plate_3mf(
+            scaled_meshes, final_plate, out_3mf, names=list(names), out_manifest=out_json
+        )
     console.print(f"Wrote {out_3mf}")
     console.print(f"Wrote {out_json}")
-    return 0
+    return finish_profile(profiler, console, 0)

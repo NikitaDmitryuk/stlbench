@@ -12,13 +12,21 @@ height_mm = 165.0
 post_fit_scale = 0.95
 # Allow any 3D orientation (all axis permutations) for scale fitting.
 # false = Z-axis rotation only (default). Set true when models have no pre-placed supports.
-any_rotation = false
+any_rotation = true
 # Full SO(3) random search (4096 samples) to maximise scale factor.
 # Requires any_rotation = true. Slow; produces arbitrary tilt angles.
-maximize = false
+maximize = true
 
 [packing]
-gap_mm = 5.0
+gap_mm = 10.0
+edge_margin_mm = 2.0
+
+[orientation]
+resin_balance = "balanced"
+long_part_target_angle_min_deg = 30.0
+long_part_target_angle_max_deg = 50.0
+long_part_low_angle_penalty_below_deg = 20.0
+long_part_high_angle_penalty_above_deg = 60.0
 
 [pipeline]
 # Default step sequence for parts that do not specify their own steps in a job file.

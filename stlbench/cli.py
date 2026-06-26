@@ -19,6 +19,7 @@ from stlbench.pipeline.run_layout import LayoutRunArgs, run_layout
 from stlbench.pipeline.run_orient import OrientRunArgs, run_orient
 from stlbench.pipeline.run_prepare import PrepareRunArgs, run_prepare
 from stlbench.pipeline.run_scale import ScaleRunArgs, run_scale
+from stlbench.profiling import ProfileOptions
 
 _ROOT_HELP = """\
 STL preparation for resin 3D printing: prepare, job, scale, layout, fill, autopack, orient, info.
@@ -61,6 +62,20 @@ app = typer.Typer(no_args_is_help=True, help=_ROOT_HELP)
 
 config_app = typer.Typer(help="Generate TOML configuration files.")
 app.add_typer(config_app, name="config")
+
+
+def _profile_options(
+    enabled: bool,
+    profile_dir: Path | None,
+    sort: str,
+    limit: int,
+) -> ProfileOptions:
+    return ProfileOptions(
+        enabled=enabled,
+        profile_dir=profile_dir,
+        sort=sort,
+        limit=limit,
+    )
 
 
 @config_app.command("init")
@@ -189,6 +204,17 @@ def cmd_scale(
             help="Use full SO(3) random search to maximise scale factor (requires --any-rotation).",
         ),
     ] = False,
+    orientation_policy: Annotated[
+        str | None,
+        typer.Option("--orientation-policy", help="Orientation scoring: printable or max-scale."),
+    ] = None,
+    orientation_scale_tolerance: Annotated[
+        float | None,
+        typer.Option(
+            "--orientation-scale-tolerance",
+            help="Keep printable candidates within this fraction of max scale.",
+        ),
+    ] = None,
     scale_factor: Annotated[
         float | None,
         typer.Option(
@@ -204,6 +230,12 @@ def cmd_scale(
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     st = load_app_settings(config) if config else None
     pr = _parse_printer_opt(printer)
@@ -219,6 +251,8 @@ def cmd_scale(
                 method=method,
                 any_rotation=any_rotation,
                 maximize=maximize,
+                orientation_policy=orientation_policy,
+                orientation_scale_tolerance=orientation_scale_tolerance,
                 scale_factor=scale_factor,
                 rotation_samples=rotation_samples,
                 no_upscale=no_upscale,
@@ -226,6 +260,7 @@ def cmd_scale(
                 recursive=recursive,
                 suffix=suffix,
                 verbose=verbose,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )
@@ -247,6 +282,7 @@ def cmd_layout(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
+    edge_margin_mm: Annotated[float | None, typer.Option("--edge-margin-mm")] = None,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     cleanup: Annotated[
@@ -260,6 +296,24 @@ def cmd_layout(
             help="Allow any 3D orientation when finding layout transform. By default only Z-axis rotation is searched.",
         ),
     ] = False,
+    orientation_policy: Annotated[
+        str | None,
+        typer.Option("--orientation-policy", help="Orientation scoring: printable or max-scale."),
+    ] = None,
+    orientation_scale_tolerance: Annotated[
+        float | None,
+        typer.Option("--orientation-scale-tolerance"),
+    ] = None,
+    rotation_samples: Annotated[
+        int | None,
+        typer.Option("--rotation-samples", help="SO(3) samples for scale orientation search."),
+    ] = None,
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -270,10 +324,15 @@ def cmd_layout(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
+                edge_margin_mm=edge_margin_mm,
                 recursive=recursive,
                 dry_run=dry_run,
                 cleanup=cleanup,
                 any_rotation=any_rotation,
+                orientation_policy=orientation_policy,
+                orientation_scale_tolerance=orientation_scale_tolerance,
+                rotation_samples=rotation_samples,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )
@@ -318,6 +377,24 @@ def cmd_fill(
             help="Allow any 3D orientation when finding layout transform. By default only Z-axis rotation is searched.",
         ),
     ] = False,
+    orientation_policy: Annotated[
+        str | None,
+        typer.Option("--orientation-policy", help="Orientation scoring: printable or max-scale."),
+    ] = None,
+    orientation_scale_tolerance: Annotated[
+        float | None,
+        typer.Option("--orientation-scale-tolerance"),
+    ] = None,
+    rotation_samples: Annotated[
+        int | None,
+        typer.Option("--rotation-samples", help="SO(3) samples for scale orientation search."),
+    ] = None,
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -334,6 +411,10 @@ def cmd_fill(
                 dry_run=dry_run,
                 cleanup=cleanup,
                 any_rotation=any_rotation,
+                orientation_policy=orientation_policy,
+                orientation_scale_tolerance=orientation_scale_tolerance,
+                rotation_samples=rotation_samples,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )
@@ -355,6 +436,13 @@ def cmd_autopack(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
+    edge_margin_mm: Annotated[float | None, typer.Option("--edge-margin-mm")] = None,
+    resin_balance: Annotated[
+        str | None,
+        typer.Option(
+            "--resin-balance", help="Orientation balance: balanced, stability, or compact."
+        ),
+    ] = None,
     post_fit_scale: Annotated[
         float | None,
         typer.Option(
@@ -386,6 +474,31 @@ def cmd_autopack(
             help="Allow any 3D orientation for scale fitting. By default only Z-axis rotation is searched.",
         ),
     ] = False,
+    maximize: Annotated[
+        bool,
+        typer.Option(
+            "--maximize/--no-maximize",
+            help="Use full SO(3) random search to maximise scale factor (requires --any-rotation).",
+        ),
+    ] = False,
+    orientation_policy: Annotated[
+        str | None,
+        typer.Option("--orientation-policy", help="Orientation scoring: printable or max-scale."),
+    ] = None,
+    orientation_scale_tolerance: Annotated[
+        float | None,
+        typer.Option("--orientation-scale-tolerance"),
+    ] = None,
+    rotation_samples: Annotated[
+        int | None,
+        typer.Option("--rotation-samples", help="SO(3) samples for scale orientation search."),
+    ] = None,
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -396,6 +509,8 @@ def cmd_autopack(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
+                edge_margin_mm=edge_margin_mm,
+                resin_balance=resin_balance,
                 post_fit_scale=post_fit_scale,
                 orient_on=orient,
                 orient_threshold_deg=overhang_angle,
@@ -404,6 +519,11 @@ def cmd_autopack(
                 verbose=verbose,
                 cleanup=cleanup,
                 any_rotation=any_rotation,
+                maximize=maximize,
+                orientation_policy=orientation_policy,
+                orientation_scale_tolerance=orientation_scale_tolerance,
+                rotation_samples=rotation_samples,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )
@@ -446,6 +566,12 @@ def cmd_orient(
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -462,6 +588,7 @@ def cmd_orient(
                 recursive=recursive,
                 suffix=suffix,
                 verbose=verbose,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )
@@ -483,6 +610,13 @@ def cmd_prepare(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     gap_mm: Annotated[float | None, typer.Option("--gap-mm")] = None,
+    edge_margin_mm: Annotated[float | None, typer.Option("--edge-margin-mm")] = None,
+    resin_balance: Annotated[
+        str | None,
+        typer.Option(
+            "--resin-balance", help="Orientation balance: balanced, stability, or compact."
+        ),
+    ] = None,
     post_fit_scale: Annotated[
         float | None,
         typer.Option(
@@ -527,6 +661,19 @@ def cmd_prepare(
             help="Allow any 3D orientation for scale fitting step. By default only Z-axis rotation is searched.",
         ),
     ] = False,
+    workers: Annotated[
+        str,
+        typer.Option(
+            "--workers",
+            help="Worker count for heavy prepare stages: 'auto' or a positive integer.",
+        ),
+    ] = "auto",
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -537,6 +684,8 @@ def cmd_prepare(
                 config_path=config,
                 printer_xyz=pr,
                 gap_mm=gap_mm,
+                edge_margin_mm=edge_margin_mm,
+                resin_balance=resin_balance,
                 post_fit_scale=post_fit_scale,
                 method=method,
                 overhang_threshold_deg=overhang_angle,
@@ -548,6 +697,8 @@ def cmd_prepare(
                 resume=resume,
                 cleanup=cleanup,
                 any_rotation=any_rotation,
+                workers=workers,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )
@@ -568,6 +719,12 @@ def cmd_info(
         typer.Option("-p", "--printer", help="Px,Py,Pz"),
     ] = None,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     pr = _parse_printer_opt(printer)
     raise typer.Exit(
@@ -577,6 +734,7 @@ def cmd_info(
                 config_path=config,
                 printer_xyz=pr,
                 recursive=recursive,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )
@@ -607,6 +765,13 @@ def job(
         float,
         typer.Option("--grid-step", help="Packing grid step in mm (layout step)."),
     ] = 2.0,
+    edge_margin_mm: Annotated[float | None, typer.Option("--edge-margin-mm")] = None,
+    resin_balance: Annotated[
+        str | None,
+        typer.Option(
+            "--resin-balance", help="Orientation balance: balanced, stability, or compact."
+        ),
+    ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", help="Show extra diagnostics.")] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Simulate without writing files.")
@@ -615,6 +780,12 @@ def job(
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
     ] = False,
+    profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
+    profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
+    profile_sort: Annotated[
+        str, typer.Option("--profile-sort", help="cumulative, tottime, or calls.")
+    ] = "cumulative",
+    profile_limit: Annotated[int, typer.Option("--profile-limit")] = 50,
 ) -> None:
     """Run a per-part configurable pipeline from a job TOML file.
 
@@ -645,9 +816,12 @@ def job(
                 overhang_threshold_deg=overhang_angle,
                 rotation_samples=rotation_samples,
                 grid_step_mm=grid_step,
+                edge_margin_mm=edge_margin_mm,
+                resin_balance=resin_balance,
                 verbose=verbose,
                 dry_run=dry_run,
                 cleanup=cleanup,
+                profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
     )

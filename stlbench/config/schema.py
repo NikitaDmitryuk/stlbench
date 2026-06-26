@@ -21,6 +21,25 @@ class ScalingSection(BaseModel):
 
 class PackingSection(BaseModel):
     gap_mm: float = Field(default=2.0, ge=0.0)
+    edge_margin_mm: float = Field(default=2.0, ge=0.0)
+
+
+class OrientationSection(BaseModel):
+    resin_balance: str = Field(default="balanced", pattern="^(balanced|stability|compact)$")
+    long_part_target_angle_min_deg: float = Field(default=30.0, ge=0.0, le=90.0)
+    long_part_target_angle_max_deg: float = Field(default=50.0, ge=0.0, le=90.0)
+    long_part_low_angle_penalty_below_deg: float = Field(default=20.0, ge=0.0, le=90.0)
+    long_part_high_angle_penalty_above_deg: float = Field(default=60.0, ge=0.0, le=90.0)
+
+    @model_validator(mode="after")
+    def _validate_angles(self) -> OrientationSection:
+        if self.long_part_target_angle_min_deg > self.long_part_target_angle_max_deg:
+            raise ValueError("orientation long part target min angle must be <= max angle")
+        if self.long_part_low_angle_penalty_below_deg > self.long_part_target_angle_min_deg:
+            raise ValueError("orientation low angle penalty threshold must be <= target min angle")
+        if self.long_part_high_angle_penalty_above_deg < self.long_part_target_angle_max_deg:
+            raise ValueError("orientation high angle penalty threshold must be >= target max angle")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -110,5 +129,6 @@ class AppSettings(BaseModel):
     printer: PrinterSection
     scaling: ScalingSection = Field(default_factory=ScalingSection)
     packing: PackingSection = Field(default_factory=PackingSection)
+    orientation: OrientationSection = Field(default_factory=OrientationSection)
     pipeline: PipelineSection = Field(default_factory=PipelineSection)
     parts: list[PartSpec] = []

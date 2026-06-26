@@ -4,6 +4,7 @@ import numpy as np
 import shapely
 import trimesh
 from shapely.geometry import MultiPoint, Polygon
+from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
 
 # Threshold above which we skip the union-of-triangles approach and use the
@@ -111,3 +112,47 @@ def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseG
         shadow = shadow.simplify(simplify_tol, preserve_topology=True)
 
     return shadow
+
+
+def mesh_to_packing_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.25) -> BaseGeometry:
+    """Return a bounded XY shadow for memory-safe packing.
+
+    The raw mesh shadow can contain many vertices and explode GEOS memory when
+    every placement stores exact polygons.  This helper keeps the geometry
+    compact while staying conservative: simplification is followed by a small
+    outward buffer, so bed-fit checks cannot be based on a footprint smaller
+    than the mesh that will be exported.
+    """
+    tol = max(0.0, float(simplify_tol))
+    shadow = mesh_to_xy_shadow(mesh, simplify_tol=tol)
+    if shadow.is_empty or tol <= 0:
+        return shadow
+
+    # Raw mesh bounds are cheap to compute and match the exporter, which places
+    # meshes by their actual XY bounding box after the selected Z rotation.
+    xy = np.asarray(mesh.vertices[:, :2], dtype=np.float64)
+    if len(xy) < 1:
+        return shadow
+    minx, miny = np.min(xy, axis=0)
+    maxx, maxy = np.max(xy, axis=0)
+    exact_bounds = (float(minx), float(miny), float(maxx), float(maxy))
+
+    exact_bbox = shapely_box(*exact_bounds)
+    conservative = shadow.buffer(tol, quad_segs=2).intersection(exact_bbox)
+    if not conservative.is_valid:
+        conservative = conservative.buffer(0)
+    if conservative.is_empty:
+        conservative = shadow
+
+    cminx, cminy, cmaxx, cmaxy = conservative.bounds
+    if (
+        cminx > exact_bounds[0]
+        or cminy > exact_bounds[1]
+        or cmaxx < exact_bounds[2]
+        or cmaxy < exact_bounds[3]
+    ):
+        conservative = conservative.union(exact_bbox)
+        if not conservative.is_valid:
+            conservative = conservative.buffer(0)
+
+    return conservative

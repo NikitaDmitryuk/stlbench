@@ -19,6 +19,7 @@ def load_app_settings(path: Path) -> AppSettings:
         "printer": printer,
         "scaling": raw.get("scaling") or {},
         "packing": raw.get("packing") or {},
+        "orientation": raw.get("orientation") or {},
         "pipeline": raw.get("pipeline") or {},
         "parts": raw.get("parts") or [],
     }

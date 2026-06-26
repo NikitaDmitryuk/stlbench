@@ -22,8 +22,16 @@ from stlbench.core.fit import (
     limiting_part_index,
 )
 from stlbench.packing.layout_orientation import select_orientation_for_scale
-from stlbench.pipeline.common import load_named_meshes, n_workers, resolve_printer
+from stlbench.pipeline.common import (
+    finish_profile,
+    load_named_meshes,
+    n_workers,
+    resolve_orientation_policy,
+    resolve_orientation_scale_tolerance,
+    resolve_printer,
+)
 from stlbench.pipeline.mesh_io import load_mesh
+from stlbench.profiling import ProfileOptions, make_profiler
 
 
 @dataclass
@@ -37,6 +45,8 @@ class ScaleRunArgs:
     method: str | None
     any_rotation: bool = False
     maximize: bool = False
+    orientation_policy: str | None = None
+    orientation_scale_tolerance: float | None = None
     scale_factor: float | None = None
     rotation_samples: int | None = None
     no_upscale: bool = False
@@ -44,10 +54,23 @@ class ScaleRunArgs:
     recursive: bool = False
     suffix: str = ""
     verbose: bool = False
+    profile_options: ProfileOptions | None = None
 
 
 def run_scale(args: ScaleRunArgs) -> int:
     console = Console(stderr=True)
+    profiler = make_profiler(
+        command="scale",
+        output_base=args.output_dir,
+        options=args.profile_options,
+        metadata={
+            "input_dir": str(args.input_dir),
+            "dry_run": args.dry_run,
+            "any_rotation": args.any_rotation,
+            "maximize": args.maximize,
+        },
+    )
+    profiler.start()
     st = args.settings
 
     # ── Validation ────────────────────────────────────────────────────────────
@@ -56,7 +79,13 @@ def run_scale(args: ScaleRunArgs) -> int:
             "[red]--maximize requires --any-rotation "
             "(full SO(3) search requires unrestricted orientation)[/red]"
         )
-        return 2
+        return finish_profile(profiler, console, 2)
+    try:
+        orientation_policy = resolve_orientation_policy(args.orientation_policy)
+        scale_tolerance = resolve_orientation_scale_tolerance(args.orientation_scale_tolerance)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return finish_profile(profiler, console, 2)
 
     # ── Printer / post_fit_scale ─────────────────────────────────────────────
     # scale_factor bypasses fit-to-printer entirely, so printer dims are optional.
@@ -65,7 +94,7 @@ def run_scale(args: ScaleRunArgs) -> int:
             prx, pry, prz = resolve_printer(args.printer_xyz, st)
         except ValueError as e:
             console.print(f"[red]{e}[/red]")
-            return 2
+            return finish_profile(profiler, console, 2)
     else:
         # Printer dims may still be provided (used only for display / validation).
         try:
@@ -92,11 +121,12 @@ def run_scale(args: ScaleRunArgs) -> int:
     output_dir = args.output_dir
     if not input_dir.is_dir():
         console.print(f"[red]Input is not a directory: {input_dir}[/red]")
-        return 2
+        return finish_profile(profiler, console, 2)
 
-    loaded = load_named_meshes(input_dir, args.recursive, console)
+    with profiler.stage("load meshes"):
+        loaded = load_named_meshes(input_dir, args.recursive, console)
     if loaded is None:
-        return 1
+        return finish_profile(profiler, console, 1)
     paths, part_names, meshes = loaded
     del loaded
 
@@ -116,13 +146,15 @@ def run_scale(args: ScaleRunArgs) -> int:
             maximize=args.maximize,
             random_samples=rot_samples,
             seed=seed,
+            policy=orientation_policy,  # type: ignore[arg-type]
+            scale_tolerance=scale_tolerance,
         )
 
     _n = n_workers(len(meshes))
     if args.verbose:
         console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
-    with ThreadPoolExecutor(max_workers=_n) as pool:
-        _results = list(pool.map(_select_orient, meshes))
+    with profiler.stage("orientation search"), ThreadPoolExecutor(max_workers=_n) as pool:
+        _results = list(profiler.map(pool, "scale.orientation", _select_orient, meshes))
     transforms: list[np.ndarray] = [r[0] for r in _results]
     parts_dims: list[tuple[float, float, float]] = [r[1] for r in _results]
 
@@ -143,17 +175,18 @@ def run_scale(args: ScaleRunArgs) -> int:
         console.print(f"post_fit_scale: {post_fit_scale:.6f}")
         console.print(f"s_final (applied): {s_final:.6f}")
     else:
-        try:
-            s_max, reports = compute_global_scale(
-                (px, py, pz),
-                parts_dims,
-                part_names,
-                method_s,
-                file_dims=file_dims_for_report,
-            )
-        except ValueError as e:
-            console.print(f"[red]{e}[/red]")
-            return 1
+        with profiler.stage("scale computation"):
+            try:
+                s_max, reports = compute_global_scale(
+                    (px, py, pz),
+                    parts_dims,
+                    part_names,
+                    method_s,
+                    file_dims=file_dims_for_report,
+                )
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                return finish_profile(profiler, console, 1)
 
         s_after = min(1.0, s_max) if args.no_upscale else s_max
         s_final = s_after * post_fit_scale
@@ -164,6 +197,7 @@ def run_scale(args: ScaleRunArgs) -> int:
             console.print(f"Printer profile: {st.printer.name}")
         console.print(f"Printer: {px:.4f} x {py:.4f} x {pz:.4f}")
         console.print(f"Method: {method_s}")
+        console.print(f"Orientation policy: {orientation_policy}, tolerance: {scale_tolerance:.3f}")
         if args.any_rotation:
             mode = "maximize" if args.maximize else "axis-permutations"
             console.print(f"Rotation: {mode}")
@@ -204,40 +238,41 @@ def run_scale(args: ScaleRunArgs) -> int:
         console.print(table)
 
     if args.dry_run:
-        return 0
+        return finish_profile(profiler, console, 0)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    with profiler.stage("export"):
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, path in enumerate(paths):
-        if args.recursive:
-            rel_parent = path.parent.relative_to(input_dir)
-            out_sub = output_dir / rel_parent
-            out_sub.mkdir(parents=True, exist_ok=True)
-            out_dir = out_sub
-        else:
-            out_dir = output_dir
-        stem = path.stem + args.suffix
-        out_path = out_dir / f"{stem}.stl"
+        for idx, path in enumerate(paths):
+            if args.recursive:
+                rel_parent = path.parent.relative_to(input_dir)
+                out_sub = output_dir / rel_parent
+                out_sub.mkdir(parents=True, exist_ok=True)
+                out_dir = out_sub
+            else:
+                out_dir = output_dir
+            stem = path.stem + args.suffix
+            out_path = out_dir / f"{stem}.stl"
 
-        if args.verbose:
-            console.print(f"[dim]  [{idx + 1}/{len(paths)}] exporting {path.name}[/dim]")
-        mesh = load_mesh(path)
-        t4 = transforms[idx]
-        if not np.allclose(t4, np.eye(4)):
-            mesh.apply_transform(t4)
-        mesh.apply_scale(s_final)
-        if not np.allclose(t4, np.eye(4)):
-            # Rotation around world origin shifts the mesh's XY position; restore
-            # AABB min to origin so the output sits on the build plate as expected.
-            b = np.asarray(mesh.bounds)
-            if not np.allclose(b[0], np.zeros(3), atol=1e-6):
-                mesh.apply_translation(-b[0])
+            if args.verbose:
+                console.print(f"[dim]  [{idx + 1}/{len(paths)}] exporting {path.name}[/dim]")
+            mesh = load_mesh(path)
+            t4 = transforms[idx]
+            if not np.allclose(t4, np.eye(4)):
+                mesh.apply_transform(t4)
+            mesh.apply_scale(s_final)
+            if not np.allclose(t4, np.eye(4)):
+                # Rotation around world origin shifts the mesh's XY position; restore
+                # AABB min to origin so the output sits on the build plate as expected.
+                b = np.asarray(mesh.bounds)
+                if not np.allclose(b[0], np.zeros(3), atol=1e-6):
+                    mesh.apply_translation(-b[0])
 
-        try:
-            mesh.export(out_path)
-        except (OSError, ValueError) as e:
-            console.print(f"[red]Failed to export {out_path}: {e}[/red]")
-            return 1
-        console.print(f"Wrote {out_path}")
+            try:
+                mesh.export(out_path)
+            except (OSError, ValueError) as e:
+                console.print(f"[red]Failed to export {out_path}: {e}[/red]")
+                return finish_profile(profiler, console, 1)
+            console.print(f"Wrote {out_path}")
 
-    return 0
+    return finish_profile(profiler, console, 0)

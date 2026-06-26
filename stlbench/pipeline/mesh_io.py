@@ -56,7 +56,7 @@ def load_mesh_with_info(path: Path) -> tuple[trimesh.Trimesh, bool]:
     if path.suffix.lower() == ".fbx":
         return _load_mesh_pymeshlab(path), False
 
-    loaded = trimesh.load(path, force="mesh")
+    loaded = trimesh.load(path, force="mesh", process=False)
     if isinstance(loaded, trimesh.Scene):
         geom = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if not geom:

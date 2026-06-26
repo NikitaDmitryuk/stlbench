@@ -22,8 +22,16 @@ from stlbench.packing.rectpack_plate import (
     int_bin_dims_mm,
     int_rect_dims_mm,
 )
-from stlbench.pipeline.common import resolve_gap, resolve_printer, resolve_settings
+from stlbench.pipeline.common import (
+    finish_profile,
+    resolve_gap,
+    resolve_orientation_policy,
+    resolve_orientation_scale_tolerance,
+    resolve_printer,
+    resolve_settings,
+)
 from stlbench.pipeline.mesh_io import collect_mesh_paths, load_mesh
+from stlbench.profiling import ProfileOptions, make_profiler
 
 
 @dataclass
@@ -39,6 +47,10 @@ class FillRunArgs:
     dry_run: bool
     cleanup: bool = False
     any_rotation: bool = False
+    orientation_policy: str | None = None
+    orientation_scale_tolerance: float | None = None
+    rotation_samples: int | None = None
+    profile_options: ProfileOptions | None = None
 
 
 def _max_copies_on_plate(
@@ -110,15 +122,28 @@ def _max_copies_on_plate(
 
 def run_fill(args: FillRunArgs) -> int:
     console = Console(stderr=True)
+    profiler = make_profiler(
+        command="fill",
+        output_base=args.output_dir,
+        options=args.profile_options,
+        metadata={"input": str(args.input_file), "dry_run": args.dry_run},
+    )
+    profiler.start()
     st = resolve_settings(args.config_path)
 
     try:
         px, py, pz = resolve_printer(args.printer_xyz, st)
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
-        return 2
+        return finish_profile(profiler, console, 2)
 
     gap = resolve_gap(args.gap_mm, st)
+    try:
+        orientation_policy = resolve_orientation_policy(args.orientation_policy)
+        scale_tolerance = resolve_orientation_scale_tolerance(args.orientation_scale_tolerance)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return finish_profile(profiler, console, 2)
 
     inp = args.input_file
     if inp.is_dir():
@@ -127,125 +152,140 @@ def run_fill(args: FillRunArgs) -> int:
             console.print(
                 f"[red]fill expects exactly one mesh file (found {len(found)} in {inp}).[/red]"
             )
-            return 2
+            return finish_profile(profiler, console, 2)
         inp = found[0]
 
     if not inp.is_file():
         console.print(f"[red]File not found: {inp}[/red]")
-        return 2
+        return finish_profile(profiler, console, 2)
 
-    try:
-        mesh = load_mesh(inp)
-    except (OSError, ValueError, TypeError) as e:
-        console.print(f"[red]Failed to load {inp}: {e}[/red]")
-        return 1
+    with profiler.stage("load mesh"):
+        try:
+            mesh = load_mesh(inp)
+        except (OSError, ValueError, TypeError) as e:
+            console.print(f"[red]Failed to load {inp}: {e}[/red]")
+            return finish_profile(profiler, console, 1)
 
     if args.cleanup:
-        mesh, n_rem = remove_small_components(mesh)
-        if n_rem:
-            console.print(f"[dim]cleanup: {inp.name} — removed {n_rem} tiny component(s)[/dim]")
+        with profiler.stage("cleanup"):
+            mesh, n_rem = remove_small_components(mesh)
+            if n_rem:
+                console.print(f"[dim]cleanup: {inp.name} — removed {n_rem} tiny component(s)[/dim]")
 
     if args.scale:
-        dims = aabb_edge_lengths(np.asarray(mesh.bounds))
-        s, _ = compute_global_scale((px, py, pz), [dims], [inp.name], "sorted")
-        pf = st.scaling.post_fit_scale if st else 1.0
-        s_final = s * pf
-        mesh.apply_scale(s_final)
+        with profiler.stage("scale"):
+            dims = aabb_edge_lengths(np.asarray(mesh.bounds))
+            s, _ = compute_global_scale((px, py, pz), [dims], [inp.name], "sorted")
+            pf = st.scaling.post_fit_scale if st else 1.0
+            s_final = s * pf
+            mesh.apply_scale(s_final)
         console.print(f"Scaled {inp.name} by {s_final:.6f}")
 
     if args.orient_on:
-        rotation, score = find_min_overhang_rotation(
-            mesh,
-            overhang_threshold_deg=args.orient_threshold_deg,
-            printer_dims=(px, py, pz),
-        )
-        mesh = apply_min_overhang_orientation(mesh, rotation)
+        with profiler.stage("overhang orientation"):
+            rotation, score = find_min_overhang_rotation(
+                mesh,
+                overhang_threshold_deg=args.orient_threshold_deg,
+                printer_dims=(px, py, pz),
+            )
+            mesh = apply_min_overhang_orientation(mesh, rotation)
         console.print(f"Overhang score after orient: {score:.1f}")
 
-    rot_samples = ORIENTATION_SAMPLES_DEFAULT
+    rot_samples = (
+        int(args.rotation_samples)
+        if args.rotation_samples is not None
+        else ORIENTATION_SAMPLES_DEFAULT
+    )
     rot_seed = ORIENTATION_SEED_DEFAULT
 
-    ok, transform, fw, fh = select_layout_transform(
-        mesh,
-        px,
-        py,
-        pz,
-        gap,
-        random_samples=rot_samples,
-        seed=rot_seed,
-        any_rotation=args.any_rotation,
-    )
+    with profiler.stage("layout orientation"):
+        ok, transform, fw, fh = profiler.profiled_call(
+            "fill.layout_orientation",
+            select_layout_transform,
+            mesh,
+            px,
+            py,
+            pz,
+            gap,
+            random_samples=rot_samples,
+            seed=rot_seed,
+            any_rotation=args.any_rotation,
+            policy=orientation_policy,
+            scale_tolerance=scale_tolerance,
+        )
     if not ok:
         console.print("[red]Part does not fit on the bed in any orientation.[/red]")
-        return 1
+        return finish_profile(profiler, console, 1)
 
     mesh.apply_transform(transform)
     _, _, dz = mesh_footprint_xy(mesh)
     console.print(f"Part footprint: {fw:.2f} x {fh:.2f} mm, height: {dz:.2f} mm")
 
-    plate = _max_copies_on_plate(fw, fh, px, py, gap)
+    with profiler.stage("packing"):
+        plate = profiler.profiled_call("fill.packing", _max_copies_on_plate, fw, fh, px, py, gap)
     if plate is None:
         console.print("[red]Part does not fit on the bed.[/red]")
-        return 1
+        return finish_profile(profiler, console, 1)
 
     n = len(plate.rects)
     console.print(f"Copies that fit: {n}")
 
     if args.dry_run:
-        return 0
+        return finish_profile(profiler, console, 0)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with profiler.stage("export"):
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    fill_meshes = []
-    fill_transforms = []
-    fill_names = []
-    for i, r in enumerate(plate.rects):
-        m = mesh.copy()
-        m.apply_translation(
-            [-float(m.bounds[0][0]), -float(m.bounds[0][1]), -float(m.bounds[0][2])]
-        )
-        if abs(r.rotation_deg) > 1e-9:
-            rot = np.array(
-                trimesh.transformations.rotation_matrix(
-                    np.radians(r.rotation_deg), [0.0, 0.0, 1.0]
-                ),
-                dtype=np.float64,
+        fill_meshes = []
+        fill_transforms = []
+        fill_names = []
+        for i, r in enumerate(plate.rects):
+            m = mesh.copy()
+            m.apply_translation(
+                [-float(m.bounds[0][0]), -float(m.bounds[0][1]), -float(m.bounds[0][2])]
             )
-            m.apply_transform(rot)
-            m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
-        t = np.eye(4, dtype=np.float64)
-        t[0, 3] = r.x
-        t[1, 3] = r.y
-        fill_meshes.append(m)
-        fill_transforms.append(t)
-        fill_names.append(f"copy_{i:02d}")
+            if abs(r.rotation_deg) > 1e-9:
+                rot = np.array(
+                    trimesh.transformations.rotation_matrix(
+                        np.radians(r.rotation_deg), [0.0, 0.0, 1.0]
+                    ),
+                    dtype=np.float64,
+                )
+                m.apply_transform(rot)
+                m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
+            t = np.eye(4, dtype=np.float64)
+            t[0, 3] = r.x
+            t[1, 3] = r.y
+            fill_meshes.append(m)
+            fill_transforms.append(t)
+            fill_names.append(f"copy_{i:02d}")
 
-    out_3mf = args.output_dir / "fill_plate.3mf"
-    out_json = args.output_dir / "fill_plate.json"
-    scene = trimesh.Scene()
-    for m, tf, name in zip(fill_meshes, fill_transforms, fill_names, strict=True):
-        scene.add_geometry(m, geom_name=name, transform=tf)
-    scene.export(str(out_3mf))
+        out_3mf = args.output_dir / "fill_plate.3mf"
+        out_json = args.output_dir / "fill_plate.json"
+        scene = trimesh.Scene()
+        for m, tf, name in zip(fill_meshes, fill_transforms, fill_names, strict=True):
+            scene.add_geometry(m, geom_name=name, transform=tf)
+        scene.export(str(out_3mf))
 
-    manifest = {
-        "source": inp.name,
-        "copies": n,
-        "bed_mm": [px, py, pz],
-        "gap_mm": gap,
-        "parts": [
-            {
-                "copy": i,
-                "x_mm": r.x,
-                "y_mm": r.y,
-                "footprint_w_mm": r.width,
-                "footprint_h_mm": r.height,
-                "rotation_deg": r.rotation_deg,
-            }
-            for i, r in enumerate(plate.rects)
-        ],
-    }
-    out_json.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        manifest = {
+            "source": inp.name,
+            "copies": n,
+            "bed_mm": [px, py, pz],
+            "gap_mm": gap,
+            "parts": [
+                {
+                    "copy": i,
+                    "x_mm": r.x,
+                    "y_mm": r.y,
+                    "footprint_w_mm": r.width,
+                    "footprint_h_mm": r.height,
+                    "rotation_deg": r.rotation_deg,
+                }
+                for i, r in enumerate(plate.rects)
+            ],
+        }
+        out_json.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     console.print(f"Wrote {out_3mf}  ({n} copies)")
     console.print(f"Wrote {out_json}")
-    return 0
+    return finish_profile(profiler, console, 0)
