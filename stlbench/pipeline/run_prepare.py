@@ -25,6 +25,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import pickle
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -34,45 +35,58 @@ from pathlib import Path
 import numpy as np
 import trimesh
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 from rich.table import Table
+from shapely import affinity
+from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
+from stlbench.core.mesh_repair import RepairOptions, RepairReport, repair_report_step
 from stlbench.core.overhang import (
     ResinOrientationOptions,
     apply_min_overhang_orientation,
     find_stable_overhang_rotation,
     overhang_score,
+    rotation_to_transform4,
 )
 from stlbench.export.plate import clear_mesh_cache, export_plate_3mf_lazy
+from stlbench.export.transform_log import (
+    bounds_to_list,
+    mesh_bounds,
+    placement_transform_for_mesh,
+    transform_bounds,
+    transform_entry,
+    transform_step,
+    translation_matrix,
+    uniform_scale_matrix,
+    write_transform_log,
+)
+from stlbench.packing.bitmap_pack import BitmapPackOptions, pack_polygons_bitmap_single_plate
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.packing.polygon_footprint import mesh_to_packing_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
-from stlbench.packing.rectpack_plate import PackedPlate
+from stlbench.packing.rectpack_plate import PackedPlate, PackedRect
 from stlbench.pipeline.common import (
     finish_profile,
+    load_mesh_with_repair,
+    repair_cache_dir_for_output,
     resolve_edge_margin,
     resolve_gap,
     resolve_printer,
+    resolve_repair_cache_enabled,
+    resolve_repair_options,
     resolve_resin_orientation_options,
     resolve_settings,
+    write_command_repair_report,
 )
 from stlbench.pipeline.mesh_io import (
     SUPPORTED_EXTENSIONS,
     collect_mesh_paths,
     load_mesh,
-    load_mesh_with_info,
 )
+from stlbench.pipeline.progress import make_progress
 from stlbench.pipeline.resource_planner import (
     DEFAULT_MEMORY_BUDGET_FRACTION,
     choose_export_workers,
@@ -105,6 +119,14 @@ class PrepareRunArgs:
     profile_options: ProfileOptions | None = None
     edge_margin_mm: float | None = None
     resin_balance: str | None = None
+    repair: bool = False
+    repair_cache: bool = True
+    packer: str | None = None
+    bitmap_grid_mm: float | None = None
+    bitmap_beam_width: int | None = None
+    packing_result_cache: bool = True
+    footprint_cache: bool = True
+    progress: bool = True
 
 
 @dataclass(frozen=True)
@@ -114,6 +136,9 @@ class PreparedMeshRef:
     source_path: Path
     cache_path: Path
     dims: tuple[float, float, float]
+    source_to_cache_matrix: np.ndarray | None = None
+    transform_steps: tuple[dict[str, object], ...] = ()
+    source_transform_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -125,6 +150,9 @@ class _ScaleOrientJob:
     pz: float
     method: str
     any_rotation: bool
+    repair_options: RepairOptions
+    name: str
+    repair_cache_dir: Path | None
 
 
 @dataclass(frozen=True)
@@ -141,6 +169,8 @@ class _PrepareCacheJob:
     printer_xyz: tuple[float, float, float]
     cleanup: bool
     resin_options: ResinOrientationOptions
+    repair_options: RepairOptions
+    repair_cache_dir: Path | None
 
 
 @dataclass(frozen=True)
@@ -169,6 +199,399 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _json_hash(payload: dict[str, object]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with open(fd, "w", encoding="utf-8", closefd=True) as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+        tmp_path.replace(path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _rect_to_json(rect: PackedRect) -> dict[str, float | int]:
+    return {
+        "part_index": rect.part_index,
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+        "rotation_deg": rect.rotation_deg,
+    }
+
+
+def _plate_to_json(plate: PackedPlate) -> dict[str, object]:
+    return {"index": plate.index, "rects": [_rect_to_json(rect) for rect in plate.rects]}
+
+
+def _plate_from_json(payload: object) -> PackedPlate | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_rects = payload.get("rects")
+    if not isinstance(raw_rects, list):
+        return None
+    rects: list[PackedRect] = []
+    for item in raw_rects:
+        if not isinstance(item, dict):
+            return None
+        try:
+            rects.append(
+                PackedRect(
+                    part_index=int(item["part_index"]),
+                    x=float(item["x"]),
+                    y=float(item["y"]),
+                    width=float(item["width"]),
+                    height=float(item["height"]),
+                    rotation_deg=float(item.get("rotation_deg", 0.0)),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+    try:
+        index = int(payload.get("index", 0))
+    except (TypeError, ValueError):
+        return None
+    return PackedPlate(index=index, rects=tuple(rects))
+
+
+def _footprint_cache_key(ref: PreparedMeshRef) -> str:
+    stat = ref.cache_path.stat()
+    return _json_hash(
+        {
+            "version": 1,
+            "path": str(ref.cache_path),
+            "size": stat.st_size,
+            "sha256": _file_sha256(ref.cache_path),
+            "index": ref.index,
+        }
+    )
+
+
+def _load_cached_footprint(cache_dir: Path | None, key: str) -> BaseGeometry | None:
+    if cache_dir is None:
+        return None
+    path = cache_dir / f"{key}.pkl"
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as fh:
+            loaded = pickle.load(fh)
+    except (OSError, pickle.PickleError, EOFError, AttributeError, ValueError):
+        return None
+    return loaded if isinstance(loaded, BaseGeometry) else None
+
+
+def _write_cached_footprint(cache_dir: Path | None, key: str, geometry: BaseGeometry) -> None:
+    if cache_dir is None:
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    final_path = cache_dir / f"{key}.pkl"
+    if final_path.exists():
+        return
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{key}.", suffix=".tmp", dir=cache_dir)
+    tmp_path = Path(tmp_name)
+    try:
+        with open(fd, "wb", closefd=True) as fh:
+            pickle.dump(geometry, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_path.replace(final_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _prepare_packer_version(packer: str) -> str:
+    return "prepare_bitmap_v1" if packer == "bitmap" else "prepare_exact_v1"
+
+
+def _packing_cache_key(
+    *,
+    footprint_keys: list[str],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    edge_margin_mm: float,
+    part_heights: list[float],
+    packer: str,
+    bitmap_options: BitmapPackOptions | None,
+    grid_step_mm: float,
+) -> str:
+    return _json_hash(
+        {
+            "version": 1,
+            "footprint_keys": footprint_keys,
+            "bed_w": round(float(bed_w), 9),
+            "bed_h": round(float(bed_h), 9),
+            "gap_mm": round(float(gap_mm), 9),
+            "edge_margin_mm": round(float(edge_margin_mm), 9),
+            "part_heights": (
+                [round(float(h), 6) for h in part_heights] if packer == "exact" else None
+            ),
+            "packer": packer,
+            "packer_version": _prepare_packer_version(packer),
+            "bitmap_grid_mm": bitmap_options.grid_mm if bitmap_options is not None else None,
+            "bitmap_beam_width": bitmap_options.beam_width if bitmap_options is not None else None,
+            "grid_step_mm": round(float(grid_step_mm), 9),
+        }
+    )
+
+
+def _load_packing_result(cache_dir: Path | None, key: str, packer: str) -> list[PackedPlate] | None:
+    if cache_dir is None:
+        return None
+    path = cache_dir / "results" / key / "result.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("packer_version") != _prepare_packer_version(packer):
+            return None
+        raw_plates = payload.get("plates")
+        if not isinstance(raw_plates, list):
+            return None
+        plates = [_plate_from_json(item) for item in raw_plates]
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if any(plate is None for plate in plates):
+        return None
+    return [plate for plate in plates if plate is not None]
+
+
+def _write_packing_result(
+    cache_dir: Path | None,
+    key: str,
+    packer: str,
+    plates: list[PackedPlate],
+) -> None:
+    if cache_dir is None:
+        return
+    _write_json_atomic(
+        cache_dir / "results" / key / "result.json",
+        {
+            "packer_version": _prepare_packer_version(packer),
+            "plates": [_plate_to_json(plate) for plate in plates],
+        },
+    )
+
+
+def _renumber_plates(plates: list[PackedPlate]) -> list[PackedPlate]:
+    return [
+        PackedPlate(index=i, rects=tuple(plate.rects))
+        for i, plate in enumerate(plates)
+        if plate.rects
+    ]
+
+
+def _offset_plate(plate: PackedPlate, dx: float, dy: float, index: int) -> PackedPlate:
+    if abs(dx) <= 1e-12 and abs(dy) <= 1e-12 and plate.index == index:
+        return plate
+    return PackedPlate(
+        index=index,
+        rects=tuple(
+            PackedRect(
+                part_index=rect.part_index,
+                x=rect.x + dx,
+                y=rect.y + dy,
+                width=rect.width,
+                height=rect.height,
+                rotation_deg=rect.rotation_deg,
+            )
+            for rect in plate.rects
+        ),
+    )
+
+
+def _validate_plate_geometry(
+    polygons: list[BaseGeometry],
+    plate: PackedPlate,
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    *,
+    tolerance: float = 1e-3,
+) -> bool:
+    bed = shapely_box(-tolerance, -tolerance, bed_w + tolerance, bed_h + tolerance)
+    placed: list[BaseGeometry] = []
+    for rect in plate.rects:
+        if rect.part_index < 0 or rect.part_index >= len(polygons):
+            return False
+        poly = affinity.rotate(polygons[rect.part_index], rect.rotation_deg, origin=(0.0, 0.0))
+        poly = affinity.translate(poly, -poly.bounds[0], -poly.bounds[1])
+        poly = affinity.translate(poly, rect.x, rect.y)
+        if not bed.covers(poly):
+            return False
+        for other in placed:
+            if gap_mm > 0 and poly.distance(other) + tolerance < gap_mm:
+                return False
+            if gap_mm <= 0 and poly.intersects(other) and poly.intersection(other).area > tolerance:
+                return False
+        placed.append(poly)
+    return True
+
+
+def _validate_layout_geometry(
+    polygons: list[BaseGeometry],
+    plates: list[PackedPlate],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+) -> bool:
+    placed_indices = sorted(rect.part_index for plate in plates for rect in plate.rects)
+    if placed_indices != list(range(len(polygons))):
+        return False
+    return all(_validate_plate_geometry(polygons, plate, bed_w, bed_h, gap_mm) for plate in plates)
+
+
+def _pack_bitmap_multi_plate(
+    polygons: list[BaseGeometry],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    edge_margin_mm: float,
+    bitmap_options: BitmapPackOptions,
+    metadata: dict[str, object],
+    max_plates: int = 64,
+) -> list[PackedPlate]:
+    effective_w = bed_w - 2.0 * edge_margin_mm
+    effective_h = bed_h - 2.0 * edge_margin_mm
+    if effective_w <= 0 or effective_h <= 0:
+        raise ValueError(
+            f"edge_margin_mm={edge_margin_mm!r} leaves no printable bed area "
+            f"inside {bed_w:.1f}×{bed_h:.1f} mm."
+        )
+    remaining = sorted(range(len(polygons)), key=lambda i: float(polygons[i].area), reverse=True)
+    plates: list[PackedPlate] = []
+    attempts: list[dict[str, object]] = []
+    total_candidates = 0
+    total_rasterize = 0.0
+    total_search = 0.0
+    while remaining:
+        if len(plates) >= max_plates:
+            raise RuntimeError(f"Exceeded max_plates={max_plates}; not all parts could be placed.")
+        subset_polygons = [polygons[i] for i in remaining]
+        subset_to_global = list(remaining)
+        best_plate: PackedPlate | None = None
+        best_count = 0
+        for count in range(len(subset_polygons), 0, -1):
+            candidate_polygons = subset_polygons[:count]
+            mapping = tuple(subset_to_global)
+            plate_index = len(plates)
+
+            def _validator(
+                local_plate: PackedPlate,
+                mapping: tuple[int, ...] = mapping,
+                plate_index: int = plate_index,
+            ) -> bool:
+                global_rects = tuple(
+                    PackedRect(
+                        part_index=mapping[rect.part_index],
+                        x=rect.x,
+                        y=rect.y,
+                        width=rect.width,
+                        height=rect.height,
+                        rotation_deg=rect.rotation_deg,
+                    )
+                    for rect in local_plate.rects
+                )
+                global_plate = PackedPlate(index=plate_index, rects=global_rects)
+                return _validate_plate_geometry(
+                    polygons, global_plate, effective_w, effective_h, gap_mm
+                )
+
+            result = pack_polygons_bitmap_single_plate(
+                candidate_polygons,
+                effective_w,
+                effective_h,
+                gap_mm,
+                scale=1.0,
+                options=bitmap_options,
+                validator=_validator,
+            )
+            total_candidates += result.stats.candidates_tested
+            total_rasterize += result.stats.rasterize_s
+            total_search += result.stats.search_s
+            attempts.append(
+                {
+                    "plate": len(plates),
+                    "try_parts": count,
+                    "ok": result.plate is not None,
+                    "candidates_tested": result.stats.candidates_tested,
+                }
+            )
+            if result.plate is None:
+                continue
+            global_rects = tuple(
+                PackedRect(
+                    part_index=subset_to_global[rect.part_index],
+                    x=rect.x,
+                    y=rect.y,
+                    width=rect.width,
+                    height=rect.height,
+                    rotation_deg=rect.rotation_deg,
+                )
+                for rect in result.plate.rects
+            )
+            best_plate = PackedPlate(index=len(plates), rects=global_rects)
+            best_count = count
+            break
+        if best_plate is None or best_count <= 0:
+            raise RuntimeError("bitmap packer could not place any remaining part on a new plate.")
+        plates.append(_offset_plate(best_plate, edge_margin_mm, edge_margin_mm, len(plates)))
+        placed = set(remaining[:best_count])
+        remaining = [idx for idx in remaining if idx not in placed]
+    metadata.update(
+        {
+            "strategy": "bitmap",
+            "baseline_plates": len(plates),
+            "final_plates": len(plates),
+            "edge_margin_mm": edge_margin_mm,
+            "effective_bed_mm": [effective_w, effective_h],
+            "bitmap_grid_mm": bitmap_options.grid_mm,
+            "bitmap_beam_width": bitmap_options.beam_width,
+            "bitmap_candidates_tested": total_candidates,
+            "bitmap_rasterize_s": total_rasterize,
+            "bitmap_search_s": total_search,
+            "attempts": attempts,
+        }
+    )
+    return _renumber_plates(plates)
+
+
+def _resolve_prepare_packer(value: str | None, settings_value: str | None) -> str:
+    out = value or settings_value or "auto"
+    if out not in {"auto", "bitmap", "exact"}:
+        raise ValueError("--packer must be auto, bitmap, or exact.")
+    return "exact" if out == "auto" else out
+
+
+def _resolve_prepare_bitmap_options(
+    *,
+    grid_mm: float | None,
+    settings_grid_mm: float | None,
+    beam_width: int | None,
+    settings_beam_width: int | None,
+) -> BitmapPackOptions:
+    resolved_grid = float(
+        settings_grid_mm if grid_mm is None and settings_grid_mm is not None else (grid_mm or 0.25)
+    )
+    resolved_beam = int(
+        settings_beam_width
+        if beam_width is None and settings_beam_width is not None
+        else (beam_width or 16)
+    )
+    if resolved_grid <= 0:
+        raise ValueError("--bitmap-grid-mm must be > 0.")
+    if resolved_beam < 1:
+        raise ValueError("--bitmap-beam-width must be >= 1.")
+    return BitmapPackOptions(grid_mm=resolved_grid, beam_width=resolved_beam)
 
 
 def _cache_mesh_name(index: int, name: str) -> str:
@@ -229,6 +652,7 @@ def _load_orient_cache(
                 source_path=source_path,
                 cache_path=stl_path,
                 dims=dims,  # type: ignore[arg-type]
+                source_transform_available=False,
             )
         )
         del mesh
@@ -238,9 +662,15 @@ def _load_orient_cache(
 
 def _scale_orientation_worker(
     job: _ScaleOrientJob,
-) -> tuple[int, np.ndarray, tuple[float, float, float], bool, float]:
+) -> tuple[int, np.ndarray, tuple[float, float, float], bool, RepairReport, float]:
     start = time.perf_counter()
-    m, has_multiple = load_mesh_with_info(job.path)
+    m, repair_report = load_mesh_with_repair(
+        job.path,
+        job.repair_options,
+        source_name=job.name,
+        repair_cache_dir=job.repair_cache_dir,
+    )
+    has_multiple = False
     try:
         transform, dims = select_orientation_for_scale(
             m,
@@ -257,18 +687,39 @@ def _scale_orientation_worker(
         clear_mesh_cache(m)
         del m
         gc.collect()
-    return job.index, transform, dims, has_multiple, time.perf_counter() - start
+    return job.index, transform, dims, has_multiple, repair_report, time.perf_counter() - start
 
 
 def _prepare_cache_worker(
     job: _PrepareCacheJob,
 ) -> tuple[int, float, float, float, PreparedMeshRef, dict[str, float | str], float]:
     start = time.perf_counter()
-    mesh = load_mesh(job.path)
+    mesh, repair_report = load_mesh_with_repair(
+        job.path,
+        job.repair_options,
+        source_name=job.name,
+        repair_cache_dir=job.repair_cache_dir,
+    )
     try:
+        source_to_cache = np.eye(4, dtype=np.float64)
+        steps: list[dict[str, object]] = (
+            [repair_report_step(repair_report)] if repair_report.enabled else []
+        )
         mesh.apply_transform(job.scale_transform)
+        source_to_cache = job.scale_transform @ source_to_cache
+        steps.append(transform_step("scale_orientation", matrix=job.scale_transform))
+        scale_matrix = uniform_scale_matrix(job.scale)
         mesh.apply_scale(job.scale)
+        source_to_cache = scale_matrix @ source_to_cache
+        steps.append(
+            transform_step("global_scale", matrix=scale_matrix, params={"scale_factor": job.scale})
+        )
+        normalize_before_orient = translation_matrix(
+            [0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])]
+        )
         mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
+        source_to_cache = normalize_before_orient @ source_to_cache
+        steps.append(transform_step("z_normalize", matrix=normalize_before_orient))
         sb = overhang_score(mesh, _IDENTITY3, job.overhang_threshold_deg)
         rotation, sa, metrics = find_stable_overhang_rotation(
             mesh,
@@ -300,9 +751,27 @@ def _prepare_cache_worker(
             "selection_reason": metrics.selection_reason,
         }
         pct = (sb - sa) / max(abs(sb), 1.0) * 100.0
+        rotation4 = rotation_to_transform4(rotation)
+        rotated_bounds = transform_bounds(np.asarray(mesh.bounds, dtype=np.float64), rotation4)
+        normalize_after_orient = translation_matrix([0.0, 0.0, -float(rotated_bounds[0, 2])])
         oriented = apply_min_overhang_orientation(mesh, rotation)
+        source_to_cache = normalize_after_orient @ rotation4 @ source_to_cache
+        steps.extend(
+            [
+                transform_step("support_orientation", matrix=rotation4),
+                transform_step("z_normalize", matrix=normalize_after_orient),
+            ]
+        )
         if job.cleanup:
             oriented, _n_removed = remove_small_components(oriented)
+            if _n_removed:
+                steps.append(
+                    transform_step(
+                        "cleanup",
+                        params={"removed_components": _n_removed},
+                        available=False,
+                    )
+                )
         bounds = np.asarray(oriented.bounds)
         dims_raw = bounds[1] - bounds[0]
         dims = (float(dims_raw[0]), float(dims_raw[1]), float(dims_raw[2]))
@@ -315,6 +784,8 @@ def _prepare_cache_worker(
             source_path=job.path,
             cache_path=out,
             dims=dims,
+            source_to_cache_matrix=source_to_cache,
+            transform_steps=tuple(steps),
         )
         return job.index, sb, sa, pct, ref, metrics_payload, time.perf_counter() - start
     finally:
@@ -355,22 +826,6 @@ def _footprint_worker(job: _FootprintJob) -> tuple[int, BaseGeometry, float]:
     return job.ref.index, shadow, time.perf_counter() - start
 
 
-# ---------------------------------------------------------------------------
-# Progress bar factory
-# ---------------------------------------------------------------------------
-
-
-def _make_progress(console: Console) -> Progress:
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    )
-
-
 def _fmt_bytes(value: int | None) -> str:
     if value is None:
         return "unknown"
@@ -401,6 +856,12 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     )
     profiler.start()
     st = resolve_settings(args.config_path)
+    args.progress = args.progress and (st.ui.progress if st is not None else True)
+    repair_options = resolve_repair_options(args.repair, st)
+    repair_cache_dir = repair_cache_dir_for_output(
+        args.output_dir,
+        resolve_repair_cache_enabled(args.repair_cache, st) and not args.dry_run,
+    )
 
     try:
         px_raw, py_raw, pz_raw = resolve_printer(args.printer_xyz, st)
@@ -417,6 +878,18 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     edge_margin = resolve_edge_margin(args.edge_margin_mm, st)
     resin_options = resolve_resin_orientation_options(args.resin_balance, st)
     method: str = args.method or "sorted"
+    requested_packer = args.packer or (st.autopack.packer if st else None) or "auto"
+    try:
+        packer = _resolve_prepare_packer(args.packer, st.autopack.packer if st else None)
+        bitmap_options = _resolve_prepare_bitmap_options(
+            grid_mm=args.bitmap_grid_mm,
+            settings_grid_mm=st.autopack.bitmap_grid_mm if st else None,
+            beam_width=args.bitmap_beam_width,
+            settings_beam_width=st.autopack.bitmap_beam_width if st else None,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return finish_profile(profiler, console, 2)
 
     px, py, pz = px_raw, py_raw, pz_raw
     epx = px - 2.0 * edge_margin
@@ -428,6 +901,11 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     console.print(
         f"Gap: {gap} mm  |  edge margin: {edge_margin} mm  |  post_fit_scale: {post_fit_scale}"
     )
+    if packer == "bitmap" and requested_packer == "bitmap":
+        console.print(
+            "[yellow]Warning: prepare bitmap packing is a fast heuristic backend; "
+            "use --packer auto/exact for quality-first plate count.[/yellow]"
+        )
 
     with profiler.stage("collect inputs"):
         paths = collect_mesh_paths(args.input_dir, args.recursive)
@@ -456,6 +934,15 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         "long_part_low_angle_penalty_below_deg": resin_options.long_part_low_angle_penalty_below_deg,
         "long_part_high_angle_penalty_above_deg": resin_options.long_part_high_angle_penalty_above_deg,
     }
+    profile_metadata["packing_options"] = {
+        "requested_packer": requested_packer,
+        "resolved_packer": packer,
+        "packer": packer,
+        "bitmap_grid_mm": bitmap_options.grid_mm if packer == "bitmap" else None,
+        "bitmap_beam_width": bitmap_options.beam_width if packer == "bitmap" else None,
+        "footprint_cache": args.footprint_cache,
+        "packing_result_cache": args.packing_result_cache,
+    }
     if args.verbose:
         console.print(
             "[dim]workers: "
@@ -478,6 +965,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     # Fast path: resume from orient cache
     # ──────────────────────────────────────────────────────────────────────────
     prepared_refs: list[PreparedMeshRef] | None = None
+    repair_reports: list[RepairReport] = []
     if args.resume:
         with profiler.stage("cache load"):
             cached = _load_orient_cache(cache_dir, paths, console)
@@ -499,7 +987,10 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             console.print(f"[dim]scale-orient: {_n} workers for {len(paths)} meshes[/dim]")
 
         _so: list = [None] * len(paths)
-        with profiler.stage("scale orientation search"), _make_progress(console) as progress:
+        with (
+            profiler.stage("scale orientation search"),
+            make_progress(console, enabled=args.progress) as progress,
+        ):
             ptask = progress.add_task("Finding scale orientations…", total=len(paths))
             with ProcessPoolExecutor(max_workers=_n, max_tasks_per_child=1) as scale_pool:
                 futs_so = {
@@ -513,6 +1004,9 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                             pz=pz,
                             method=method,
                             any_rotation=args.any_rotation,
+                            repair_options=repair_options,
+                            name=names[idx],
+                            repair_cache_dir=repair_cache_dir,
                         ),
                     ): idx
                     for idx, path in enumerate(paths)
@@ -520,12 +1014,21 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 for fut_so in as_completed(futs_so):
                     idx = futs_so[fut_so]
                     try:
-                        _idx, transform, dims, has_multiple, duration_s = fut_so.result()
+                        (
+                            _idx,
+                            transform,
+                            dims,
+                            has_multiple,
+                            repair_report,
+                            duration_s,
+                        ) = fut_so.result()
                     except (OSError, ValueError, TypeError) as e:
                         console.print(f"[red]Failed to load {paths[idx]}: {e}[/red]")
                         return finish_profile(profiler, console, 1)
                     profiler.record_worker("prepare.scale_orientation", duration_s)
-                    _so[idx] = (transform, dims)
+                    _so[idx] = (transform, dims, repair_report)
+                    if repair_report.enabled and repair_report.changed:
+                        console.print(f"[dim]repair: {names[idx]} — mesh topology updated[/dim]")
                     if has_multiple:
                         console.print(
                             f"[yellow]Warning: {names[idx]!r} contains multiple surfaces — "
@@ -535,6 +1038,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
 
         scale_transforms = [r[0] for r in _so]
         oriented_dims = [r[1] for r in _so]
+        repair_reports = [r[2] for r in _so]
 
         with profiler.stage("scale computation"):
             try:
@@ -587,7 +1091,10 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         _prepared: list[
             tuple[float, float, float, PreparedMeshRef, dict[str, float | str]] | None
         ] = [None] * len(paths)
-        with profiler.stage("scale/orient/cache"), _make_progress(console) as progress:
+        with (
+            profiler.stage("scale/orient/cache"),
+            make_progress(console, enabled=args.progress) as progress,
+        ):
             ptask = progress.add_task("Orienting parts…", total=len(paths))
             with ProcessPoolExecutor(max_workers=_n2, max_tasks_per_child=1) as orient_pool:
                 future_to_idx = {
@@ -607,6 +1114,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                             printer_xyz=(epx, epy, pz),
                             cleanup=args.cleanup,
                             resin_options=resin_options,
+                            repair_options=repair_options,
+                            repair_cache_dir=repair_cache_dir,
                         ),
                     ): idx
                     for idx, path in enumerate(paths)
@@ -685,41 +1194,114 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     n_parts = len(prepared_refs)
 
     shadows: list[BaseGeometry | None] = [None] * n_parts
-    with profiler.stage("footprint computation"), _make_progress(console) as progress:
+    footprint_keys = [_footprint_cache_key(ref) for ref in prepared_refs]
+    footprint_cache_dir = (
+        args.output_dir / "cache" / "footprints"
+        if args.footprint_cache and not args.dry_run
+        else (args.output_dir / "cache" / "footprints" if args.footprint_cache else None)
+    )
+    footprint_hits = 0
+    with (
+        profiler.stage("footprint computation"),
+        make_progress(console, enabled=args.progress) as progress,
+    ):
         ptask = progress.add_task("Computing footprints…", total=n_parts)
+        missing_refs: list[PreparedMeshRef] = []
+        for ref, key in zip(prepared_refs, footprint_keys, strict=True):
+            cached_shadow = _load_cached_footprint(footprint_cache_dir, key)
+            if cached_shadow is not None:
+                shadows[ref.index] = cached_shadow
+                footprint_hits += 1
+                progress.update(ptask, advance=1, description=f"Footprint cache: {ref.name}")
+            else:
+                missing_refs.append(ref)
         with ProcessPoolExecutor(
             max_workers=worker_plan.footprint_workers,
             max_tasks_per_child=1,
         ) as footprint_pool:
             footprint_futures = {
                 footprint_pool.submit(_footprint_worker, _FootprintJob(ref=ref)): ref
-                for ref in prepared_refs
+                for ref in missing_refs
             }
             for footprint_future in as_completed(footprint_futures):
                 ref = footprint_futures[footprint_future]
                 idx, shadow, duration_s = footprint_future.result()
                 profiler.record_worker("prepare.footprint", duration_s)
                 shadows[idx] = shadow
+                if not args.dry_run:
+                    _write_cached_footprint(footprint_cache_dir, footprint_keys[idx], shadow)
                 progress.update(ptask, advance=1, description=f"Footprint: {ref.name}")
+    profile_metadata["footprint_cache"] = {"hits": footprint_hits, "total": n_parts}
     packed_shadows = [s for s in shadows if s is not None]
     part_heights = [ref.dims[2] for ref in prepared_refs]
     packing_metadata: dict[str, object] = {}
+    packing_cache_dir = (
+        args.output_dir / "cache" / "prepare_packing" if args.packing_result_cache else None
+    )
+    packing_key = _packing_cache_key(
+        footprint_keys=footprint_keys,
+        bed_w=px,
+        bed_h=py,
+        gap_mm=gap,
+        edge_margin_mm=edge_margin,
+        part_heights=part_heights,
+        packer=packer,
+        bitmap_options=bitmap_options if packer == "bitmap" else None,
+        grid_step_mm=args.grid_step_mm,
+    )
 
-    with profiler.stage("packing"), _make_progress(console) as progress:
+    with profiler.stage("packing"), make_progress(console, enabled=args.progress) as progress:
         ptask = progress.add_task("Packing…", total=n_parts)
-        plates = profiler.profiled_call(
-            "prepare.packing",
-            pack_polygons_on_plates,
-            packed_shadows,
-            px,
-            py,
-            gap_mm=gap,
-            grid_step_mm=args.grid_step_mm,
-            on_placed=lambda: progress.advance(ptask),
-            part_heights=part_heights,
-            metadata=packing_metadata,
-            edge_margin_mm=edge_margin,
-        )
+        cached_plates = _load_packing_result(packing_cache_dir, packing_key, packer)
+        if cached_plates is not None and _validate_layout_geometry(
+            packed_shadows, cached_plates, px, py, gap
+        ):
+            plates = cached_plates
+            packing_metadata["cache_hit"] = True
+            packing_metadata["strategy"] = packer
+            packing_metadata["final_plates"] = len(plates)
+            progress.update(ptask, completed=n_parts)
+        else:
+            packing_metadata["cache_hit"] = False
+            if packer == "bitmap":
+                plates = profiler.profiled_call(
+                    "prepare.packing.bitmap",
+                    _pack_bitmap_multi_plate,
+                    packed_shadows,
+                    px,
+                    py,
+                    gap,
+                    edge_margin,
+                    bitmap_options,
+                    packing_metadata,
+                )
+                progress.update(ptask, completed=n_parts)
+            else:
+                plates = profiler.profiled_call(
+                    "prepare.packing.exact",
+                    pack_polygons_on_plates,
+                    packed_shadows,
+                    px,
+                    py,
+                    gap_mm=gap,
+                    grid_step_mm=args.grid_step_mm,
+                    on_placed=lambda: progress.advance(ptask),
+                    part_heights=part_heights,
+                    metadata=packing_metadata,
+                    edge_margin_mm=edge_margin,
+                )
+            if not _validate_layout_geometry(packed_shadows, plates, px, py, gap):
+                console.print(
+                    "[red]Internal error: prepare layout failed geometry validation.[/red]"
+                )
+                return finish_profile(profiler, console, 1)
+            if not args.dry_run:
+                _write_packing_result(packing_cache_dir, packing_key, packer, plates)
+        packing_metadata["cache_key"] = packing_key
+        packing_metadata["requested_packer"] = requested_packer
+        packing_metadata["resolved_packer"] = packer
+        packing_metadata["packer"] = packer
+        packing_metadata["final_plates"] = len(plates)
     profile_metadata["packing"] = packing_metadata
 
     console.print(f"Plates: {len(plates)}")
@@ -757,8 +1339,9 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             f"(largest plate={_fmt_bytes(max(plate_part_bytes, default=0))})[/dim]"
         )
 
-    with profiler.stage("export"), _make_progress(console) as progress:
+    with profiler.stage("export"), make_progress(console, enabled=args.progress) as progress:
         ptask = progress.add_task("Exporting plates…", total=len(plates))
+        output_files: list[Path] = []
         with ProcessPoolExecutor(
             max_workers=export_workers,
             max_tasks_per_child=1,
@@ -779,6 +1362,76 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 out_path, duration_s = export_future.result()
                 profiler.record_worker("prepare.export", duration_s)
                 console.print(f"Wrote {out_path}")
+                output_files.extend([out_path, out_path.with_suffix(".json")])
                 progress.advance(ptask)
+
+    transform_parts: list[dict] = []
+    refs_by_index = {ref.index: ref for ref in prepared_refs}
+    for pl in plates:
+        plate_file = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
+        for rect in pl.rects:
+            ref = refs_by_index[rect.part_index]
+            cached_mesh = load_mesh(ref.cache_path)
+            try:
+                placement_transform, placement_steps = placement_transform_for_mesh(
+                    cached_mesh, rect
+                )
+                source_to_export = (
+                    placement_transform @ ref.source_to_cache_matrix
+                    if ref.source_to_cache_matrix is not None
+                    else None
+                )
+                source_bounds_mm = None
+                final_bounds_mm = None
+                source_mesh, _source_repair_report = load_mesh_with_repair(
+                    ref.source_path,
+                    repair_options,
+                    source_name=ref.name,
+                    repair_cache_dir=repair_cache_dir,
+                )
+                try:
+                    source_bounds = np.asarray(source_mesh.bounds, dtype=np.float64)
+                    source_bounds_mm = mesh_bounds(source_mesh)
+                    if source_to_export is not None:
+                        final_bounds_mm = bounds_to_list(
+                            transform_bounds(source_bounds, source_to_export)
+                        )
+                finally:
+                    clear_mesh_cache(source_mesh)
+                transform_parts.append(
+                    transform_entry(
+                        index=ref.index,
+                        plate_index=pl.index,
+                        plate_file=plate_file,
+                        source_path=ref.source_path,
+                        source_name=ref.name,
+                        output_name=ref.name,
+                        output_file=plate_file,
+                        source_bounds_mm=source_bounds_mm,
+                        final_bounds_mm=final_bounds_mm,
+                        source_to_export_matrix=source_to_export,
+                        steps=[*ref.transform_steps, *placement_steps],
+                        plate_x_mm=rect.x,
+                        plate_y_mm=rect.y,
+                        rotation_deg=rect.rotation_deg,
+                        source_transform_available=ref.source_transform_available,
+                    )
+                )
+            finally:
+                clear_mesh_cache(cached_mesh)
+    write_transform_log(
+        args.output_dir / "transforms.json",
+        command="prepare",
+        output_files=output_files,
+        parts=transform_parts,
+        metadata={"resume": args.resume},
+    )
+    if repair_reports:
+        write_command_repair_report(
+            args.output_dir,
+            command="prepare",
+            reports=repair_reports,
+            dry_run=args.dry_run,
+        )
 
     return finish_profile(profiler, console, 0)

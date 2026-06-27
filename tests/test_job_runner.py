@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -234,6 +235,9 @@ def test_job_writes_files(tmp_path, stl_assets):
     out_dir = tmp_path / "out"
     assert any(out_dir.glob("plate_*.3mf")), "No 3MF files written"
     assert any(out_dir.glob("plate_*.json")), "No JSON manifests written"
+    payload = json.loads((out_dir / "transforms.json").read_text(encoding="utf-8"))
+    assert payload["command"] == "job"
+    assert len(payload["parts"]) == 2
 
 
 def test_job_missing_part_file(tmp_path):

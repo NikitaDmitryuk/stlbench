@@ -39,7 +39,12 @@ def remove_small_components(
     sizes = [len(c) for c in comps]
     threshold = min_faces if min_faces > 0 else max(50, max(sizes) // 1000)
 
-    keep = [np.asarray(c) for c, s in zip(comps, sizes, strict=True) if s >= threshold]
+    largest_index = int(np.argmax(sizes))
+    keep = [
+        np.asarray(c)
+        for i, (c, s) in enumerate(zip(comps, sizes, strict=True))
+        if s >= threshold or i == largest_index
+    ]
     n_removed = sum(1 for s in sizes if s < threshold)
 
     if n_removed == 0:

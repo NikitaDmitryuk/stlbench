@@ -37,3 +37,6 @@ long_part_high_angle_penalty_above_deg = 60.0
 #   ["orient", "layout"]           — orient only, no scaling
 #   ["layout"]                     — pack as-is (model already prepared)
 default_steps = ["scale", "orient", "layout"]
+
+[ui]
+progress = true

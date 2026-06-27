@@ -6,32 +6,39 @@ from pathlib import Path
 import numpy as np
 import trimesh
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.mesh_cleanup import remove_small_components
+from stlbench.core.mesh_repair import repair_report_step
 from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
+from stlbench.export.transform_log import (
+    bounds_to_list,
+    mesh_bounds,
+    placement_transform_for_mesh,
+    transform_bounds,
+    transform_entry,
+    transform_step,
+    write_transform_log,
+)
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.polygon_footprint import mesh_to_packing_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
 from stlbench.packing.rectpack_plate import int_bin_dims_mm
 from stlbench.pipeline.common import (
     finish_profile,
-    load_named_meshes,
+    load_named_meshes_with_repair,
+    repair_cache_dir_for_output,
     resolve_edge_margin,
     resolve_gap,
     resolve_orientation_policy,
     resolve_orientation_scale_tolerance,
     resolve_printer,
+    resolve_repair_cache_enabled,
+    resolve_repair_options,
     resolve_settings,
+    write_command_repair_report,
 )
+from stlbench.pipeline.progress import make_progress
 from stlbench.profiling import ProfileOptions, make_profiler
 
 
@@ -45,23 +52,15 @@ class LayoutRunArgs:
     recursive: bool
     dry_run: bool
     cleanup: bool = False
+    repair: bool = False
+    repair_cache: bool = True
     any_rotation: bool = False
     orientation_policy: str | None = None
     orientation_scale_tolerance: float | None = None
     rotation_samples: int | None = None
     profile_options: ProfileOptions | None = None
     edge_margin_mm: float | None = None
-
-
-def _make_progress(console: Console) -> Progress:
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    )
+    progress: bool = True
 
 
 def run_layout(args: LayoutRunArgs) -> int:
@@ -79,6 +78,12 @@ def run_layout(args: LayoutRunArgs) -> int:
     )
     profiler.start()
     st = resolve_settings(args.config_path)
+    args.progress = args.progress and (st.ui.progress if st is not None else True)
+    repair_options = resolve_repair_options(args.repair, st)
+    repair_cache_dir = repair_cache_dir_for_output(
+        args.output_dir,
+        resolve_repair_cache_enabled(args.repair_cache, st) and not args.dry_run,
+    )
 
     try:
         px, py, pz = resolve_printer(args.printer_xyz, st)
@@ -98,10 +103,16 @@ def run_layout(args: LayoutRunArgs) -> int:
         return finish_profile(profiler, console, 2)
 
     with profiler.stage("load meshes"):
-        loaded = load_named_meshes(args.input_dir, args.recursive, console)
+        loaded = load_named_meshes_with_repair(
+            args.input_dir,
+            args.recursive,
+            console,
+            repair_options,
+            repair_cache_dir,
+        )
     if loaded is None:
         return finish_profile(profiler, console, 1)
-    _paths, names, meshes = loaded
+    paths, names, meshes, repair_reports = loaded
 
     n_parts = len(meshes)
     dims_list: list[tuple[float, float, float]] = []
@@ -120,7 +131,10 @@ def run_layout(args: LayoutRunArgs) -> int:
     bad_layout: list[tuple[str, float, float, float]] = []
     layout_plans: list[tuple[np.ndarray, float, float] | None] = []
 
-    with profiler.stage("orientation selection"), _make_progress(console) as progress:
+    with (
+        profiler.stage("orientation selection"),
+        make_progress(console, enabled=args.progress) as progress,
+    ):
         ptask = progress.add_task("Finding orientations…", total=n_parts)
         for m, name in zip(meshes, names, strict=True):
             dx, dy, dz = mesh_footprint_xy(m)
@@ -179,13 +193,16 @@ def run_layout(args: LayoutRunArgs) -> int:
                     )
 
     shadows = []
-    with profiler.stage("footprint computation"), _make_progress(console) as progress:
+    with (
+        profiler.stage("footprint computation"),
+        make_progress(console, enabled=args.progress) as progress,
+    ):
         ptask = progress.add_task("Computing footprints…", total=n_parts)
         for i, m in enumerate(oriented_meshes):
             shadows.append(profiler.profiled_call("layout.footprint", mesh_to_packing_shadow, m))
             progress.update(ptask, advance=1, description=f"Footprint: {names[i]}")
 
-    with profiler.stage("packing"), _make_progress(console) as progress:
+    with profiler.stage("packing"), make_progress(console, enabled=args.progress) as progress:
         ptask = progress.add_task("Packing…", total=n_parts)
         part_heights = [mesh_footprint_xy(m)[2] for m in oriented_meshes]
         packing_metadata: dict[str, object] = {}
@@ -216,11 +233,67 @@ def run_layout(args: LayoutRunArgs) -> int:
         export_plate_3mf(oriented_meshes, pl, out_3mf, names=list(names), out_manifest=out_js)
         return out_3mf
 
-    with profiler.stage("export"), _make_progress(console) as progress:
+    output_files: list[Path] = []
+    with profiler.stage("export"), make_progress(console, enabled=args.progress) as progress:
         ptask = progress.add_task("Exporting plates…", total=len(plates))
         for pl in plates:
             out_path = profiler.profiled_call("layout.export", _export_plate, pl)
             console.print(f"Wrote {out_path}")
+            output_files.append(out_path)
             progress.advance(ptask)
+
+    transform_parts: list[dict] = []
+    for pl in plates:
+        plate_file = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
+        for rect in pl.rects:
+            part_index = rect.part_index
+            plan = layout_plans[part_index]
+            assert plan is not None
+            layout_transform = plan[0]
+            placement_transform, placement_steps = placement_transform_for_mesh(
+                oriented_meshes[part_index], rect
+            )
+            source_to_export = placement_transform @ layout_transform
+            source_bounds = np.asarray(meshes[part_index].bounds, dtype=np.float64)
+            transform_parts.append(
+                transform_entry(
+                    index=part_index,
+                    plate_index=pl.index,
+                    plate_file=plate_file,
+                    source_path=paths[part_index],
+                    source_name=names[part_index],
+                    output_name=names[part_index],
+                    output_file=plate_file,
+                    source_bounds_mm=mesh_bounds(meshes[part_index]),
+                    final_bounds_mm=bounds_to_list(
+                        transform_bounds(source_bounds, source_to_export)
+                    ),
+                    source_to_export_matrix=source_to_export,
+                    steps=[
+                        *(
+                            [repair_report_step(repair_reports[part_index])]
+                            if repair_reports[part_index].enabled
+                            else []
+                        ),
+                        transform_step("layout_orientation", matrix=layout_transform),
+                        *placement_steps,
+                    ],
+                    plate_x_mm=rect.x,
+                    plate_y_mm=rect.y,
+                    rotation_deg=rect.rotation_deg,
+                )
+            )
+    write_transform_log(
+        args.output_dir / "transforms.json",
+        command="layout",
+        output_files=output_files,
+        parts=transform_parts,
+    )
+    write_command_repair_report(
+        args.output_dir,
+        command="layout",
+        reports=repair_reports,
+        dry_run=args.dry_run,
+    )
 
     return finish_profile(profiler, console, 0)

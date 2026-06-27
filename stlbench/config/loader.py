@@ -20,6 +20,9 @@ def load_app_settings(path: Path) -> AppSettings:
         "scaling": raw.get("scaling") or {},
         "packing": raw.get("packing") or {},
         "orientation": raw.get("orientation") or {},
+        "repair": raw.get("repair") or {},
+        "autopack": raw.get("autopack") or {},
+        "ui": raw.get("ui") or {},
         "pipeline": raw.get("pipeline") or {},
         "parts": raw.get("parts") or [],
     }

@@ -363,6 +363,11 @@ which write scaled/rotated STL files).
 The 3MF files use only the core 3MF 2015/02 namespace and are compatible with
 Elegoo SatelLite, Chitubox, Lychee, and PrusaSlicer.
 
+Commands that write geometry also create `transforms.json` in the output directory.
+It records source files, bounds, per-part transforms, scale factors, and plate
+placements so exported models can be audited or mapped back toward their source
+size and position.
+
 ## Examples
 
 See [`examples/README.md`](examples/README.md) for a step-by-step walkthrough

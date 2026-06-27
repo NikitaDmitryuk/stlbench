@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,11 @@ def test_explicit_scale_factor():
 
         rc = run_scale(_make_scale_args(d, scale_factor=2.0, printer_xyz=None))
         assert rc == 0
+
+        log = json.loads((d / "out" / "transforms.json").read_text(encoding="utf-8"))
+        assert log["command"] == "scale"
+        assert len(log["parts"]) == 1
+        assert log["parts"][0]["scale_factor"] == 2.0
 
         out = trimesh.load(str(d / "out" / "box.stl"), force="mesh")
         dims = np.asarray(out.bounds)[1] - np.asarray(out.bounds)[0]
