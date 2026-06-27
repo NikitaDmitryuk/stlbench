@@ -18,6 +18,32 @@ def _write_box(path: Path, extents: tuple[float, float, float]) -> None:
     trimesh.creation.box(extents=extents).export(str(path))
 
 
+def _prepare_args(
+    input_dir: Path,
+    out_dir: Path,
+    *,
+    packer: str | None = None,
+    resume: bool = False,
+    profile_options: ProfileOptions | None = None,
+) -> PrepareRunArgs:
+    return PrepareRunArgs(
+        input_dir=input_dir,
+        output_dir=out_dir,
+        config_path=None,
+        printer_xyz=(100.0, 100.0, 100.0),
+        gap_mm=1.0,
+        post_fit_scale=None,
+        method="sorted",
+        overhang_threshold_deg=45.0,
+        n_orient_candidates=8,
+        dry_run=False,
+        recursive=False,
+        packer=packer,
+        resume=resume,
+        profile_options=profile_options,
+    )
+
+
 def _worker_hotspot(value: int) -> int:
     return sum(i * value for i in range(100))
 
@@ -110,6 +136,31 @@ def test_run_layout_dry_run_profile_creates_artifacts(tmp_path: Path):
     assert any(s["name"] == "packing" for s in payload["stages"])
 
 
+def test_run_layout_writes_transform_log(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_box(input_dir / "part.stl", (10.0, 20.0, 30.0))
+    out_dir = tmp_path / "layout-out"
+
+    rc = run_layout(
+        LayoutRunArgs(
+            input_dir=input_dir,
+            output_dir=out_dir,
+            config_path=None,
+            printer_xyz=(100.0, 100.0, 100.0),
+            gap_mm=1.0,
+            recursive=False,
+            dry_run=False,
+            rotation_samples=4,
+        )
+    )
+
+    assert rc == 0
+    payload = json.loads((out_dir / "transforms.json").read_text(encoding="utf-8"))
+    assert payload["command"] == "layout"
+    assert len(payload["parts"]) == 1
+
+
 def test_run_prepare_dry_run_profile_creates_artifacts(tmp_path: Path):
     _write_box(tmp_path / "part.stl", (10.0, 20.0, 30.0))
     profile_dir = tmp_path / "prepare-profile"
@@ -175,3 +226,79 @@ def test_run_prepare_writes_orient_cache_refs(tmp_path: Path):
     assert payload["names"] == ["part.stl"]
     assert len(payload["mesh_files"]) == 1
     assert (out_dir / "cache" / payload["mesh_files"][0]).exists()
+    log = json.loads((out_dir / "transforms.json").read_text(encoding="utf-8"))
+    assert log["command"] == "prepare"
+    assert len(log["parts"]) == 1
+
+
+def test_run_prepare_reuses_footprint_and_packing_cache(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_box(input_dir / "a.stl", (10.0, 20.0, 30.0))
+    _write_box(input_dir / "b.stl", (15.0, 10.0, 20.0))
+    out_dir = tmp_path / "out"
+
+    rc = run_prepare(_prepare_args(input_dir, out_dir, packer="bitmap"))
+    assert rc == 0
+    assert any((out_dir / "cache" / "footprints").glob("*.pkl"))
+    assert any((out_dir / "cache" / "prepare_packing" / "results").glob("*/result.json"))
+
+    profile_dir = tmp_path / "prepare-cache-profile"
+    rc = run_prepare(
+        _prepare_args(
+            input_dir,
+            out_dir,
+            packer="bitmap",
+            resume=True,
+            profile_options=ProfileOptions(enabled=True, profile_dir=profile_dir, limit=20),
+        )
+    )
+
+    assert rc == 0
+    payload = _assert_profile_artifacts(profile_dir, "prepare")
+    assert payload["metadata"]["footprint_cache"]["hits"] == 2
+    assert payload["metadata"]["packing"]["cache_hit"] is True
+
+
+def test_run_prepare_auto_uses_exact_cache_not_bitmap_cache(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_box(input_dir / "a.stl", (10.0, 20.0, 30.0))
+    _write_box(input_dir / "b.stl", (15.0, 10.0, 20.0))
+    out_dir = tmp_path / "out"
+
+    rc = run_prepare(_prepare_args(input_dir, out_dir, packer="bitmap"))
+    assert rc == 0
+
+    first_auto_profile = tmp_path / "prepare-auto-first-profile"
+    rc = run_prepare(
+        _prepare_args(
+            input_dir,
+            out_dir,
+            packer="auto",
+            resume=True,
+            profile_options=ProfileOptions(enabled=True, profile_dir=first_auto_profile, limit=20),
+        )
+    )
+    assert rc == 0
+    first_payload = _assert_profile_artifacts(first_auto_profile, "prepare")
+    assert first_payload["metadata"]["packing_options"]["requested_packer"] == "auto"
+    assert first_payload["metadata"]["packing_options"]["resolved_packer"] == "exact"
+    assert first_payload["metadata"]["packing"]["resolved_packer"] == "exact"
+    assert first_payload["metadata"]["packing"]["cache_hit"] is False
+
+    second_auto_profile = tmp_path / "prepare-auto-second-profile"
+    rc = run_prepare(
+        _prepare_args(
+            input_dir,
+            out_dir,
+            packer="auto",
+            resume=True,
+            profile_options=ProfileOptions(enabled=True, profile_dir=second_auto_profile, limit=20),
+        )
+    )
+    assert rc == 0
+    second_payload = _assert_profile_artifacts(second_auto_profile, "prepare")
+    assert second_payload["metadata"]["footprint_cache"]["hits"] == 2
+    assert second_payload["metadata"]["packing"]["resolved_packer"] == "exact"
+    assert second_payload["metadata"]["packing"]["cache_hit"] is True

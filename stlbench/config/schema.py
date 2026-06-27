@@ -42,6 +42,38 @@ class OrientationSection(BaseModel):
         return self
 
 
+class RepairSection(BaseModel):
+    enabled: bool = False
+    close_holes: bool = True
+    max_hole_size_edges: int = Field(default=30, ge=0)
+    repair_non_manifold: bool = True
+    remove_small_components: bool = True
+    cache: bool = True
+
+
+class AutopackSection(BaseModel):
+    packer: str = Field(default="auto", pattern="^(auto|bitmap|exact)$")
+    pack_workers: int | str = "auto"
+    result_cache: bool = True
+    attempt_cache: bool = True
+    scale_tolerance: float = Field(default=1e-4, gt=0.0)
+    bitmap_grid_mm: float = Field(default=0.25, gt=0.0)
+    bitmap_beam_width: int = Field(default=16, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_pack_workers(self) -> AutopackSection:
+        if isinstance(self.pack_workers, str):
+            if self.pack_workers != "auto":
+                raise ValueError('autopack pack_workers must be "auto" or a positive integer')
+        elif self.pack_workers < 1:
+            raise ValueError("autopack pack_workers must be >= 1")
+        return self
+
+
+class UISection(BaseModel):
+    progress: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Pipeline step definitions
 # ---------------------------------------------------------------------------
@@ -130,5 +162,8 @@ class AppSettings(BaseModel):
     scaling: ScalingSection = Field(default_factory=ScalingSection)
     packing: PackingSection = Field(default_factory=PackingSection)
     orientation: OrientationSection = Field(default_factory=OrientationSection)
+    repair: RepairSection = Field(default_factory=RepairSection)
+    autopack: AutopackSection = Field(default_factory=AutopackSection)
+    ui: UISection = Field(default_factory=UISection)
     pipeline: PipelineSection = Field(default_factory=PipelineSection)
     parts: list[PartSpec] = []

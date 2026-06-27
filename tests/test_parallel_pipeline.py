@@ -9,6 +9,7 @@ These tests verify that:
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -161,6 +162,9 @@ def test_run_orient_parallel_writes_all_parts():
         assert rc == 0
         assert (out / "p1_o.stl").exists()
         assert (out / "p2_o.stl").exists()
+        log = json.loads((out / "transforms.json").read_text(encoding="utf-8"))
+        assert log["command"] == "orient"
+        assert len(log["parts"]) == 2
 
 
 def test_run_orient_dry_run_no_output():

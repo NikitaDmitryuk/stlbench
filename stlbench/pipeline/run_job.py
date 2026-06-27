@@ -31,20 +31,12 @@ Pass 4 — pack and export
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import trimesh
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
 from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
@@ -52,17 +44,38 @@ from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import PartSpec, StepName
 from stlbench.core.fit import compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
+from stlbench.core.mesh_repair import RepairOptions, RepairReport, repair_report_step
 from stlbench.core.overhang import (
     ResinOrientationOptions,
     apply_min_overhang_orientation,
     find_stable_overhang_rotation,
+    rotation_to_transform4,
 )
 from stlbench.export.plate import export_plate_3mf, mesh_footprint_xy
+from stlbench.export.transform_log import (
+    bounds_to_list,
+    placement_transform_for_mesh,
+    transform_bounds,
+    transform_entry,
+    transform_step,
+    translation_matrix,
+    uniform_scale_matrix,
+    write_transform_log,
+)
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.packing.polygon_footprint import mesh_to_packing_shadow
 from stlbench.packing.polygon_pack import pack_polygons_on_plates
-from stlbench.pipeline.common import finish_profile, n_workers, resolve_resin_orientation_options
-from stlbench.pipeline.mesh_io import load_mesh
+from stlbench.pipeline.common import (
+    finish_profile,
+    load_mesh_with_repair,
+    n_workers,
+    repair_cache_dir_for_output,
+    resolve_repair_cache_enabled,
+    resolve_repair_options,
+    resolve_resin_orientation_options,
+    write_command_repair_report,
+)
+from stlbench.pipeline.progress import make_progress
 from stlbench.profiling import ProfileOptions, make_profiler
 
 
@@ -80,11 +93,9 @@ class JobRunArgs:
     profile_options: ProfileOptions | None = None
     edge_margin_mm: float | None = None
     resin_balance: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Internal data structures
-# ---------------------------------------------------------------------------
+    repair: bool = False
+    repair_cache: bool = True
+    progress: bool = True
 
 
 @dataclass
@@ -103,6 +114,10 @@ class _PartWork:
 
     # Filled by Pass 3
     final_mesh: trimesh.Trimesh | None = None
+    source_bounds: np.ndarray | None = None
+    source_to_final: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64))
+    transform_steps: list[dict] = field(default_factory=list)
+    repair_report: RepairReport | None = None
 
     @property
     def has_scale(self) -> bool:
@@ -123,22 +138,6 @@ class _PartWork:
 
 
 # ---------------------------------------------------------------------------
-# Progress helper
-# ---------------------------------------------------------------------------
-
-
-def _make_progress(console: Console) -> Progress:
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Pass-1 workers
 # ---------------------------------------------------------------------------
 
@@ -152,9 +151,20 @@ def _pass1_scale_first(
     any_rotation: bool,
     maximize: bool,
     rotation_samples: int,
+    repair_options: RepairOptions,
+    repair_cache_dir: Path | None,
 ) -> _PartWork:
     """Prepare mesh for global scale: search for best orientation (Z-only by default)."""
-    mesh = load_mesh(pw.abs_path)
+    mesh, repair_report = load_mesh_with_repair(
+        pw.abs_path,
+        repair_options,
+        source_name=pw.label,
+        repair_cache_dir=repair_cache_dir,
+    )
+    pw.repair_report = repair_report
+    pw.source_bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    if repair_report.enabled:
+        pw.transform_steps.append(repair_report_step(repair_report))
     t4, dims = select_orientation_for_scale(
         mesh,
         px,
@@ -167,10 +177,18 @@ def _pass1_scale_first(
         seed=ORIENTATION_SEED_DEFAULT,
     )
     mesh.apply_transform(t4)
+    normalize = translation_matrix([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
     mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
     pw.pass1_mesh = mesh
     pw.pass1_dims = dims
     pw.source_up = t4[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    pw.source_to_final = normalize @ t4
+    pw.transform_steps.extend(
+        [
+            transform_step("scale_orientation", matrix=t4),
+            transform_step("z_normalize", matrix=normalize),
+        ]
+    )
     return pw
 
 
@@ -182,9 +200,20 @@ def _pass1_orient_first(
     overhang_threshold_deg: float,
     n_candidates: int,
     resin_options: ResinOrientationOptions,
+    repair_options: RepairOptions,
+    repair_cache_dir: Path | None,
 ) -> _PartWork:
     """Tweaker-3 orient, then derive scale dims from the oriented AABB."""
-    mesh = load_mesh(pw.abs_path)
+    mesh, repair_report = load_mesh_with_repair(
+        pw.abs_path,
+        repair_options,
+        source_name=pw.label,
+        repair_cache_dir=repair_cache_dir,
+    )
+    pw.repair_report = repair_report
+    pw.source_bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    if repair_report.enabled:
+        pw.transform_steps.append(repair_report_step(repair_report))
     _ = mesh.face_normals  # warm caches before any concurrent use
     _ = mesh.area_faces
     rotation, _, _metrics = find_stable_overhang_rotation(
@@ -195,12 +224,22 @@ def _pass1_orient_first(
         resin_options=resin_options,
         source_up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
     )
+    rotation4 = rotation_to_transform4(rotation)
+    rotated_bounds = transform_bounds(np.asarray(mesh.bounds, dtype=np.float64), rotation4)
+    normalize = translation_matrix([0.0, 0.0, -float(rotated_bounds[0, 2])])
     oriented = apply_min_overhang_orientation(mesh, rotation)
     b = np.asarray(oriented.bounds)
     dims = (float(b[1, 0] - b[0, 0]), float(b[1, 1] - b[0, 1]), float(b[1, 2] - b[0, 2]))
     pw.pass1_mesh = oriented  # already at z=0 from apply_min_overhang_orientation
     pw.pass1_dims = dims
     pw.source_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    pw.source_to_final = normalize @ rotation4
+    pw.transform_steps.extend(
+        [
+            transform_step("support_orientation", matrix=rotation4),
+            transform_step("z_normalize", matrix=normalize),
+        ]
+    )
     return pw
 
 
@@ -218,14 +257,24 @@ def _pass3_apply(
     overhang_threshold_deg: float,
     n_candidates: int,
     resin_options: ResinOrientationOptions,
+    repair_options: RepairOptions,
+    repair_cache_dir: Path | None,
 ) -> _PartWork:
     """Apply the remaining pipeline steps to produce the final mesh."""
     if pw.has_scale and pw.scale_before_orient:
         # Pass 1 already applied scale-orientation transform; apply scale now.
         mesh = pw.pass1_mesh
         assert mesh is not None
+        scale_matrix = uniform_scale_matrix(s_final)
         mesh.apply_scale(s_final)
+        pw.source_to_final = scale_matrix @ pw.source_to_final
+        pw.transform_steps.append(
+            transform_step("global_scale", matrix=scale_matrix, params={"scale_factor": s_final})
+        )
+        normalize = translation_matrix([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
         mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
+        pw.source_to_final = normalize @ pw.source_to_final
+        pw.transform_steps.append(transform_step("z_normalize", matrix=normalize))
         if pw.has_orient:
             _ = mesh.face_normals
             _ = mesh.area_faces
@@ -237,20 +286,52 @@ def _pass3_apply(
                 resin_options=resin_options,
                 source_up=pw.source_up,
             )
+            rotation4 = rotation_to_transform4(rotation)
             mesh = apply_min_overhang_orientation(mesh, rotation)
+            normalize = translation_matrix([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
+            pw.source_to_final = normalize @ rotation4 @ pw.source_to_final
+            pw.transform_steps.extend(
+                [
+                    transform_step("support_orientation", matrix=rotation4),
+                    transform_step("z_normalize", matrix=normalize),
+                ]
+            )
 
     elif pw.has_orient and not pw.scale_before_orient:
         # Pass 1 already applied orient; apply scale now if needed.
         mesh = pw.pass1_mesh
         assert mesh is not None
         if pw.has_scale:
+            scale_matrix = uniform_scale_matrix(s_final)
             mesh.apply_scale(s_final)
+            pw.source_to_final = scale_matrix @ pw.source_to_final
+            pw.transform_steps.append(
+                transform_step(
+                    "global_scale", matrix=scale_matrix, params={"scale_factor": s_final}
+                )
+            )
+            normalize = translation_matrix([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
             mesh.apply_translation([0.0, 0.0, -float(np.asarray(mesh.bounds)[0, 2])])
+            pw.source_to_final = normalize @ pw.source_to_final
+            pw.transform_steps.append(transform_step("z_normalize", matrix=normalize))
 
     else:
         # steps == ["orient", "layout"] or ["layout"]
         # orient-only: pass1 already ran orient; layout-only: load fresh
-        mesh = pw.pass1_mesh if pw.pass1_mesh is not None else load_mesh(pw.abs_path)
+        if pw.pass1_mesh is not None:
+            mesh = pw.pass1_mesh
+        else:
+            mesh, repair_report = load_mesh_with_repair(
+                pw.abs_path,
+                repair_options,
+                source_name=pw.label,
+                repair_cache_dir=repair_cache_dir,
+            )
+            pw.repair_report = repair_report
+            if repair_report.enabled:
+                pw.transform_steps.append(repair_report_step(repair_report))
+        if pw.source_bounds is None:
+            pw.source_bounds = np.asarray(mesh.bounds, dtype=np.float64)
 
     pw.final_mesh = mesh
     return pw
@@ -279,6 +360,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         except (FileNotFoundError, ValueError) as e:
             console.print(f"[red]{e}[/red]")
             return finish_profile(profiler, console, 2)
+    args.progress = args.progress and settings.ui.progress
 
     if not settings.parts:
         console.print("[red]Job file has no [[parts]] entries.[/red]")
@@ -293,6 +375,11 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
     gap_mm = settings.packing.gap_mm
     edge_margin_mm = (
         settings.packing.edge_margin_mm if args.edge_margin_mm is None else args.edge_margin_mm
+    )
+    repair_options = resolve_repair_options(args.repair, settings)
+    repair_cache_dir = repair_cache_dir_for_output(
+        args.output_dir,
+        resolve_repair_cache_enabled(args.repair_cache, settings) and not args.dry_run,
     )
     resin_options = resolve_resin_orientation_options(args.resin_balance, settings)
     method = "sorted"
@@ -348,7 +435,16 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         def _submit_pass1(pw: _PartWork):
             if pw.has_scale and pw.scale_before_orient:
                 return _pass1_scale_first(
-                    pw, epx, epy, pz, method, any_rotation, maximize, args.rotation_samples
+                    pw,
+                    epx,
+                    epy,
+                    pz,
+                    method,
+                    any_rotation,
+                    maximize,
+                    args.rotation_samples,
+                    repair_options,
+                    repair_cache_dir,
                 )
             else:
                 # orient-first (either scale-after-orient or orient-only)
@@ -360,11 +456,13 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                     args.overhang_threshold_deg,
                     args.n_orient_candidates,
                     resin_options,
+                    repair_options,
+                    repair_cache_dir,
                 )
 
         with (
             profiler.stage("pass 1 orientation / scale search"),
-            _make_progress(console) as progress,
+            make_progress(console, enabled=args.progress) as progress,
         ):
             ptask = progress.add_task("Pass 1…", total=len(all_pass1))
             with ThreadPoolExecutor(max_workers=_n) as pool:
@@ -373,13 +471,15 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                 }
                 for fut in as_completed(futs):
                     try:
-                        fut.result()  # result written in-place to pw
+                        result = fut.result()  # result written in-place to pw
                     except Exception as e:
                         orig = futs[fut]
                         if args.verbose:
                             console.print_exception()
                         console.print(f"[red]Pass 1 failed for {orig.label!r}: {e}[/red]")
                         return finish_profile(profiler, console, 1)
+                    if result.repair_report and result.repair_report.changed:
+                        console.print(f"[dim]repair: {result.label} — mesh topology updated[/dim]")
                     progress.advance(ptask)
 
     # ── Pass 2: global scale ────────────────────────────────────────────────
@@ -430,21 +530,28 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
             args.overhang_threshold_deg,
             args.n_orient_candidates,
             resin_options,
+            repair_options,
+            repair_cache_dir,
         )
 
-    with profiler.stage("pass 3 apply pipeline"), _make_progress(console) as progress:
+    with (
+        profiler.stage("pass 3 apply pipeline"),
+        make_progress(console, enabled=args.progress) as progress,
+    ):
         ptask = progress.add_task("Applying pipeline…", total=len(works))
         with ThreadPoolExecutor(max_workers=_n3) as pool:
             futs3 = {profiler.submit(pool, "job.pass3", _submit_pass3, pw): pw for pw in works}
             for fut3 in as_completed(futs3):
                 try:
-                    fut3.result()
+                    result = fut3.result()
                 except Exception as e:
                     orig = futs3[fut3]
                     if args.verbose:
                         console.print_exception()
                     console.print(f"[red]Pass 3 failed for {orig.label!r}: {e}[/red]")
                     return finish_profile(profiler, console, 1)
+                if result.repair_report and result.repair_report.changed:
+                    console.print(f"[dim]repair: {result.label} — mesh topology updated[/dim]")
                 progress.advance(ptask)
 
     final_meshes: list[trimesh.Trimesh] = [pw.final_mesh for pw in works]  # type: ignore[misc]
@@ -456,6 +563,14 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                 cleaned, n_rem = remove_small_components(m)
                 if n_rem:
                     final_meshes[i] = cleaned
+                    works[i].final_mesh = cleaned
+                    works[i].transform_steps.append(
+                        transform_step(
+                            "cleanup",
+                            params={"removed_components": n_rem},
+                            available=False,
+                        )
+                    )
                     console.print(
                         f"[dim]cleanup: {final_names[i]} — removed {n_rem} tiny component(s)[/dim]"
                     )
@@ -481,13 +596,19 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
             return finish_profile(profiler, console, 1)
 
     shadows = []
-    with profiler.stage("pass 4 footprint computation"), _make_progress(console) as progress:
+    with (
+        profiler.stage("pass 4 footprint computation"),
+        make_progress(console, enabled=args.progress) as progress,
+    ):
         ptask = progress.add_task("Computing footprints…", total=len(final_meshes))
         for i, m in enumerate(final_meshes):
             shadows.append(profiler.profiled_call("job.footprint", mesh_to_packing_shadow, m))
             progress.update(ptask, advance=1, description=f"Footprint: {final_names[i]}")
 
-    with profiler.stage("pass 4 packing"), _make_progress(console) as progress:
+    with (
+        profiler.stage("pass 4 packing"),
+        make_progress(console, enabled=args.progress) as progress,
+    ):
         ptask = progress.add_task("Packing…", total=len(final_meshes))
         part_heights = [mesh_footprint_xy(m)[2] for m in final_meshes]
         packing_metadata: dict[str, object] = {}
@@ -522,11 +643,61 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         export_plate_3mf(final_meshes, pl, out_3mf, names=final_names, out_manifest=out_js)
         return out_3mf
 
-    with profiler.stage("pass 4 export"), _make_progress(console) as progress:
+    output_files: list[Path] = []
+    with profiler.stage("pass 4 export"), make_progress(console, enabled=args.progress) as progress:
         ptask = progress.add_task("Exporting plates…", total=len(plates))
         for pl in plates:
             out_path = profiler.profiled_call("job.export", _export_plate, pl)
             console.print(f"Wrote {out_path}")
+            output_files.append(out_path)
             progress.advance(ptask)
+
+    transform_parts: list[dict] = []
+    for pl in plates:
+        plate_file = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
+        for rect in pl.rects:
+            work = works[rect.part_index]
+            final_mesh = final_meshes[rect.part_index]
+            placement_transform, placement_steps = placement_transform_for_mesh(final_mesh, rect)
+            source_to_export = placement_transform @ work.source_to_final
+            source_bounds = (
+                np.asarray(work.source_bounds, dtype=np.float64)
+                if work.source_bounds is not None
+                else np.asarray(final_mesh.bounds, dtype=np.float64)
+            )
+            transform_parts.append(
+                transform_entry(
+                    index=rect.part_index,
+                    plate_index=pl.index,
+                    plate_file=plate_file,
+                    source_path=work.abs_path,
+                    source_name=work.label,
+                    output_name=final_names[rect.part_index],
+                    output_file=plate_file,
+                    source_bounds_mm=bounds_to_list(source_bounds),
+                    final_bounds_mm=bounds_to_list(
+                        transform_bounds(source_bounds, source_to_export)
+                    ),
+                    source_to_export_matrix=source_to_export,
+                    steps=[*work.transform_steps, *placement_steps],
+                    plate_x_mm=rect.x,
+                    plate_y_mm=rect.y,
+                    rotation_deg=rect.rotation_deg,
+                )
+            )
+    write_transform_log(
+        args.output_dir / "transforms.json",
+        command="job",
+        output_files=output_files,
+        parts=transform_parts,
+        metadata={"job_path": str(args.job_path)},
+    )
+    repair_reports = [work.repair_report for work in works if work.repair_report is not None]
+    write_command_repair_report(
+        args.output_dir,
+        command="job",
+        reports=repair_reports,
+        dry_run=args.dry_run,
+    )
 
     return finish_profile(profiler, console, 0)

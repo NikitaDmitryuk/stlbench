@@ -225,11 +225,26 @@ def cmd_scale(
     rotation_samples: Annotated[int | None, typer.Option("--rotation-samples")] = None,
     no_upscale: Annotated[bool, typer.Option("--no-upscale")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Repair mesh topology before transforms."),
+    ] = False,
+    repair_cache: Annotated[
+        bool,
+        typer.Option(
+            "--repair-cache/--no-repair-cache",
+            help="Cache repaired meshes under output/cache/repair.",
+        ),
+    ] = True,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     suffix: Annotated[str, typer.Option("--suffix", show_default=False)] = "",
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
+    ] = True,
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -257,9 +272,12 @@ def cmd_scale(
                 rotation_samples=rotation_samples,
                 no_upscale=no_upscale,
                 dry_run=dry_run,
+                repair=repair,
+                repair_cache=repair_cache,
                 recursive=recursive,
                 suffix=suffix,
                 verbose=verbose,
+                progress=progress,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
@@ -285,6 +303,17 @@ def cmd_layout(
     edge_margin_mm: Annotated[float | None, typer.Option("--edge-margin-mm")] = None,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Repair mesh topology before layout."),
+    ] = False,
+    repair_cache: Annotated[
+        bool,
+        typer.Option(
+            "--repair-cache/--no-repair-cache",
+            help="Cache repaired meshes under output/cache/repair.",
+        ),
+    ] = True,
     cleanup: Annotated[
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
@@ -308,6 +337,10 @@ def cmd_layout(
         int | None,
         typer.Option("--rotation-samples", help="SO(3) samples for scale orientation search."),
     ] = None,
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
+    ] = True,
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -327,11 +360,14 @@ def cmd_layout(
                 edge_margin_mm=edge_margin_mm,
                 recursive=recursive,
                 dry_run=dry_run,
+                repair=repair,
+                repair_cache=repair_cache,
                 cleanup=cleanup,
                 any_rotation=any_rotation,
                 orientation_policy=orientation_policy,
                 orientation_scale_tolerance=orientation_scale_tolerance,
                 rotation_samples=rotation_samples,
+                progress=progress,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
@@ -366,6 +402,17 @@ def cmd_fill(
         typer.Option("--overhang-angle", help="Overhang threshold in degrees."),
     ] = 45.0,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Repair mesh topology before copies are packed."),
+    ] = False,
+    repair_cache: Annotated[
+        bool,
+        typer.Option(
+            "--repair-cache/--no-repair-cache",
+            help="Cache repaired meshes under output/cache/repair.",
+        ),
+    ] = True,
     cleanup: Annotated[
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
@@ -389,6 +436,10 @@ def cmd_fill(
         int | None,
         typer.Option("--rotation-samples", help="SO(3) samples for scale orientation search."),
     ] = None,
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
+    ] = True,
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -409,11 +460,14 @@ def cmd_fill(
                 orient_on=orient,
                 orient_threshold_deg=overhang_angle,
                 dry_run=dry_run,
+                repair=repair,
+                repair_cache=repair_cache,
                 cleanup=cleanup,
                 any_rotation=any_rotation,
                 orientation_policy=orientation_policy,
                 orientation_scale_tolerance=orientation_scale_tolerance,
                 rotation_samples=rotation_samples,
+                progress=progress,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
@@ -460,6 +514,54 @@ def cmd_autopack(
     ] = 45.0,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Repair mesh topology before autopack."),
+    ] = False,
+    repair_cache: Annotated[
+        bool,
+        typer.Option(
+            "--repair-cache/--no-repair-cache",
+            help="Cache repaired meshes under output/cache/repair.",
+        ),
+    ] = True,
+    autopack_pack_workers: Annotated[
+        str | None,
+        typer.Option(
+            "--autopack-pack-workers",
+            help='Exact polygon pack workers: "auto" or a positive integer.',
+        ),
+    ] = None,
+    autopack_result_cache: Annotated[
+        bool,
+        typer.Option(
+            "--autopack-result-cache/--no-autopack-result-cache",
+            help="Cache final autopack scale and plate layout.",
+        ),
+    ] = True,
+    autopack_attempt_cache: Annotated[
+        bool,
+        typer.Option(
+            "--autopack-attempt-cache/--no-autopack-attempt-cache",
+            help="Cache exact polygon pack attempts during scale search.",
+        ),
+    ] = True,
+    autopack_scale_tolerance: Annotated[
+        float | None,
+        typer.Option("--autopack-scale-tol", help="Scale-search tolerance for autopack."),
+    ] = None,
+    autopack_packer: Annotated[
+        str | None,
+        typer.Option("--autopack-packer", help="Autopack backend: auto, bitmap, or exact."),
+    ] = None,
+    autopack_bitmap_grid_mm: Annotated[
+        float | None,
+        typer.Option("--autopack-bitmap-grid-mm", help="Bitmap autopack raster grid in mm."),
+    ] = None,
+    autopack_bitmap_beam_width: Annotated[
+        int | None,
+        typer.Option("--autopack-bitmap-beam-width", help="Bitmap autopack order beam width."),
+    ] = None,
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
@@ -493,6 +595,10 @@ def cmd_autopack(
         int | None,
         typer.Option("--rotation-samples", help="SO(3) samples for scale orientation search."),
     ] = None,
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
+    ] = True,
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -515,6 +621,15 @@ def cmd_autopack(
                 orient_on=orient,
                 orient_threshold_deg=overhang_angle,
                 dry_run=dry_run,
+                repair=repair,
+                repair_cache=repair_cache,
+                autopack_pack_workers=autopack_pack_workers,
+                autopack_result_cache=autopack_result_cache,
+                autopack_attempt_cache=autopack_attempt_cache,
+                autopack_scale_tolerance=autopack_scale_tolerance,
+                autopack_packer=autopack_packer,
+                autopack_bitmap_grid_mm=autopack_bitmap_grid_mm,
+                autopack_bitmap_beam_width=autopack_bitmap_beam_width,
                 recursive=recursive,
                 verbose=verbose,
                 cleanup=cleanup,
@@ -523,6 +638,7 @@ def cmd_autopack(
                 orientation_policy=orientation_policy,
                 orientation_scale_tolerance=orientation_scale_tolerance,
                 rotation_samples=rotation_samples,
+                progress=progress,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
@@ -561,11 +677,26 @@ def cmd_orient(
         ),
     ] = 200,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Repair mesh topology before orienting."),
+    ] = False,
+    repair_cache: Annotated[
+        bool,
+        typer.Option(
+            "--repair-cache/--no-repair-cache",
+            help="Cache repaired meshes under output/cache/repair.",
+        ),
+    ] = True,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     suffix: Annotated[str, typer.Option("--suffix", show_default=False)] = "",
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Print per-mesh progress and thread counts.")
     ] = False,
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
+    ] = True,
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -585,9 +716,12 @@ def cmd_orient(
                 overhang_threshold_deg=overhang_angle,
                 n_candidates=candidates,
                 dry_run=dry_run,
+                repair=repair,
+                repair_cache=repair_cache,
                 recursive=recursive,
                 suffix=suffix,
                 verbose=verbose,
+                progress=progress,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
@@ -640,6 +774,42 @@ def cmd_prepare(
         ),
     ] = 2.0,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Repair mesh topology before preparing plates."),
+    ] = False,
+    repair_cache: Annotated[
+        bool,
+        typer.Option(
+            "--repair-cache/--no-repair-cache",
+            help="Cache repaired meshes under output/cache/repair.",
+        ),
+    ] = True,
+    packer: Annotated[
+        str | None,
+        typer.Option("--packer", help="Prepare layout backend: auto, bitmap, or exact."),
+    ] = None,
+    bitmap_grid_mm: Annotated[
+        float | None,
+        typer.Option("--bitmap-grid-mm", help="Bitmap prepare layout raster grid in mm."),
+    ] = None,
+    bitmap_beam_width: Annotated[
+        int | None,
+        typer.Option("--bitmap-beam-width", help="Bitmap prepare layout order beam width."),
+    ] = None,
+    footprint_cache: Annotated[
+        bool,
+        typer.Option(
+            "--footprint-cache/--no-footprint-cache", help="Cache prepared mesh footprints."
+        ),
+    ] = True,
+    packing_result_cache: Annotated[
+        bool,
+        typer.Option(
+            "--packing-result-cache/--no-packing-result-cache",
+            help="Cache prepare layout results.",
+        ),
+    ] = True,
     recursive: Annotated[bool, typer.Option("--recursive")] = False,
     resume: Annotated[
         bool,
@@ -668,6 +838,10 @@ def cmd_prepare(
             help="Worker count for heavy prepare stages: 'auto' or a positive integer.",
         ),
     ] = "auto",
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
+    ] = True,
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -691,6 +865,13 @@ def cmd_prepare(
                 overhang_threshold_deg=overhang_angle,
                 n_orient_candidates=orient_candidates,
                 dry_run=dry_run,
+                repair=repair,
+                repair_cache=repair_cache,
+                packer=packer,
+                bitmap_grid_mm=bitmap_grid_mm,
+                bitmap_beam_width=bitmap_beam_width,
+                footprint_cache=footprint_cache,
+                packing_result_cache=packing_result_cache,
                 recursive=recursive,
                 verbose=verbose,
                 grid_step_mm=grid_step,
@@ -698,6 +879,7 @@ def cmd_prepare(
                 cleanup=cleanup,
                 any_rotation=any_rotation,
                 workers=workers,
+                progress=progress,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )
@@ -780,6 +962,21 @@ def job(
         bool,
         typer.Option("--cleanup", help="Remove tiny disconnected mesh components before export."),
     ] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair/--no-repair", help="Repair mesh topology before running the job."),
+    ] = False,
+    repair_cache: Annotated[
+        bool,
+        typer.Option(
+            "--repair-cache/--no-repair-cache",
+            help="Cache repaired meshes under output/cache/repair.",
+        ),
+    ] = True,
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
+    ] = True,
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -821,6 +1018,9 @@ def job(
                 verbose=verbose,
                 dry_run=dry_run,
                 cleanup=cleanup,
+                repair=repair,
+                repair_cache=repair_cache,
+                progress=progress,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )

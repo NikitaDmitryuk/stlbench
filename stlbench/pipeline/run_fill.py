@@ -12,25 +12,43 @@ from rich.console import Console
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
-from stlbench.core.overhang import apply_min_overhang_orientation, find_min_overhang_rotation
+from stlbench.core.overhang import (
+    apply_min_overhang_orientation,
+    find_min_overhang_rotation,
+    rotation_to_transform4,
+)
 from stlbench.export.plate import mesh_footprint_xy
+from stlbench.export.transform_log import (
+    bounds_to_list,
+    mesh_bounds,
+    shared_geometry_placement_transform_for_mesh,
+    transform_bounds,
+    transform_entry,
+    transform_step,
+    translation_matrix,
+    uniform_scale_matrix,
+    write_transform_log,
+)
 from stlbench.packing.layout_orientation import select_layout_transform
 from stlbench.packing.rectpack_plate import (
     PackedPlate,
     PackedRect,
-    footprint_fits_bin_mm,
-    int_bin_dims_mm,
-    int_rect_dims_mm,
 )
 from stlbench.pipeline.common import (
     finish_profile,
+    load_mesh_with_repair,
+    repair_cache_dir_for_output,
     resolve_gap,
     resolve_orientation_policy,
     resolve_orientation_scale_tolerance,
     resolve_printer,
+    resolve_repair_cache_enabled,
+    resolve_repair_options,
     resolve_settings,
+    write_command_repair_report,
 )
-from stlbench.pipeline.mesh_io import collect_mesh_paths, load_mesh
+from stlbench.pipeline.mesh_io import collect_mesh_paths
+from stlbench.pipeline.progress import make_progress
 from stlbench.profiling import ProfileOptions, make_profiler
 
 
@@ -46,11 +64,14 @@ class FillRunArgs:
     orient_threshold_deg: float
     dry_run: bool
     cleanup: bool = False
+    repair: bool = False
     any_rotation: bool = False
     orientation_policy: str | None = None
     orientation_scale_tolerance: float | None = None
     rotation_samples: int | None = None
     profile_options: ProfileOptions | None = None
+    repair_cache: bool = True
+    progress: bool = True
 
 
 def _max_copies_on_plate(
@@ -61,10 +82,13 @@ def _max_copies_on_plate(
     gap_mm: float,
 ) -> PackedPlate | None:
     """Pack as many identical rectangles (fw x fh) as possible onto one bin."""
-    bw, bh = int_bin_dims_mm(bed_w, bed_h, gap_mm)
-    rw, rh = int_rect_dims_mm(fw, fh, gap_mm)
+    scale = 1000.0
+    bw = max(1, int(np.floor((bed_w + gap_mm) * scale)))
+    bh = max(1, int(np.floor((bed_h + gap_mm) * scale)))
+    rw = max(1, int(np.ceil((fw + gap_mm) * scale)))
+    rh = max(1, int(np.ceil((fh + gap_mm) * scale)))
 
-    if not footprint_fits_bin_mm(fw, fh, bed_w, bed_h, gap_mm):
+    if not ((fw <= bed_w and fh <= bed_h) or (fh <= bed_w and fw <= bed_h)):
         return None
 
     max_possible = int((bw * bh) / max(1, rw * rh)) + 1
@@ -94,13 +118,15 @@ def _max_copies_on_plate(
             placed_w = int(round(r.width))
             placed_h = int(round(r.height))
             was_rotated = (placed_w == rh and placed_h == rw) and (rw != rh)
+            actual_w = fh if was_rotated else fw
+            actual_h = fw if was_rotated else fh
             placed.append(
                 PackedRect(
                     part_index=0,
-                    x=float(r.x),
-                    y=float(r.y),
-                    width=float(r.width) - gap_mm,
-                    height=float(r.height) - gap_mm,
+                    x=float(r.x) / scale,
+                    y=float(r.y) / scale,
+                    width=float(actual_w),
+                    height=float(actual_h),
                     rotation_deg=90.0 if was_rotated else 0.0,
                 )
             )
@@ -130,6 +156,12 @@ def run_fill(args: FillRunArgs) -> int:
     )
     profiler.start()
     st = resolve_settings(args.config_path)
+    args.progress = args.progress and (st.ui.progress if st is not None else True)
+    repair_options = resolve_repair_options(args.repair, st)
+    repair_cache_dir = repair_cache_dir_for_output(
+        args.output_dir,
+        resolve_repair_cache_enabled(args.repair_cache, st) and not args.dry_run,
+    )
 
     try:
         px, py, pz = resolve_printer(args.printer_xyz, st)
@@ -161,16 +193,39 @@ def run_fill(args: FillRunArgs) -> int:
 
     with profiler.stage("load mesh"):
         try:
-            mesh = load_mesh(inp)
+            mesh, repair_report = load_mesh_with_repair(
+                inp,
+                repair_options,
+                source_name=inp.name,
+                repair_cache_dir=repair_cache_dir,
+            )
         except (OSError, ValueError, TypeError) as e:
             console.print(f"[red]Failed to load {inp}: {e}[/red]")
             return finish_profile(profiler, console, 1)
+    if repair_report.enabled and repair_report.changed:
+        console.print(f"[dim]repair: {inp.name} — mesh topology updated[/dim]")
+
+    source_bounds_np = np.asarray(mesh.bounds, dtype=np.float64)
+    source_bounds = mesh_bounds(mesh)
+    pipeline_matrix = np.eye(4, dtype=np.float64)
+    pipeline_steps: list[dict] = []
+    if repair_report.enabled:
+        from stlbench.core.mesh_repair import repair_report_step
+
+        pipeline_steps.append(repair_report_step(repair_report))
 
     if args.cleanup:
         with profiler.stage("cleanup"):
             mesh, n_rem = remove_small_components(mesh)
             if n_rem:
                 console.print(f"[dim]cleanup: {inp.name} — removed {n_rem} tiny component(s)[/dim]")
+                pipeline_steps.append(
+                    transform_step(
+                        "cleanup",
+                        params={"removed_components": n_rem},
+                        available=False,
+                    )
+                )
 
     if args.scale:
         with profiler.stage("scale"):
@@ -178,7 +233,12 @@ def run_fill(args: FillRunArgs) -> int:
             s, _ = compute_global_scale((px, py, pz), [dims], [inp.name], "sorted")
             pf = st.scaling.post_fit_scale if st else 1.0
             s_final = s * pf
+            scale_matrix = uniform_scale_matrix(s_final)
             mesh.apply_scale(s_final)
+            pipeline_matrix = scale_matrix @ pipeline_matrix
+            pipeline_steps.append(
+                transform_step("scale", matrix=scale_matrix, params={"scale_factor": s_final})
+            )
         console.print(f"Scaled {inp.name} by {s_final:.6f}")
 
     if args.orient_on:
@@ -188,7 +248,17 @@ def run_fill(args: FillRunArgs) -> int:
                 overhang_threshold_deg=args.orient_threshold_deg,
                 printer_dims=(px, py, pz),
             )
+            rotation4 = rotation_to_transform4(rotation)
+            rotated_bounds = transform_bounds(np.asarray(mesh.bounds, dtype=np.float64), rotation4)
+            normalize = translation_matrix([0.0, 0.0, -float(rotated_bounds[0, 2])])
             mesh = apply_min_overhang_orientation(mesh, rotation)
+            pipeline_matrix = normalize @ rotation4 @ pipeline_matrix
+            pipeline_steps.extend(
+                [
+                    transform_step("support_orientation", matrix=rotation4),
+                    transform_step("z_normalize", matrix=normalize),
+                ]
+            )
         console.print(f"Overhang score after orient: {score:.1f}")
 
     rot_samples = (
@@ -218,11 +288,15 @@ def run_fill(args: FillRunArgs) -> int:
         return finish_profile(profiler, console, 1)
 
     mesh.apply_transform(transform)
+    pipeline_matrix = transform @ pipeline_matrix
+    pipeline_steps.append(transform_step("layout_orientation", matrix=transform))
     _, _, dz = mesh_footprint_xy(mesh)
     console.print(f"Part footprint: {fw:.2f} x {fh:.2f} mm, height: {dz:.2f} mm")
 
-    with profiler.stage("packing"):
+    with profiler.stage("packing"), make_progress(console, enabled=args.progress) as progress:
+        ptask = progress.add_task("Packing copies…", total=1)
         plate = profiler.profiled_call("fill.packing", _max_copies_on_plate, fw, fh, px, py, gap)
+        progress.advance(ptask)
     if plate is None:
         console.print("[red]Part does not fit on the bed.[/red]")
         return finish_profile(profiler, console, 1)
@@ -233,38 +307,28 @@ def run_fill(args: FillRunArgs) -> int:
     if args.dry_run:
         return finish_profile(profiler, console, 0)
 
-    with profiler.stage("export"):
+    with profiler.stage("export"), make_progress(console, enabled=args.progress) as progress:
+        ptask = progress.add_task("Exporting copies…", total=max(1, n))
         args.output_dir.mkdir(parents=True, exist_ok=True)
-
-        fill_meshes = []
-        fill_transforms = []
-        fill_names = []
-        for i, r in enumerate(plate.rects):
-            m = mesh.copy()
-            m.apply_translation(
-                [-float(m.bounds[0][0]), -float(m.bounds[0][1]), -float(m.bounds[0][2])]
-            )
-            if abs(r.rotation_deg) > 1e-9:
-                rot = np.array(
-                    trimesh.transformations.rotation_matrix(
-                        np.radians(r.rotation_deg), [0.0, 0.0, 1.0]
-                    ),
-                    dtype=np.float64,
-                )
-                m.apply_transform(rot)
-                m.apply_translation([-float(m.bounds[0][0]), -float(m.bounds[0][1]), 0.0])
-            t = np.eye(4, dtype=np.float64)
-            t[0, 3] = r.x
-            t[1, 3] = r.y
-            fill_meshes.append(m)
-            fill_transforms.append(t)
-            fill_names.append(f"copy_{i:02d}")
 
         out_3mf = args.output_dir / "fill_plate.3mf"
         out_json = args.output_dir / "fill_plate.json"
         scene = trimesh.Scene()
-        for m, tf, name in zip(fill_meshes, fill_transforms, fill_names, strict=True):
-            scene.add_geometry(m, geom_name=name, transform=tf)
+        base_mesh = mesh.copy()
+        shared_normalize = translation_matrix(-np.asarray(base_mesh.bounds[0], dtype=np.float64))
+        base_mesh.apply_transform(shared_normalize)
+        geom_name = inp.stem
+        scene.geometry[geom_name] = base_mesh
+        for i, r in enumerate(plate.rects):
+            node_name = f"copy_{i:02d}"
+            node_transform, _steps = shared_geometry_placement_transform_for_mesh(base_mesh, r)
+            scene.graph.update(
+                frame_to=node_name,
+                matrix=node_transform,
+                geometry=geom_name,
+                geometry_flags={"visible": True},
+            )
+            progress.advance(ptask)
         scene.export(str(out_3mf))
 
         manifest = {
@@ -285,6 +349,51 @@ def run_fill(args: FillRunArgs) -> int:
             ],
         }
         out_json.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        transform_parts: list[dict] = []
+        for i, r in enumerate(plate.rects):
+            placement_transform, placement_steps = shared_geometry_placement_transform_for_mesh(
+                base_mesh,
+                r,
+            )
+            source_to_export = placement_transform @ shared_normalize @ pipeline_matrix
+            transform_parts.append(
+                transform_entry(
+                    index=i,
+                    plate_index=0,
+                    plate_file=out_3mf,
+                    source_path=inp,
+                    source_name=inp.name,
+                    output_name=f"copy_{i:02d}",
+                    output_file=out_3mf,
+                    source_bounds_mm=source_bounds,
+                    final_bounds_mm=bounds_to_list(
+                        transform_bounds(source_bounds_np, source_to_export)
+                    ),
+                    source_to_export_matrix=source_to_export,
+                    steps=[
+                        *pipeline_steps,
+                        transform_step("shared_geometry_normalize", matrix=shared_normalize),
+                        *placement_steps,
+                    ],
+                    plate_x_mm=r.x,
+                    plate_y_mm=r.y,
+                    rotation_deg=r.rotation_deg,
+                )
+            )
+        write_transform_log(
+            args.output_dir / "transforms.json",
+            command="fill",
+            output_files=[out_3mf, out_json],
+            parts=transform_parts,
+            metadata={"copies": n, "source": str(inp)},
+        )
+        write_command_repair_report(
+            args.output_dir,
+            command="fill",
+            reports=[repair_report],
+            dry_run=args.dry_run,
+        )
 
     console.print(f"Wrote {out_3mf}  ({n} copies)")
     console.print(f"Wrote {out_json}")

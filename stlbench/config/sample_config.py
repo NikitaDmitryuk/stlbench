@@ -8,7 +8,9 @@ from stlbench.config.schema import (
     PackingSection,
     PipelineSection,
     PrinterSection,
+    RepairSection,
     ScalingSection,
+    UISection,
 )
 
 
@@ -24,6 +26,8 @@ def sample_app_settings() -> AppSettings:
         scaling=ScalingSection(post_fit_scale=0.95, any_rotation=True, maximize=True),
         packing=PackingSection(gap_mm=10.0),
         orientation=OrientationSection(),
+        repair=RepairSection(),
+        ui=UISection(),
     )
 
 
@@ -47,6 +51,9 @@ def render_sample_config_toml() -> str:
     sc = s.scaling
     pk = s.packing
     ori = s.orientation
+    repair = s.repair
+    autopack = s.autopack
+    ui = s.ui
 
     lines = [
         "# Typical SLA build volume (example: ELEGOO Mars 5 Ultra,",
@@ -84,6 +91,29 @@ def render_sample_config_toml() -> str:
         f"long_part_low_angle_penalty_below_deg = {_toml_number(ori.long_part_low_angle_penalty_below_deg)}",
         f"long_part_high_angle_penalty_above_deg = {_toml_number(ori.long_part_high_angle_penalty_above_deg)}",
         "",
+        "[repair]",
+        "# Conservative mesh repair before scale/orient/layout/export.",
+        f"enabled = {str(repair.enabled).lower()}",
+        f"close_holes = {str(repair.close_holes).lower()}",
+        f"max_hole_size_edges = {repair.max_hole_size_edges}",
+        f"repair_non_manifold = {str(repair.repair_non_manifold).lower()}",
+        f"remove_small_components = {str(repair.remove_small_components).lower()}",
+        f"cache = {str(repair.cache).lower()}",
+        "",
+        "[autopack]",
+        "# Cache exact polygon packing attempts/results and parallelise scale search.",
+        f"packer = {_toml_str(autopack.packer)}",
+        f"pack_workers = {_toml_str(autopack.pack_workers) if isinstance(autopack.pack_workers, str) else autopack.pack_workers}",
+        f"result_cache = {str(autopack.result_cache).lower()}",
+        f"attempt_cache = {str(autopack.attempt_cache).lower()}",
+        f"scale_tolerance = {_toml_number(autopack.scale_tolerance)}",
+        f"bitmap_grid_mm = {_toml_number(autopack.bitmap_grid_mm)}",
+        f"bitmap_beam_width = {autopack.bitmap_beam_width}",
+        "",
+        "[ui]",
+        "# Show interactive Rich progress bars when stderr is a terminal.",
+        f"progress = {str(ui.progress).lower()}",
+        "",
     ]
     return "\n".join(lines)
 
@@ -95,6 +125,9 @@ def render_sample_job_toml() -> str:
     sc = s.scaling
     pk = s.packing
     ori = s.orientation
+    repair = s.repair
+    autopack = s.autopack
+    ui = s.ui
     pl = PipelineSection()
     steps_str = "[" + ", ".join(f'"{step.value}"' for step in pl.default_steps) + "]"
 
@@ -131,6 +164,29 @@ def render_sample_job_toml() -> str:
         f"long_part_target_angle_max_deg = {_toml_number(ori.long_part_target_angle_max_deg)}",
         f"long_part_low_angle_penalty_below_deg = {_toml_number(ori.long_part_low_angle_penalty_below_deg)}",
         f"long_part_high_angle_penalty_above_deg = {_toml_number(ori.long_part_high_angle_penalty_above_deg)}",
+        "",
+        "[repair]",
+        "# Conservative mesh repair before scale/orient/layout/export.",
+        f"enabled = {str(repair.enabled).lower()}",
+        f"close_holes = {str(repair.close_holes).lower()}",
+        f"max_hole_size_edges = {repair.max_hole_size_edges}",
+        f"repair_non_manifold = {str(repair.repair_non_manifold).lower()}",
+        f"remove_small_components = {str(repair.remove_small_components).lower()}",
+        f"cache = {str(repair.cache).lower()}",
+        "",
+        "[autopack]",
+        "# Cache exact polygon packing attempts/results and parallelise scale search.",
+        f"packer = {_toml_str(autopack.packer)}",
+        f"pack_workers = {_toml_str(autopack.pack_workers) if isinstance(autopack.pack_workers, str) else autopack.pack_workers}",
+        f"result_cache = {str(autopack.result_cache).lower()}",
+        f"attempt_cache = {str(autopack.attempt_cache).lower()}",
+        f"scale_tolerance = {_toml_number(autopack.scale_tolerance)}",
+        f"bitmap_grid_mm = {_toml_number(autopack.bitmap_grid_mm)}",
+        f"bitmap_beam_width = {autopack.bitmap_beam_width}",
+        "",
+        "[ui]",
+        "# Show interactive Rich progress bars when stderr is a terminal.",
+        f"progress = {str(ui.progress).lower()}",
         "",
         "[pipeline]",
         "# Default step sequence for parts that do not specify their own 'steps'.",

@@ -21,16 +21,30 @@ from stlbench.core.fit import (
     compute_global_scale,
     limiting_part_index,
 )
+from stlbench.core.mesh_repair import repair_report_step
+from stlbench.export.transform_log import (
+    mesh_bounds,
+    transform_entry,
+    transform_step,
+    translation_matrix,
+    uniform_scale_matrix,
+    write_transform_log,
+)
 from stlbench.packing.layout_orientation import select_orientation_for_scale
 from stlbench.pipeline.common import (
     finish_profile,
-    load_named_meshes,
+    load_mesh_with_repair,
+    load_named_meshes_with_repair,
     n_workers,
+    repair_cache_dir_for_output,
     resolve_orientation_policy,
     resolve_orientation_scale_tolerance,
     resolve_printer,
+    resolve_repair_cache_enabled,
+    resolve_repair_options,
+    write_command_repair_report,
 )
-from stlbench.pipeline.mesh_io import load_mesh
+from stlbench.pipeline.progress import make_progress
 from stlbench.profiling import ProfileOptions, make_profiler
 
 
@@ -55,6 +69,9 @@ class ScaleRunArgs:
     suffix: str = ""
     verbose: bool = False
     profile_options: ProfileOptions | None = None
+    repair: bool = False
+    repair_cache: bool = True
+    progress: bool = True
 
 
 def run_scale(args: ScaleRunArgs) -> int:
@@ -72,6 +89,12 @@ def run_scale(args: ScaleRunArgs) -> int:
     )
     profiler.start()
     st = args.settings
+    args.progress = args.progress and (st.ui.progress if st is not None else True)
+    repair_options = resolve_repair_options(args.repair, st)
+    repair_cache_dir = repair_cache_dir_for_output(
+        args.output_dir,
+        resolve_repair_cache_enabled(args.repair_cache, st) and not args.dry_run,
+    )
 
     # ── Validation ────────────────────────────────────────────────────────────
     if args.maximize and not args.any_rotation:
@@ -124,10 +147,16 @@ def run_scale(args: ScaleRunArgs) -> int:
         return finish_profile(profiler, console, 2)
 
     with profiler.stage("load meshes"):
-        loaded = load_named_meshes(input_dir, args.recursive, console)
+        loaded = load_named_meshes_with_repair(
+            input_dir,
+            args.recursive,
+            console,
+            repair_options,
+            repair_cache_dir,
+        )
     if loaded is None:
         return finish_profile(profiler, console, 1)
-    paths, part_names, meshes = loaded
+    paths, part_names, meshes, repair_reports = loaded
     del loaded
 
     px, py, pz = prx, pry, prz
@@ -153,8 +182,16 @@ def run_scale(args: ScaleRunArgs) -> int:
     _n = n_workers(len(meshes))
     if args.verbose:
         console.print(f"[dim]orient: {_n} workers for {len(meshes)} meshes[/dim]")
-    with profiler.stage("orientation search"), ThreadPoolExecutor(max_workers=_n) as pool:
-        _results = list(profiler.map(pool, "scale.orientation", _select_orient, meshes))
+    with (
+        profiler.stage("orientation search"),
+        ThreadPoolExecutor(max_workers=_n) as pool,
+        make_progress(console, enabled=args.progress) as progress,
+    ):
+        ptask = progress.add_task("Finding orientations…", total=len(meshes))
+        _results = []
+        for result in profiler.map(pool, "scale.orientation", _select_orient, meshes):
+            _results.append(result)
+            progress.advance(ptask)
     transforms: list[np.ndarray] = [r[0] for r in _results]
     parts_dims: list[tuple[float, float, float]] = [r[1] for r in _results]
 
@@ -240,8 +277,11 @@ def run_scale(args: ScaleRunArgs) -> int:
     if args.dry_run:
         return finish_profile(profiler, console, 0)
 
-    with profiler.stage("export"):
+    with profiler.stage("export"), make_progress(console, enabled=args.progress) as progress:
+        ptask = progress.add_task("Exporting meshes…", total=len(paths))
         output_dir.mkdir(parents=True, exist_ok=True)
+        transform_parts: list[dict] = []
+        output_files: list[Path] = []
 
         for idx, path in enumerate(paths):
             if args.recursive:
@@ -256,17 +296,37 @@ def run_scale(args: ScaleRunArgs) -> int:
 
             if args.verbose:
                 console.print(f"[dim]  [{idx + 1}/{len(paths)}] exporting {path.name}[/dim]")
-            mesh = load_mesh(path)
+            mesh, export_repair_report = load_mesh_with_repair(
+                path,
+                repair_options,
+                source_name=part_names[idx],
+                repair_cache_dir=repair_cache_dir,
+            )
+            source_bounds = mesh_bounds(mesh)
+            source_to_output = np.eye(4, dtype=np.float64)
+            steps = (
+                [repair_report_step(export_repair_report)] if export_repair_report.enabled else []
+            )
             t4 = transforms[idx]
             if not np.allclose(t4, np.eye(4)):
                 mesh.apply_transform(t4)
+                source_to_output = t4 @ source_to_output
+                steps.append(transform_step("scale_orientation", matrix=t4))
+            scale_matrix = uniform_scale_matrix(s_final)
             mesh.apply_scale(s_final)
+            source_to_output = scale_matrix @ source_to_output
+            steps.append(
+                transform_step("scale", matrix=scale_matrix, params={"scale_factor": s_final})
+            )
             if not np.allclose(t4, np.eye(4)):
                 # Rotation around world origin shifts the mesh's XY position; restore
                 # AABB min to origin so the output sits on the build plate as expected.
                 b = np.asarray(mesh.bounds)
                 if not np.allclose(b[0], np.zeros(3), atol=1e-6):
+                    translate = translation_matrix(-b[0])
                     mesh.apply_translation(-b[0])
+                    source_to_output = translate @ source_to_output
+                    steps.append(transform_step("normalize_to_origin", matrix=translate))
 
             try:
                 mesh.export(out_path)
@@ -274,5 +334,34 @@ def run_scale(args: ScaleRunArgs) -> int:
                 console.print(f"[red]Failed to export {out_path}: {e}[/red]")
                 return finish_profile(profiler, console, 1)
             console.print(f"Wrote {out_path}")
+            progress.advance(ptask)
+            output_files.append(out_path)
+            transform_parts.append(
+                transform_entry(
+                    index=idx,
+                    source_path=path,
+                    source_name=part_names[idx],
+                    output_name=out_path.name,
+                    output_file=out_path,
+                    source_bounds_mm=source_bounds,
+                    final_bounds_mm=mesh_bounds(mesh),
+                    source_to_export_matrix=source_to_output,
+                    steps=steps,
+                    scale_factor=s_final,
+                )
+            )
+
+        write_transform_log(
+            output_dir / "transforms.json",
+            command="scale",
+            output_files=output_files,
+            parts=transform_parts,
+        )
+        write_command_repair_report(
+            output_dir,
+            command="scale",
+            reports=repair_reports,
+            dry_run=args.dry_run,
+        )
 
     return finish_profile(profiler, console, 0)
