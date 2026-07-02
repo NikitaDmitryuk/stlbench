@@ -100,11 +100,13 @@ def transform_step(
     return out
 
 
-def placement_transform_for_mesh(
-    mesh: trimesh.Trimesh, rect: Any
+def placement_transform_for_bounds(
+    bounds: np.ndarray, rect: Any
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Return current-mesh-to-plate transform matching export_plate_3mf_lazy."""
-    bounds = np.asarray(mesh.bounds, dtype=np.float64)
+    """Return current-bounds-to-plate transform matching export_plate_3mf_lazy."""
+    bounds = np.asarray(bounds, dtype=np.float64)
+    if bounds.shape != (2, 3):
+        raise ValueError("bounds must have shape (2, 3).")
     normalize = translation_matrix(-bounds[0])
     rotation_deg = float(getattr(rect, "rotation_deg", 0.0))
     rotate = z_rotation_matrix(rotation_deg)
@@ -128,6 +130,13 @@ def placement_transform_for_mesh(
         ),
     ]
     return matrix, steps
+
+
+def placement_transform_for_mesh(
+    mesh: trimesh.Trimesh, rect: Any
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Return current-mesh-to-plate transform matching export_plate_3mf_lazy."""
+    return placement_transform_for_bounds(np.asarray(mesh.bounds, dtype=np.float64), rect)
 
 
 def shared_geometry_placement_transform_for_mesh(

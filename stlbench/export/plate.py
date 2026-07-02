@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import uuid
+import zipfile
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+from xml.sax.saxutils import escape
 
 import numpy as np
 import trimesh
 
 from stlbench.packing.rectpack_plate import PackedPlate
+
+ExportCompressionMode = Literal["default", "fast", "store"]
 
 
 class MeshLoader(Protocol):
@@ -62,6 +67,126 @@ def _validate_rect_local_bounds(
     return actual_w, actual_h
 
 
+def _compression_options(mode: ExportCompressionMode) -> tuple[int, int | None]:
+    if mode == "default":
+        return zipfile.ZIP_DEFLATED, 5
+    if mode == "fast":
+        return zipfile.ZIP_DEFLATED, 1
+    if mode == "store":
+        return zipfile.ZIP_STORED, None
+    raise ValueError("compression_mode must be default, fast, or store.")
+
+
+def _xml_attr(value: object) -> str:
+    return escape(str(value), {'"': "&quot;"})
+
+
+def _transform_3mf(matrix: np.ndarray) -> str:
+    return " ".join(str(i) for i in np.asarray(matrix, dtype=np.float64)[:3, :4].T.flatten())
+
+
+def _write_vertex_batch(file_obj: Any, vertices: np.ndarray) -> None:
+    rows = np.asarray(vertices).tolist()
+    file_obj.write(
+        "".join(f'<vertex x="{x}" y="{y}" z="{z}" />' for x, y, z in rows).encode("utf-8")
+    )
+
+
+def _write_face_batch(file_obj: Any, faces: np.ndarray) -> None:
+    rows = np.asarray(faces).tolist()
+    file_obj.write(
+        "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}" />' for a, b, c in rows).encode("utf-8")
+    )
+
+
+def _export_3mf_direct(
+    meshes: list[trimesh.Trimesh],
+    transforms: list[np.ndarray],
+    names: list[str],
+    out_3mf: Path,
+    *,
+    compression_mode: ExportCompressionMode,
+    batch_size: int = 4096,
+) -> None:
+    compression, compresslevel = _compression_options(compression_mode)
+    model_ns = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+    rels_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    content_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
+
+    with zipfile.ZipFile(
+        out_3mf,
+        mode="w",
+        compression=compression,
+        compresslevel=compresslevel,
+    ) as zf:
+        with zf.open("3D/3dmodel.model", "w") as f:
+            f.write(
+                (
+                    "<?xml version='1.0' encoding='utf-8'?>\n"
+                    f'<model xmlns="{model_ns}" '
+                    'xmlns:b="http://schemas.microsoft.com/3dmanufacturing/beamlattice/2017/02" '
+                    'xmlns:m="http://schemas.microsoft.com/3dmanufacturing/material/2015/02" '
+                    'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" '
+                    'xmlns:s="http://schemas.microsoft.com/3dmanufacturing/slice/2015/07" '
+                    'xmlns:sc="http://schemas.microsoft.com/3dmanufacturing/securecontent/2019/04" '
+                    'unit="millimeter"><resources>'
+                ).encode()
+            )
+            for object_id, (mesh, name) in enumerate(zip(meshes, names, strict=True), start=1):
+                f.write(
+                    (
+                        f'<object id="{object_id}" name="{_xml_attr(name)}" type="model" '
+                        f'p:UUID="{uuid.uuid4()}"><mesh><vertices>'
+                    ).encode()
+                )
+                for i in range(0, len(mesh.vertices), batch_size):
+                    _write_vertex_batch(f, mesh.vertices[i : i + batch_size])
+                f.write(b"</vertices><triangles>")
+                for i in range(0, len(mesh.faces), batch_size):
+                    _write_face_batch(f, mesh.faces[i : i + batch_size])
+                f.write(b"</triangles></mesh></object>")
+            f.write(f'</resources><build p:UUID="{uuid.uuid4()}">'.encode())
+            for object_id, (name, transform) in enumerate(
+                zip(names, transforms, strict=True), start=1
+            ):
+                f.write(
+                    (
+                        f'<item objectid="{object_id}" transform="{_xml_attr(_transform_3mf(transform))}" '
+                        f'p:UUID="{uuid.uuid4()}" partnumber="{_xml_attr(name)}" />'
+                    ).encode()
+                )
+            f.write(b"</build></model>")
+
+        with zf.open("_rels/.rels", "w") as f:
+            f.write(
+                (
+                    "<?xml version='1.0' encoding='utf-8'?>\n"
+                    f'<Relationships xmlns="{rels_ns}">'
+                    '<Relationship Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" '
+                    'Target="/3D/3dmodel.model" Id="rel0" />'
+                    "</Relationships>"
+                ).encode()
+            )
+
+        with zf.open("[Content_Types].xml", "w") as f:
+            defaults = (
+                ("jpeg", "image/jpeg"),
+                ("jpg", "image/jpeg"),
+                ("model", "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"),
+                ("png", "image/png"),
+                ("rels", "application/vnd.openxmlformats-package.relationships+xml"),
+                ("texture", "application/vnd.ms-package.3dmanufacturing-3dmodeltexture"),
+            )
+            f.write(
+                (f"<?xml version='1.0' encoding='utf-8'?>\n<Types xmlns=\"{content_ns}\">").encode()
+            )
+            for extension, content_type in defaults:
+                f.write(
+                    (f'<Default Extension="{extension}" ContentType="{content_type}" />').encode()
+                )
+            f.write(b"</Types>")
+
+
 def _place_rect(m: trimesh.Trimesh, r: object) -> trimesh.Trimesh:
     """Translate mesh to origin, rotate by rotation_deg around Z, then place at rect (x, y).
 
@@ -78,6 +203,8 @@ def export_plate_3mf(
     out_3mf: Path,
     names: list[str] | None = None,
     out_manifest: Path | None = None,
+    *,
+    compression_mode: ExportCompressionMode = "default",
 ) -> None:
     def _load_mesh(part_index: int) -> trimesh.Trimesh:
         return meshes[part_index]
@@ -89,6 +216,7 @@ def export_plate_3mf(
         names=names,
         out_manifest=out_manifest,
         copy_mesh=True,
+        compression_mode=compression_mode,
     )
 
 
@@ -100,6 +228,7 @@ def export_plate_3mf_lazy(
     out_manifest: Path | None = None,
     *,
     copy_mesh: bool = False,
+    compression_mode: ExportCompressionMode = "default",
 ) -> None:
     """Export a packed plate as a 3MF with one independent object per part.
 
@@ -157,11 +286,14 @@ def export_plate_3mf_lazy(
     if not out_meshes:
         raise ValueError("No meshes to export for this plate.")
 
-    scene = trimesh.Scene()
-    for m, tf, name in zip(out_meshes, out_transforms, out_names, strict=True):
-        scene.add_geometry(m, geom_name=name, transform=tf)
     out_3mf.parent.mkdir(parents=True, exist_ok=True)
-    scene.export(str(out_3mf))
+    _export_3mf_direct(
+        out_meshes,
+        out_transforms,
+        out_names,
+        out_3mf,
+        compression_mode=compression_mode,
+    )
     for m in out_meshes:
         clear_mesh_cache(m)
 

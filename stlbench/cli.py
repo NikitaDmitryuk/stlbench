@@ -842,6 +842,27 @@ def cmd_prepare(
         bool,
         typer.Option("--progress/--no-progress", help="Show interactive progress bars."),
     ] = True,
+    orientation_strategy: Annotated[
+        str,
+        typer.Option(
+            "--orientation-strategy",
+            help="Prepare orientation strategy: auto or legacy.",
+        ),
+    ] = "auto",
+    orientation_quality: Annotated[
+        str,
+        typer.Option(
+            "--orientation-quality",
+            help="Prepare support orientation quality: default or adaptive.",
+        ),
+    ] = "adaptive",
+    export_compression: Annotated[
+        str,
+        typer.Option(
+            "--export-compression",
+            help="3MF export ZIP compression: default, fast, or store.",
+        ),
+    ] = "default",
     profile: Annotated[bool, typer.Option("--profile/--no-profile")] = False,
     profile_dir: Annotated[Path | None, typer.Option("--profile-dir")] = None,
     profile_sort: Annotated[
@@ -880,6 +901,9 @@ def cmd_prepare(
                 any_rotation=any_rotation,
                 workers=workers,
                 progress=progress,
+                orientation_strategy=orientation_strategy,
+                orientation_quality=orientation_quality,
+                export_compression=export_compression,
                 profile_options=_profile_options(profile, profile_dir, profile_sort, profile_limit),
             )
         )

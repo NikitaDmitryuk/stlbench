@@ -7,6 +7,7 @@ import pytest
 import trimesh
 
 from stlbench.export.transform_log import (
+    placement_transform_for_bounds,
     placement_transform_for_mesh,
     shared_geometry_placement_transform_for_mesh,
     transform_bounds,
@@ -61,6 +62,18 @@ def test_placement_transform_matches_export_bounds():
     ]
     assert placed_bounds[0] == pytest.approx([3.0, 4.0, 0.0])
     assert placed_bounds[1] == pytest.approx([23.0, 14.0, 5.0])
+
+
+def test_placement_transform_for_bounds_matches_mesh_helper():
+    mesh = trimesh.creation.box(extents=(10.0, 20.0, 5.0))
+    mesh.apply_translation([7.0, -3.0, 11.0])
+    rect = PackedRect(part_index=0, x=3.0, y=4.0, width=20.0, height=10.0, rotation_deg=90.0)
+
+    from_mesh, mesh_steps = placement_transform_for_mesh(mesh, rect)
+    from_bounds, bounds_steps = placement_transform_for_bounds(np.asarray(mesh.bounds), rect)
+
+    assert from_bounds == pytest.approx(from_mesh)
+    assert bounds_steps == mesh_steps
 
 
 def test_shared_geometry_placement_matches_full_placement():
