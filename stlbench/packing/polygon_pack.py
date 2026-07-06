@@ -26,6 +26,7 @@ import numpy as np
 import pyclipper
 import shapely
 from shapely import affinity
+from shapely.errors import GEOSException
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
@@ -79,10 +80,10 @@ def _int_paths_to_shapely(paths: list[list[tuple[int, int]]]) -> BaseGeometry | 
             p = Polygon(coords)
             if not p.is_valid:
                 p = p.buffer(0)
-            if not p.is_empty:
-                polys.append(p)
-        except Exception:
-            continue
+        except (GEOSException, ValueError):
+            p = None
+        if p is not None and not p.is_empty:
+            polys.append(p)
     if not polys:
         return None
     if len(polys) == 1:
@@ -126,7 +127,7 @@ def _outer_nfp(fixed: BaseGeometry, moving: BaseGeometry) -> BaseGeometry | None
 
     try:
         result = pyclipper.MinkowskiSum(fixed_int, neg_moving_int, True)
-    except Exception:
+    except (pyclipper.ClipperException, OverflowError, ValueError):
         return None
 
     return _int_paths_to_shapely(result) if result else None

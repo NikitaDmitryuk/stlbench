@@ -6,10 +6,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pytest
 import trimesh
 
+from stlbench.core.mesh_repair import RepairOptions
+from stlbench.core.overhang import ResinOrientationOptions
 from stlbench.pipeline.run_layout import LayoutRunArgs, run_layout
-from stlbench.pipeline.run_prepare import PrepareRunArgs, run_prepare
+from stlbench.pipeline.run_prepare import (
+    PrepareRunArgs,
+    _prepare_cache_worker,
+    _PrepareCacheJob,
+    _select_retained_indices,
+    run_prepare,
+)
 from stlbench.pipeline.run_scale import ScaleRunArgs, run_scale
 from stlbench.profiling import ProfileOptions, make_profiler
 
@@ -25,6 +35,9 @@ def _prepare_args(
     packer: str | None = None,
     resume: bool = False,
     profile_options: ProfileOptions | None = None,
+    export_compression: str = "default",
+    orientation_strategy: str = "auto",
+    orientation_quality: str = "adaptive",
 ) -> PrepareRunArgs:
     return PrepareRunArgs(
         input_dir=input_dir,
@@ -41,6 +54,9 @@ def _prepare_args(
         packer=packer,
         resume=resume,
         profile_options=profile_options,
+        export_compression=export_compression,
+        orientation_strategy=orientation_strategy,
+        orientation_quality=orientation_quality,
     )
 
 
@@ -63,6 +79,27 @@ def _assert_profile_artifacts(profile_dir: Path, command: str) -> dict[str, Any]
     assert payload["top_functions"]
     assert int(getattr(pstats.Stats(str(pstats_path)), "total_calls", 0)) > 0
     return payload
+
+
+def test_select_retained_indices_respects_cap_and_largest_first(tmp_path: Path):
+    sizes = [100, 30, 20, 10]
+    paths: list[Path] = []
+    for idx, size in enumerate(sizes):
+        path = tmp_path / f"part-{idx}.stl"
+        path.write_bytes(b"x" * size)
+        paths.append(path)
+
+    retained, metadata = _select_retained_indices(
+        paths,
+        memory_budget_bytes=100_000,
+        orient_workers=3,
+    )
+
+    assert retained == {0, 1}
+    assert metadata["retained_indices"] == [0, 1]
+    assert metadata["estimated_retained_bytes"] == 520
+    assert metadata["cap_bytes"] == 540
+    assert metadata["max_retained_parts"] == 3
 
 
 def test_execution_profiler_writes_artifacts_and_merges_worker_stats(tmp_path: Path):
@@ -188,6 +225,8 @@ def test_run_prepare_dry_run_profile_creates_artifacts(tmp_path: Path):
     assert payload["metadata"]["resource_plan"]["requested"] == "auto"
     assert payload["metadata"]["resource_plan"]["scale_workers"] >= 1
     assert payload["metadata"]["orientation_options"]["resin_balance"] == "balanced"
+    assert payload["metadata"]["orientation_options"]["quality"] == "adaptive"
+    assert "orientation_retention" in payload["metadata"]
     orient = payload["metadata"]["orientation_stability"]
     assert len(orient) == 1
     assert "support_contact_proxy" in orient[0]
@@ -229,6 +268,119 @@ def test_run_prepare_writes_orient_cache_refs(tmp_path: Path):
     log = json.loads((out_dir / "transforms.json").read_text(encoding="utf-8"))
     assert log["command"] == "prepare"
     assert len(log["parts"]) == 1
+    part = log["parts"][0]
+    assert part["source_bounds_mm"] is not None
+    assert part["final_bounds_mm"] is not None
+    assert part["source_to_export_matrix"] is not None
+    assert part["export_to_source_matrix"] is not None
+
+
+def test_run_prepare_fast_export_writes_loadable_3mf_and_profile_metadata(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_box(input_dir / "a.stl", (10.0, 20.0, 30.0))
+    _write_box(input_dir / "b.stl", (15.0, 10.0, 20.0))
+    out_dir = tmp_path / "out"
+    profile_dir = tmp_path / "profile"
+
+    rc = run_prepare(
+        _prepare_args(
+            input_dir,
+            out_dir,
+            profile_options=ProfileOptions(enabled=True, profile_dir=profile_dir, limit=20),
+            export_compression="fast",
+        )
+    )
+
+    assert rc == 0
+    payload = _assert_profile_artifacts(profile_dir, "prepare")
+    assert payload["metadata"]["export"]["compression"] == "fast"
+    assert payload["metadata"]["orientation_options"]["strategy"] == "auto"
+    assert payload["metadata"]["orientation_timings"]
+    assert any(w["metadata"].get("part") for w in payload["workers"])
+    assert any(s["name"] == "export" for s in payload["stages"])
+    total_geometry = 0
+    for plate_path in sorted(out_dir.glob("plate_*.3mf")):
+        loaded = trimesh.load(plate_path, force="scene")
+        assert isinstance(loaded, trimesh.Scene)
+        total_geometry += len(loaded.geometry)
+    assert total_geometry == 2
+
+
+def test_run_prepare_adaptive_orientation_quality_records_diagnostics(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_box(input_dir / "rod.stl", (80.0, 6.0, 6.0))
+    out_dir = tmp_path / "out"
+    profile_dir = tmp_path / "profile"
+
+    rc = run_prepare(
+        _prepare_args(
+            input_dir,
+            out_dir,
+            profile_options=ProfileOptions(enabled=True, profile_dir=profile_dir, limit=20),
+            orientation_quality="adaptive",
+        )
+    )
+
+    assert rc == 0
+    payload = _assert_profile_artifacts(profile_dir, "prepare")
+    assert payload["metadata"]["orientation_options"]["quality"] == "adaptive"
+    orient_workers = [w for w in payload["workers"] if w["name"] == "prepare.scale_orient_cache"]
+    assert orient_workers
+    metadata = orient_workers[0]["metadata"]
+    assert metadata["orientation_quality"] == "adaptive"
+    assert "adaptive_enabled" in metadata
+    assert "candidate_count_default" in metadata
+    assert "candidate_count_adaptive" in metadata
+
+
+def test_prepare_cache_worker_auto_orientation_falls_back_to_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    input_path = tmp_path / "part.stl"
+    _write_box(input_path, (20.0, 20.0, 40.0))
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("forced auto failure")
+
+    monkeypatch.setattr("stlbench.pipeline.run_prepare.find_stable_overhang_rotation", _boom)
+
+    (
+        _idx,
+        _sb,
+        _sa,
+        _pct,
+        ref,
+        metrics_payload,
+        _duration_s,
+        timing_payload,
+    ) = _prepare_cache_worker(
+        _PrepareCacheJob(
+            index=0,
+            path=input_path,
+            name=input_path.name,
+            cache_dir=tmp_path / "cache",
+            scale_transform=np.eye(4, dtype=np.float64),
+            source_up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            scale=1.0,
+            overhang_threshold_deg=45.0,
+            n_orient_candidates=20,
+            printer_xyz=(100.0, 100.0, 100.0),
+            cleanup=False,
+            resin_options=ResinOrientationOptions(),
+            repair_options=RepairOptions(),
+            repair_cache_dir=None,
+            orientation_strategy="auto",
+            orientation_quality="default",
+        )
+    )
+
+    assert ref.cache_path.exists()
+    assert metrics_payload["orientation_strategy"] == "legacy"
+    assert timing_payload["fallback"] is True
+    assert timing_payload["strategy_used"] == "legacy"
+    assert "forced auto failure" in str(timing_payload["fallback_reason"])
 
 
 def test_run_prepare_reuses_footprint_and_packing_cache(tmp_path: Path):

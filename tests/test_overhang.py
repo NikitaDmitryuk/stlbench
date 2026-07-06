@@ -10,6 +10,8 @@ from stlbench.core.overhang import (
     apply_min_overhang_orientation,
     find_min_overhang_rotation,
     find_stable_overhang_rotation,
+    find_stable_overhang_rotation_adaptive,
+    find_stable_overhang_rotation_legacy,
     overhang_score,
 )
 
@@ -78,6 +80,69 @@ def test_stable_overhang_keeps_long_rod_in_resin_target_band():
     assert 30.0 <= metrics.long_axis_angle_from_bed_deg <= 50.0
     assert oriented.extents[2] > 6.0
     assert metrics.selection_reason == "long_part_target_band"
+
+
+@pytest.mark.parametrize(
+    "extents",
+    [(120.0, 6.0, 6.0), (6.0, 6.0, 120.0), (70.0, 4.0, 40.0), (20.0, 20.0, 40.0)],
+)
+def test_auto_stable_overhang_metrics_are_not_worse_than_legacy(
+    extents: tuple[float, float, float],
+):
+    mesh = trimesh.creation.box(extents=extents)
+
+    _legacy_rotation, _legacy_score, legacy = find_stable_overhang_rotation_legacy(
+        mesh,
+        n_candidates=80,
+        printer_dims=(200.0, 200.0, 200.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(resin_balance="balanced"),
+    )
+    _auto_rotation, _auto_score, auto = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=80,
+        printer_dims=(200.0, 200.0, 200.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(resin_balance="balanced"),
+    )
+
+    assert auto.stability_score <= legacy.stability_score + 1e-9
+    assert auto.overhang_score <= legacy.overhang_score + max(mesh.area, 1.0) * 0.5 + 1e-9
+    assert auto.height_mm <= 200.0 + 1e-6
+
+
+@pytest.mark.parametrize(
+    "extents",
+    [(120.0, 6.0, 6.0), (80.0, 10.0, 20.0), (20.0, 20.0, 8.0)],
+)
+def test_adaptive_stable_overhang_is_not_worse_than_default(
+    extents: tuple[float, float, float],
+):
+    mesh = trimesh.creation.box(extents=extents)
+
+    _default_rotation, _default_score, default = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=80,
+        printer_dims=(200.0, 200.0, 200.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(resin_balance="balanced"),
+    )
+    _adaptive_rotation, _adaptive_score, adaptive, diagnostics = (
+        find_stable_overhang_rotation_adaptive(
+            mesh,
+            n_candidates=80,
+            printer_dims=(200.0, 200.0, 200.0),
+            support_tolerance_ratio=0.5,
+            resin_options=ResinOrientationOptions(resin_balance="balanced"),
+        )
+    )
+
+    assert adaptive.stability_score <= default.stability_score + 1e-6
+    assert adaptive.overhang_score <= default.overhang_score + 1e-6
+    assert adaptive.height_mm <= default.height_mm + 1e-6
+    assert "adaptive_enabled" in diagnostics
+    assert "candidate_count_default" in diagnostics
+    assert "candidate_count_adaptive" in diagnostics
 
 
 def test_stable_overhang_rejects_horizontal_long_rod_when_target_exists():

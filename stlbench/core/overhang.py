@@ -18,6 +18,7 @@ Score = overhang_area - 0.5 * bottom_area   (lower is better)
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -75,6 +76,20 @@ class OrientationStabilityMetrics:
     vertical_penalty: float
     horizontal_penalty: float
     selection_reason: str
+
+
+@dataclass(frozen=True)
+class OrientationSearchData:
+    cos_t: float
+    face_normals: np.ndarray
+    face_areas: np.ndarray
+    face_saliency: np.ndarray
+    rotations: np.ndarray
+    raw_scores: np.ndarray
+    fits: np.ndarray
+    phase1_scores: np.ndarray
+    convex_hull_vertices: np.ndarray | None
+    candidate_profile: str
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +263,25 @@ def _batch_fits_printer(
     tol = 1e-6
     fits: np.ndarray = (dz <= pz + tol) & (xy_lo <= bed_lo + tol) & (xy_hi <= bed_hi + tol)
     return fits
+
+
+def _fits_printer_vertices(
+    vertices: np.ndarray,
+    rotation: np.ndarray,
+    px: float,
+    py: float,
+    pz: float,
+) -> bool:
+    verts = np.asarray(vertices, dtype=np.float64) @ rotation.T
+    dx = float(verts[:, 0].max() - verts[:, 0].min())
+    dy = float(verts[:, 1].max() - verts[:, 1].min())
+    dz = float(verts[:, 2].max() - verts[:, 2].min())
+    xy_lo = min(dx, dy)
+    xy_hi = max(dx, dy)
+    bed_lo = min(px, py)
+    bed_hi = max(px, py)
+    tol = 1e-6
+    return dz <= pz + tol and xy_lo <= bed_lo + tol and xy_hi <= bed_hi + tol
 
 
 def _mesh_vertices_for_stability(mesh: trimesh.Trimesh, max_vertices: int = 80_000) -> np.ndarray:
@@ -512,16 +546,7 @@ def _fits_printer(
     Uses convex-hull vertices instead of all mesh vertices: the AABB of the
     convex hull equals the AABB of the full mesh, but with far fewer points.
     """
-    verts = mesh.convex_hull.vertices @ rotation.T
-    dx = float(verts[:, 0].max() - verts[:, 0].min())
-    dy = float(verts[:, 1].max() - verts[:, 1].min())
-    dz = float(verts[:, 2].max() - verts[:, 2].min())
-    xy_lo = min(dx, dy)
-    xy_hi = max(dx, dy)
-    bed_lo = min(px, py)
-    bed_hi = max(px, py)
-    tol = 1e-6
-    return dz <= pz + tol and xy_lo <= bed_lo + tol and xy_hi <= bed_hi + tol
+    return _fits_printer_vertices(mesh.convex_hull.vertices, rotation, px, py, pz)
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +554,12 @@ def _fits_printer(
 # ---------------------------------------------------------------------------
 
 
-def _build_candidates(mesh: trimesh.Trimesh, n_mesh_candidates: int) -> np.ndarray:
+def _build_candidates(
+    mesh: trimesh.Trimesh,
+    n_mesh_candidates: int,
+    *,
+    candidate_profile: str = "default",
+) -> np.ndarray:
     """Return (K, 3) array of candidate 'bottom' unit directions.
 
     Combines:
@@ -543,7 +573,13 @@ def _build_candidates(mesh: trimesh.Trimesh, n_mesh_candidates: int) -> np.ndarr
     top_idx = np.argpartition(areas, -k)[-k:]
     mesh_cands = normals[top_idx]
 
-    ico = trimesh.creation.icosphere(subdivisions=1)  # 80 faces (was 320 at subdivisions=2)
+    if candidate_profile == "adaptive":
+        ico_subdivisions = 2
+    elif candidate_profile == "default":
+        ico_subdivisions = 1
+    else:
+        raise ValueError(f"unknown orientation candidate profile: {candidate_profile!r}")
+    ico = trimesh.creation.icosphere(subdivisions=ico_subdivisions)
     # Six axis-aligned directions guarantee at least one Phase-1 candidate for
     # meshes that only fit in a narrow angular window (e.g. tall/thin parts).
     axis_dirs = np.array(
@@ -604,6 +640,110 @@ def _subsample_normals(
     sub_areas = area_faces[idx]
     scale = total_area / float(sub_areas.sum())
     return face_normals[idx], sub_areas * scale
+
+
+def _build_orientation_search_data(
+    mesh: trimesh.Trimesh,
+    overhang_threshold_deg: float,
+    n_candidates: int,
+    printer_dims: tuple[float, float, float] | None,
+    *,
+    candidate_profile: str = "default",
+) -> OrientationSearchData:
+    _PRINTER_PENALTY = 1e9
+    cos_t = float(np.cos(np.radians(overhang_threshold_deg)))
+    fn, af, face_saliency = _subsample_surface_data(mesh)
+    candidates = _build_candidates(mesh, n_candidates, candidate_profile=candidate_profile)
+    rotations = np.array([_rotation_from_to(cand, _DOWN) for cand in candidates])
+    raw_scores = _batch_overhang_scores(fn, af, rotations, cos_t)
+    if printer_dims is not None:
+        ch_verts = np.asarray(mesh.convex_hull.vertices, dtype=np.float64)
+        fits = _batch_fits_printer(ch_verts, rotations, *printer_dims)
+        phase1_scores = raw_scores + np.where(fits, 0.0, _PRINTER_PENALTY)
+    else:
+        ch_verts = None
+        fits = np.ones(len(rotations), dtype=bool)
+        phase1_scores = raw_scores
+    return OrientationSearchData(
+        cos_t=cos_t,
+        face_normals=fn,
+        face_areas=af,
+        face_saliency=face_saliency,
+        rotations=rotations,
+        raw_scores=raw_scores,
+        fits=fits,
+        phase1_scores=phase1_scores,
+        convex_hull_vertices=ch_verts,
+        candidate_profile=candidate_profile,
+    )
+
+
+def _fast_overhang_from_data(data: OrientationSearchData, rotation: np.ndarray) -> float:
+    nz = data.face_normals @ rotation[2]
+    bottom_mask = nz < -0.99
+    overhang_mask = (nz < -data.cos_t) & ~bottom_mask
+    return float((data.face_areas * overhang_mask).sum()) - 0.5 * float(
+        (data.face_areas * bottom_mask).sum()
+    )
+
+
+def _find_min_overhang_rotation_from_data(
+    mesh: trimesh.Trimesh,
+    data: OrientationSearchData,
+    printer_dims: tuple[float, float, float] | None,
+) -> tuple[np.ndarray, float]:
+    from scipy.optimize import minimize  # required dependency
+
+    _PRINTER_PENALTY = 1e9
+    if len(data.phase1_scores) == 0:
+        raise ValueError("No orientation candidates.")
+
+    def _penalised_score(rotation: np.ndarray) -> float:
+        score = _fast_overhang_from_data(data, rotation)
+        if printer_dims is not None:
+            if data.convex_hull_vertices is None:
+                raise RuntimeError("Printer fit check requires convex hull vertices.")
+            if not _fits_printer_vertices(data.convex_hull_vertices, rotation, *printer_dims):
+                score += _PRINTER_PENALTY
+        return score
+
+    n_top = min(3, len(data.phase1_scores))
+    top_idx = np.argpartition(data.phase1_scores, n_top - 1)[:n_top]
+    top_candidates = [(data.phase1_scores[i], data.rotations[i]) for i in top_idx]
+    top_candidates.sort(key=lambda x: x[0])
+
+    fitting_mask = data.fits & (data.phase1_scores < 0.5 * _PRINTER_PENALTY)
+    if fitting_mask.any():
+        best_phase1_idx = int(np.argmin(np.where(fitting_mask, data.raw_scores, np.inf)))
+        fallback_R: np.ndarray = data.rotations[best_phase1_idx]
+    else:
+        fallback_R = data.rotations[top_idx[0]]
+
+    best_penalised = float("inf")
+    best_R = fallback_R
+    for _, init_R in top_candidates:
+        down_in_orig = init_R.T @ _DOWN
+        phi0 = float(np.arccos(np.clip(down_in_orig[2], -1.0, 1.0)))
+        theta0 = float(np.arctan2(down_in_orig[1], down_in_orig[0]))
+
+        def _objective(angles: np.ndarray) -> float:
+            rotation = _rotation_from_angles(angles[0], angles[1])
+            return _penalised_score(rotation)
+
+        result = minimize(
+            _objective,
+            x0=np.array([theta0, phi0]),
+            method="Nelder-Mead",
+            options={"xatol": 1e-3, "fatol": mesh.area * 1e-4, "maxiter": 150},
+        )
+        if result.fun < best_penalised:
+            best_penalised = float(result.fun)
+            best_R = _rotation_from_angles(result.x[0], result.x[1])
+
+    if best_penalised >= 0.5 * _PRINTER_PENALTY:
+        best_R = fallback_R
+
+    return best_R, overhang_score(mesh, best_R, cos_t=data.cos_t)
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +871,7 @@ def find_min_overhang_rotation(
     return best_R, overhang_score(mesh, best_R, cos_t=cos_t)
 
 
-def find_stable_overhang_rotation(
+def find_stable_overhang_rotation_legacy(
     mesh: trimesh.Trimesh,
     overhang_threshold_deg: float = 45.0,
     n_candidates: int = 200,
@@ -823,6 +963,282 @@ def find_stable_overhang_rotation(
         ),
     )
     return all_rotations[best_idx], metrics[best_idx].overhang_score, metrics[best_idx]
+
+
+def _orientation_quality_tuple(metrics: OrientationStabilityMetrics) -> tuple[float, float, float]:
+    return metrics.stability_score, metrics.overhang_score, metrics.height_mm
+
+
+def _metrics_not_worse(
+    candidate: OrientationStabilityMetrics,
+    baseline: OrientationStabilityMetrics,
+    *,
+    atol: float = 1e-6,
+) -> bool:
+    return all(
+        cand <= base + atol
+        for cand, base in zip(
+            _orientation_quality_tuple(candidate), _orientation_quality_tuple(baseline), strict=True
+        )
+    )
+
+
+def _fit_margin_ratio(
+    vertices: np.ndarray,
+    rotation: np.ndarray,
+    printer_dims: tuple[float, float, float] | None,
+) -> float:
+    if printer_dims is None or len(vertices) == 0:
+        return 1.0
+    rotated = np.asarray(vertices, dtype=np.float64) @ rotation.T
+    extents = rotated.max(axis=0) - rotated.min(axis=0)
+    px, py, pz = printer_dims
+    xy_lo = min(float(extents[0]), float(extents[1]))
+    xy_hi = max(float(extents[0]), float(extents[1]))
+    bed_lo = min(px, py)
+    bed_hi = max(px, py)
+    margins = [
+        (bed_lo - xy_lo) / max(bed_lo, 1e-9),
+        (bed_hi - xy_hi) / max(bed_hi, 1e-9),
+        (pz - float(extents[2])) / max(pz, 1e-9),
+    ]
+    return float(min(margins))
+
+
+def _phase1_second_delta_ratio(data: OrientationSearchData, total_area: float) -> float:
+    finite = np.asarray(data.phase1_scores[np.isfinite(data.phase1_scores)], dtype=np.float64)
+    if len(finite) < 2:
+        return float("inf")
+    idx = np.argpartition(finite, 1)[:2]
+    best_two = np.sort(finite[idx])
+    return float((best_two[1] - best_two[0]) / max(total_area, 1.0))
+
+
+def _adaptive_trigger_reason(
+    metrics: OrientationStabilityMetrics,
+    data: OrientationSearchData,
+    total_area: float,
+    rotation: np.ndarray,
+    printer_dims: tuple[float, float, float] | None,
+) -> str:
+    reasons: list[str] = []
+    fit_vertices = (
+        data.convex_hull_vertices if data.convex_hull_vertices is not None else np.empty((0, 3))
+    )
+    fit_margin = _fit_margin_ratio(fit_vertices, rotation, printer_dims)
+    is_linear_part = metrics.pca_aspect >= 3.0 and metrics.pca_line_ratio <= 0.55
+    if is_linear_part:
+        reasons.append("linear_part")
+    band_delta = metrics.support_score_delta / max(total_area, 1.0)
+    if band_delta >= 0.16 and (is_linear_part or fit_margin <= 0.12):
+        reasons.append("support_tolerance_edge")
+    if fit_margin <= 0.08:
+        reasons.append("near_printer_bounds")
+    if is_linear_part and metrics.selection_reason in {
+        "balanced_long_part",
+        "support_overrode_surface",
+        "flat_plate_stability",
+    }:
+        reasons.append(f"selection_{metrics.selection_reason}")
+    if _phase1_second_delta_ratio(data, total_area) <= 0.01 and (
+        is_linear_part or fit_margin <= 0.08
+    ):
+        reasons.append("close_phase1_candidates")
+    return ",".join(reasons)
+
+
+def _stable_overhang_rotation_with_diagnostics(
+    mesh: trimesh.Trimesh,
+    overhang_threshold_deg: float = 45.0,
+    n_candidates: int = 200,
+    printer_dims: tuple[float, float, float] | None = None,
+    *,
+    support_tolerance_ratio: float = 0.20,
+    resin_options: ResinOrientationOptions | None = None,
+    source_up: np.ndarray | None = None,
+    candidate_profile: str = "default",
+) -> tuple[np.ndarray, float, OrientationStabilityMetrics, dict[str, float | str | bool | int]]:
+    options = resin_options or ResinOrientationOptions()
+    effective_candidates = n_candidates * 2 if candidate_profile == "adaptive" else n_candidates
+    data = _build_orientation_search_data(
+        mesh,
+        overhang_threshold_deg=overhang_threshold_deg,
+        n_candidates=effective_candidates,
+        printer_dims=printer_dims,
+        candidate_profile=candidate_profile,
+    )
+    best_overhang_R, best_overhang = _find_min_overhang_rotation_from_data(
+        mesh,
+        data,
+        printer_dims,
+    )
+
+    total_area = float(np.sum(mesh.area_faces))
+    all_rotations = [best_overhang_R]
+    all_scores = [best_overhang]
+    max_allowed = best_overhang + support_tolerance_ratio * max(total_area, 1.0)
+    for rotation, score, fits in zip(data.rotations, data.raw_scores, data.fits, strict=True):
+        score_f = float(score)
+        if score_f <= max_allowed and (printer_dims is None or bool(fits)):
+            all_rotations.append(rotation)
+            all_scores.append(score_f)
+
+    vertices = _mesh_vertices_for_stability(mesh)
+    principal_axis, pca_aspect, pca_line_ratio = _principal_axis_stats(vertices)
+    centroid = np.asarray(mesh.centroid, dtype=np.float64)
+    metrics = [
+        _stability_metrics(
+            mesh,
+            rotation,
+            score,
+            best_overhang,
+            printer_dims,
+            vertices,
+            principal_axis,
+            pca_aspect,
+            pca_line_ratio,
+            centroid,
+            total_area,
+            data.face_normals,
+            data.face_areas,
+            data.face_saliency,
+            data.cos_t,
+            options,
+            source_up,
+        )
+        for rotation, score in zip(all_rotations, all_scores, strict=True)
+    ]
+    in_target_band = [
+        i
+        for i, m in enumerate(metrics)
+        if (
+            m.pca_aspect >= 3.0
+            and options.long_part_target_angle_min_deg
+            <= m.long_axis_angle_from_bed_deg
+            <= options.long_part_target_angle_max_deg
+        )
+    ]
+    if in_target_band and options.resin_balance == "balanced":
+        candidates_idx = in_target_band
+    else:
+        candidates_idx = list(range(len(all_rotations)))
+    best_idx = min(
+        candidates_idx,
+        key=lambda i: (
+            metrics[i].stability_score,
+            metrics[i].overhang_score,
+            metrics[i].height_mm,
+        ),
+    )
+    rotation = all_rotations[best_idx]
+    selected_metrics = metrics[best_idx]
+    diagnostics: dict[str, float | str | bool | int] = {
+        "candidate_profile": candidate_profile,
+        "candidate_count": int(len(data.rotations)),
+        "fitting_candidate_count": int(np.count_nonzero(data.fits)),
+        "phase1_second_delta_ratio": _phase1_second_delta_ratio(data, total_area),
+        "fit_margin_ratio": _fit_margin_ratio(
+            (
+                data.convex_hull_vertices
+                if data.convex_hull_vertices is not None
+                else np.empty((0, 3))
+            ),
+            rotation,
+            printer_dims,
+        ),
+    }
+    diagnostics["adaptive_trigger_reason"] = _adaptive_trigger_reason(
+        selected_metrics,
+        data,
+        total_area,
+        rotation,
+        printer_dims,
+    )
+    return rotation, selected_metrics.overhang_score, selected_metrics, diagnostics
+
+
+def find_stable_overhang_rotation(
+    mesh: trimesh.Trimesh,
+    overhang_threshold_deg: float = 45.0,
+    n_candidates: int = 200,
+    printer_dims: tuple[float, float, float] | None = None,
+    *,
+    support_tolerance_ratio: float = 0.20,
+    resin_options: ResinOrientationOptions | None = None,
+    source_up: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, OrientationStabilityMetrics]:
+    """Find a stable support orientation while reusing candidate scoring data."""
+    rotation, score, metrics, _diagnostics = _stable_overhang_rotation_with_diagnostics(
+        mesh,
+        overhang_threshold_deg=overhang_threshold_deg,
+        n_candidates=n_candidates,
+        printer_dims=printer_dims,
+        support_tolerance_ratio=support_tolerance_ratio,
+        resin_options=resin_options,
+        source_up=source_up,
+        candidate_profile="default",
+    )
+    return rotation, score, metrics
+
+
+def find_stable_overhang_rotation_adaptive(
+    mesh: trimesh.Trimesh,
+    overhang_threshold_deg: float = 45.0,
+    n_candidates: int = 200,
+    printer_dims: tuple[float, float, float] | None = None,
+    *,
+    support_tolerance_ratio: float = 0.20,
+    resin_options: ResinOrientationOptions | None = None,
+    source_up: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, OrientationStabilityMetrics, dict[str, float | str | bool | int]]:
+    baseline_start = time.perf_counter()
+    baseline_rotation, baseline_score, baseline_metrics, baseline_diag = (
+        _stable_overhang_rotation_with_diagnostics(
+            mesh,
+            overhang_threshold_deg=overhang_threshold_deg,
+            n_candidates=n_candidates,
+            printer_dims=printer_dims,
+            support_tolerance_ratio=support_tolerance_ratio,
+            resin_options=resin_options,
+            source_up=source_up,
+            candidate_profile="default",
+        )
+    )
+    baseline_support_s = time.perf_counter() - baseline_start
+    trigger = str(baseline_diag["adaptive_trigger_reason"])
+    diagnostics: dict[str, float | str | bool | int] = {
+        "adaptive_enabled": bool(trigger),
+        "adaptive_reason": trigger,
+        "baseline_support_s": baseline_support_s,
+        "adaptive_support_s": 0.0,
+        "candidate_count_default": int(baseline_diag["candidate_count"]),
+        "candidate_count_adaptive": 0,
+        "adaptive_accepted": False,
+        "accepted": False,
+    }
+    if not trigger:
+        return baseline_rotation, baseline_score, baseline_metrics, diagnostics
+
+    adaptive_start = time.perf_counter()
+    adaptive_rotation, adaptive_score, adaptive_metrics, adaptive_diag = (
+        _stable_overhang_rotation_with_diagnostics(
+            mesh,
+            overhang_threshold_deg=overhang_threshold_deg,
+            n_candidates=n_candidates,
+            printer_dims=printer_dims,
+            support_tolerance_ratio=support_tolerance_ratio,
+            resin_options=resin_options,
+            source_up=source_up,
+            candidate_profile="adaptive",
+        )
+    )
+    diagnostics["adaptive_support_s"] = time.perf_counter() - adaptive_start
+    diagnostics["candidate_count_adaptive"] = int(adaptive_diag["candidate_count"])
+    if _metrics_not_worse(adaptive_metrics, baseline_metrics):
+        diagnostics["adaptive_accepted"] = True
+        diagnostics["accepted"] = True
+        return adaptive_rotation, adaptive_score, adaptive_metrics, diagnostics
+    return baseline_rotation, baseline_score, baseline_metrics, diagnostics
 
 
 def rotation_to_transform4(rotation: np.ndarray) -> np.ndarray:

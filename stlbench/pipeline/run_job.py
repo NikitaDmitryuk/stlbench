@@ -264,7 +264,8 @@ def _pass3_apply(
     if pw.has_scale and pw.scale_before_orient:
         # Pass 1 already applied scale-orientation transform; apply scale now.
         mesh = pw.pass1_mesh
-        assert mesh is not None
+        if mesh is None:
+            raise RuntimeError(f"Pass 1 mesh is missing for {pw.label!r}.")
         scale_matrix = uniform_scale_matrix(s_final)
         mesh.apply_scale(s_final)
         pw.source_to_final = scale_matrix @ pw.source_to_final
@@ -300,7 +301,8 @@ def _pass3_apply(
     elif pw.has_orient and not pw.scale_before_orient:
         # Pass 1 already applied orient; apply scale now if needed.
         mesh = pw.pass1_mesh
-        assert mesh is not None
+        if mesh is None:
+            raise RuntimeError(f"Pass 1 mesh is missing for {pw.label!r}.")
         if pw.has_scale:
             scale_matrix = uniform_scale_matrix(s_final)
             mesh.apply_scale(s_final)
@@ -472,7 +474,8 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                 for fut in as_completed(futs):
                     try:
                         result = fut.result()  # result written in-place to pw
-                    except Exception as e:
+                    # Worker boundary: report the part name and fail the command.
+                    except Exception as e:  # noqa: BLE001
                         orig = futs[fut]
                         if args.verbose:
                             console.print_exception()
@@ -488,13 +491,15 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         console.print("\n[bold]Pass 2  Global scale[/bold]")
         scale_dims = [pw.pass1_dims for pw in scale_works]
         scale_names = [pw.label for pw in scale_works]
-        assert all(d is not None for d in scale_dims)
+        if any(d is None for d in scale_dims):
+            raise RuntimeError("Pass 1 dimensions are missing for global scale.")
+        scale_dims_checked = [d for d in scale_dims if d is not None]
 
         with profiler.stage("pass 2 global scale"):
             try:
                 s_max, reports = compute_global_scale(
                     (epx, epy, pz),
-                    scale_dims,  # type: ignore[arg-type]
+                    scale_dims_checked,
                     scale_names,
                     method,  # type: ignore[arg-type]
                 )
@@ -544,7 +549,8 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
             for fut3 in as_completed(futs3):
                 try:
                     result = fut3.result()
-                except Exception as e:
+                # Worker boundary: report the part name and fail the command.
+                except Exception as e:  # noqa: BLE001
                     orig = futs3[fut3]
                     if args.verbose:
                         console.print_exception()

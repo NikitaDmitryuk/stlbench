@@ -167,6 +167,28 @@ def _rotated_extents_chunked(
     return float(d[0]), float(d[1]), float(d[2])
 
 
+def _z_rotated_bounds_all(
+    vertices: np.ndarray,
+    rotations: list[np.ndarray],
+    *,
+    chunk_size: int = 24,
+) -> tuple[np.ndarray, np.ndarray]:
+    verts = np.asarray(vertices, dtype=np.float64)
+    if verts.ndim != 2 or verts.shape[1] != 3:
+        raise ValueError("vertices must be (N, 3).")
+    lows = np.empty((len(rotations), 3), dtype=np.float64)
+    extents = np.empty((len(rotations), 3), dtype=np.float64)
+    vt = verts.T
+    for start in range(0, len(rotations), chunk_size):
+        end = min(start + chunk_size, len(rotations))
+        r_chunk = np.asarray(rotations[start:end], dtype=np.float64)
+        rotated = (r_chunk @ vt).transpose(0, 2, 1)
+        lo = rotated.min(axis=1)
+        lows[start:end] = lo
+        extents[start:end] = rotated.max(axis=1) - lo
+    return lows, extents
+
+
 def _candidate_rotations(
     *,
     any_rotation: bool,
@@ -183,6 +205,48 @@ def _candidate_rotations(
                 bases.append(_random_rotation_matrix(rng))
         return bases, perms
     return _z_rotation_candidates(), [np.eye(3, dtype=np.float64)]
+
+
+def _generate_z_orientation_candidates_fast(
+    mesh: trimesh.Trimesh,
+    printer_xyz: tuple[float, float, float],
+    method: Method,
+) -> list[OrientationCandidate]:
+    verts = mesh_vertices_for_orientation(mesh)
+    rotations = _z_rotation_candidates()
+    lows, extents = _z_rotated_bounds_all(verts, rotations)
+    principal_axis, pca_aspect = _principal_axis(verts)
+    center = verts.mean(axis=0)
+    px, py, pz = printer_xyz
+    p_min = min(px, py, pz)
+    out: list[OrientationCandidate] = []
+    for r, lo, d in zip(rotations, lows, extents, strict=True):
+        ex, ey, ez = float(d[0]), float(d[1]), float(d[2])
+        if ex <= 0 or ey <= 0 or ez <= 0:
+            continue
+        if method == "sorted":
+            scale_limit, _ = s_max_for_part_printer_axes(px, py, pz, ex, ey, ez)
+        else:
+            scale_limit = s_max_for_part_conservative(p_min, ex, ey, ez)
+        r_center = r @ center
+        center_z_ratio = float(np.clip((r_center[2] - lo[2]) / max(ez, 1e-9), 0.0, 1.0))
+        long_axis = r @ principal_axis
+        long_axis_z = float(abs(long_axis[2]) / max(np.linalg.norm(long_axis), 1e-12))
+        out.append(
+            OrientationCandidate(
+                transform=_rotation_to_4x4(r),
+                rotation=r.copy(),
+                extents=(ex, ey, ez),
+                scale_limit=scale_limit,
+                xy_area=ex * ey,
+                height=ez,
+                pca_aspect=pca_aspect,
+                long_axis_z=long_axis_z,
+                down_area_ratio=0.0,
+                center_z_ratio=center_z_ratio,
+            )
+        )
+    return out
 
 
 def generate_orientation_candidates(
@@ -368,17 +432,28 @@ def select_orientation_for_scale(
     policy: OrientationPolicy = "printable",
     scale_tolerance: float = DEFAULT_ORIENTATION_SCALE_TOLERANCE,
     compute_printability_metrics: bool = True,
+    use_fast_z: bool = True,
 ) -> tuple[np.ndarray, tuple[float, float, float]]:
-    candidates = generate_orientation_candidates(
-        mesh,
-        (px, py, pz),
-        method,
-        any_rotation=any_rotation,
-        maximize=maximize,
-        random_samples=random_samples,
-        seed=seed,
-        compute_printability_metrics=compute_printability_metrics,
-    )
+    if (
+        use_fast_z
+        and not any_rotation
+        and not maximize
+        and not compute_printability_metrics
+        and random_samples == 4096
+        and seed == 0
+    ):
+        candidates = _generate_z_orientation_candidates_fast(mesh, (px, py, pz), method)
+    else:
+        candidates = generate_orientation_candidates(
+            mesh,
+            (px, py, pz),
+            method,
+            any_rotation=any_rotation,
+            maximize=maximize,
+            random_samples=random_samples,
+            seed=seed,
+            compute_printability_metrics=compute_printability_metrics,
+        )
     selected = select_orientation_candidate(
         candidates,
         (px, py, pz),

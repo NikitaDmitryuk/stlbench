@@ -55,6 +55,7 @@ class StageRecord:
 class WorkerRecord:
     name: str
     duration_s: float
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _rss_to_mb(raw: float) -> float:
@@ -157,11 +158,11 @@ class ExecutionProfiler:
             with self._lock:
                 self._workers.append(WorkerRecord(name=name, duration_s=duration))
 
-    def record_worker(self, name: str, duration_s: float) -> None:
+    def record_worker(self, name: str, duration_s: float, **metadata: Any) -> None:
         if not self.enabled:
             return
         with self._lock:
-            self._workers.append(WorkerRecord(name=name, duration_s=duration_s))
+            self._workers.append(WorkerRecord(name=name, duration_s=duration_s, metadata=metadata))
 
     def map(
         self,
@@ -344,7 +345,7 @@ class NullProfiler:
     def profiled_call(self, name: str, fn: Callable[..., R], *args: Any, **kwargs: Any) -> R:
         return fn(*args, **kwargs)
 
-    def record_worker(self, name: str, duration_s: float) -> None:
+    def record_worker(self, name: str, duration_s: float, **metadata: Any) -> None:
         pass
 
     def map(

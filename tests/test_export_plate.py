@@ -51,6 +51,56 @@ def test_export_plate_3mf_lazy_writes_manifest_and_loads_only_plate_parts(tmp_pa
     assert payload["parts"][0]["rotation_deg"] == 90.0
 
 
+@pytest.mark.parametrize("compression_mode", ["default", "fast", "store"])
+def test_export_plate_3mf_lazy_compression_modes_are_loadable(
+    tmp_path: Path, compression_mode: str
+):
+    meshes = [
+        trimesh.creation.box(extents=(10.0, 20.0, 5.0)),
+        trimesh.creation.box(extents=(8.0, 12.0, 4.0)),
+    ]
+    plate = PackedPlate(
+        index=0,
+        rects=(
+            PackedRect(part_index=0, x=0.0, y=0.0, width=10.0, height=20.0),
+            PackedRect(part_index=1, x=20.0, y=0.0, width=8.0, height=12.0),
+        ),
+    )
+    out_3mf = tmp_path / f"plate-{compression_mode}.3mf"
+    out_json = tmp_path / f"plate-{compression_mode}.json"
+
+    export_plate_3mf_lazy(
+        lambda part_index: meshes[part_index].copy(),
+        plate,
+        out_3mf,
+        names=["a.stl", "b.stl"],
+        out_manifest=out_json,
+        compression_mode=compression_mode,  # type: ignore[arg-type]
+    )
+
+    loaded = trimesh.load(out_3mf, force="scene")
+    assert isinstance(loaded, trimesh.Scene)
+    assert len(loaded.geometry) == 2
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert [p["name"] for p in payload["parts"]] == ["a.stl", "b.stl"]
+
+
+def test_export_plate_3mf_lazy_rejects_invalid_compression_mode(tmp_path: Path):
+    mesh = trimesh.creation.box(extents=(10.0, 20.0, 5.0))
+    plate = PackedPlate(
+        index=0,
+        rects=(PackedRect(part_index=0, x=0.0, y=0.0, width=10.0, height=20.0),),
+    )
+
+    with pytest.raises(ValueError, match="compression_mode"):
+        export_plate_3mf_lazy(
+            lambda _part_index: mesh.copy(),
+            plate,
+            tmp_path / "plate.3mf",
+            compression_mode="invalid",  # type: ignore[arg-type]
+        )
+
+
 def test_export_plate_3mf_lazy_rejects_underestimated_footprint(tmp_path: Path):
     mesh = trimesh.creation.box(extents=(10.0, 20.0, 5.0))
     plate = PackedPlate(

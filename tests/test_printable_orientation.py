@@ -7,6 +7,7 @@ from stlbench.packing.layout_orientation import (
     OrientationCandidate,
     generate_orientation_candidates,
     select_orientation_candidate,
+    select_orientation_for_scale,
 )
 
 
@@ -24,6 +25,34 @@ def test_generate_candidates_keeps_z_only_default_and_is_deterministic():
     assert len(a) == 360
     assert np.allclose(a[0].transform, np.eye(4))
     assert [c.extents for c in a[:10]] == pytest.approx([c.extents for c in b[:10]])
+
+
+@pytest.mark.parametrize("extents", [(10.0, 20.0, 30.0), (120.0, 8.0, 12.0), (70.0, 4.0, 40.0)])
+def test_fast_z_scale_orientation_matches_legacy(extents: tuple[float, float, float]):
+    mesh = _box(extents)
+    fast_transform, fast_extents = select_orientation_for_scale(
+        mesh,
+        153.4,
+        77.8,
+        165.0,
+        "sorted",
+        any_rotation=False,
+        compute_printability_metrics=False,
+        use_fast_z=True,
+    )
+    legacy_transform, legacy_extents = select_orientation_for_scale(
+        mesh,
+        153.4,
+        77.8,
+        165.0,
+        "sorted",
+        any_rotation=False,
+        compute_printability_metrics=False,
+        use_fast_z=False,
+    )
+
+    assert fast_transform == pytest.approx(legacy_transform)
+    assert fast_extents == pytest.approx(legacy_extents)
 
 
 def test_generate_candidates_full_search_count():
