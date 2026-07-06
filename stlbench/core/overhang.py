@@ -701,7 +701,8 @@ def _find_min_overhang_rotation_from_data(
     def _penalised_score(rotation: np.ndarray) -> float:
         score = _fast_overhang_from_data(data, rotation)
         if printer_dims is not None:
-            assert data.convex_hull_vertices is not None
+            if data.convex_hull_vertices is None:
+                raise RuntimeError("Printer fit check requires convex hull vertices.")
             if not _fits_printer_vertices(data.convex_hull_vertices, rotation, *printer_dims):
                 score += _PRINTER_PENALTY
         return score

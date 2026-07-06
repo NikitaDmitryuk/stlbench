@@ -174,7 +174,9 @@ def run_layout(args: LayoutRunArgs) -> int:
 
     oriented_meshes: list[trimesh.Trimesh] = []
     for m, plan in zip(meshes, layout_plans, strict=True):
-        assert plan is not None
+        if plan is None:
+            console.print("[red]Internal error: missing layout orientation plan.[/red]")
+            return finish_profile(profiler, console, 1)
         t, _fw, _fh = plan
         m2 = m.copy()
         m2.apply_transform(t)
@@ -248,7 +250,9 @@ def run_layout(args: LayoutRunArgs) -> int:
         for rect in pl.rects:
             part_index = rect.part_index
             plan = layout_plans[part_index]
-            assert plan is not None
+            if plan is None:
+                console.print("[red]Internal error: missing layout orientation plan.[/red]")
+                return finish_profile(profiler, console, 1)
             layout_transform = plan[0]
             placement_transform, placement_steps = placement_transform_for_mesh(
                 oriented_meshes[part_index], rect

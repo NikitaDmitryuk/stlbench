@@ -6,6 +6,7 @@ import trimesh
 from shapely.geometry import MultiPoint, Polygon
 from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
+from shapely.errors import GEOSException
 
 # Threshold above which we skip the union-of-triangles approach and use the
 # convex hull of all XY vertices instead.  Random face subsampling fails for
@@ -13,6 +14,19 @@ from shapely.geometry.base import BaseGeometry
 # faces on nearly-vertical surfaces that project to zero-area 2D triangles,
 # so the sampled union covers only a tiny patch instead of the full footprint.
 _MAX_FACES_UNION = 20_000
+
+
+def _convex_hull_shadow(xy: np.ndarray) -> BaseGeometry:
+    try:
+        from scipy.spatial import ConvexHull, QhullError  # noqa: PLC0415
+    except ImportError:
+        return MultiPoint(xy).convex_hull
+
+    try:
+        hull = ConvexHull(xy)
+    except (QhullError, ValueError, IndexError):
+        return MultiPoint(xy).convex_hull
+    return Polygon(xy[hull.vertices])
 
 
 def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseGeometry:
@@ -44,13 +58,7 @@ def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseG
     # Large meshes: use convex hull of ALL XY vertices.  Always correct and
     # O(n log n); the union-of-triangles path fails for non-uniform meshes.
     if len(mesh.faces) > _MAX_FACES_UNION:
-        try:
-            from scipy.spatial import ConvexHull  # noqa: PLC0415
-
-            hull = ConvexHull(xy)
-            shadow: BaseGeometry = Polygon(xy[hull.vertices])
-        except Exception:
-            shadow = MultiPoint(xy).convex_hull
+        shadow = _convex_hull_shadow(xy)
         if simplify_tol > 0 and not shadow.is_empty:
             shadow = shadow.simplify(simplify_tol, preserve_topology=True)
         return shadow
@@ -98,15 +106,9 @@ def mesh_to_xy_shadow(mesh: trimesh.Trimesh, simplify_tol: float = 0.5) -> BaseG
                 raise ValueError("union produced no polygon")
             shadow = Polygon(max(polys_only, key=lambda g: g.area).exterior)
 
-    except Exception:
+    except (GEOSException, ValueError, TypeError, IndexError):
         # Fallback: convex hull of all vertices (original behaviour).
-        try:
-            from scipy.spatial import ConvexHull  # noqa: PLC0415
-
-            hull = ConvexHull(xy)
-            shadow = Polygon(xy[hull.vertices])
-        except Exception:
-            shadow = MultiPoint(xy).convex_hull
+        shadow = _convex_hull_shadow(xy)
 
     if simplify_tol > 0 and not shadow.is_empty:
         shadow = shadow.simplify(simplify_tol, preserve_topology=True)

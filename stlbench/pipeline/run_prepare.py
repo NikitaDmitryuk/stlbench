@@ -43,6 +43,7 @@ import numpy as np
 import trimesh
 from rich.console import Console
 from rich.table import Table
+from scipy.spatial import QhullError
 from shapely import affinity
 from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
@@ -301,7 +302,7 @@ def _load_cached_footprint(cache_dir: Path | None, key: str) -> BaseGeometry | N
         return None
     try:
         with path.open("rb") as fh:
-            loaded = pickle.load(fh)
+            loaded = pickle.load(fh)  # noqa: S301 - trusted local cache keyed by source content.
     except (OSError, pickle.PickleError, EOFError, AttributeError, ValueError):
         return None
     return loaded if isinstance(loaded, BaseGeometry) else None
@@ -754,7 +755,7 @@ def _find_support_orientation_for_prepare(
         ):
             raise ValueError("selected orientation does not fit printer bounds")
         return rotation, score_after, metrics
-    except Exception as exc:
+    except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError, QhullError) as exc:
         if job.orientation_strategy == "legacy":
             raise
         timings["fallback"] = True
@@ -1225,7 +1226,7 @@ def _stop_orientation_actors(
     if not actor_processes:
         return
     for command_q in actor_queues:
-        with suppress(Exception):
+        with suppress(OSError, EOFError, BrokenPipeError):
             command_q.put(("stop",))
     stopped = 0
     if actor_result_q is not None:
@@ -1235,7 +1236,7 @@ def _stop_orientation_actors(
                 kind, _idx, _payload = actor_result_q.get(timeout=0.1)
             except queue.Empty:
                 continue
-            except Exception:
+            except (OSError, EOFError, BrokenPipeError):
                 break
             if kind == "stopped":
                 stopped += 1
@@ -1542,7 +1543,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         ):
             ptask = progress.add_task("Finding scale orientations…", total=len(paths))
             if use_fused_orientation:
-                assert actor_result_q is not None
+                if actor_result_q is None:
+                    raise RuntimeError("Orientation actor result queue was not initialised.")
                 for idx, path in enumerate(paths):
                     actor_idx = retained_actor.get(idx, idx % len(actor_queues))
                     actor_queues[actor_idx].put(
@@ -1724,7 +1726,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         ):
             ptask = progress.add_task("Orienting parts…", total=len(paths))
             if use_fused_orientation:
-                assert actor_result_q is not None
+                if actor_result_q is None:
+                    raise RuntimeError("Orientation actor result queue was not initialised.")
                 for idx, path in enumerate(paths):
                     actor_idx = retained_actor.get(idx, idx % len(actor_queues))
                     actor_queues[actor_idx].put(
@@ -1825,7 +1828,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                                 duration_s,
                                 timing_payload,
                             ) = future.result()
-                        except Exception as e:
+                        # Worker boundary: report the part name and fail the command.
+                        except Exception as e:  # noqa: BLE001
                             if args.verbose:
                                 console.print_exception()
                             console.print(
@@ -1845,7 +1849,11 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         orientation_metrics: list[dict[str, object]] = []
         orientation_timings: list[dict[str, object]] = []
         for name, row in zip(names, _prepared, strict=True):
-            assert row is not None
+            if row is None:
+                console.print(
+                    f"[red]Internal error: no prepared orientation result for {name}.[/red]"
+                )
+                return finish_profile(profiler, console, 1)
             sb, sa, pct, ref, metrics_payload, timing_payload = row
             orient_table.add_row(name, f"{sb:.1f}", f"{sa:.1f}", f"{pct:+.0f}%")
             stability_table.add_row(
@@ -1878,14 +1886,16 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 with profiler.stage("cache metadata save"):
                     _write_orient_cache_meta(cache_dir, paths, names, mesh_files)
                 console.print(f"[dim]Orient cache saved → {cache_dir}[/dim]")
-            except Exception as exc:
+            except (OSError, TypeError, ValueError) as exc:
                 console.print(f"[yellow]Warning: could not save orient cache: {exc}[/yellow]")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Step 3 – Layout
     # ──────────────────────────────────────────────────────────────────────────
     console.print("\n[bold]3 / 3  Layout[/bold]")
-    assert prepared_refs is not None
+    if prepared_refs is None:
+        console.print("[red]Internal error: layout started without prepared mesh references.[/red]")
+        return finish_profile(profiler, console, 1)
 
     # Pre-check: each part must fit the bed in at least one orientation before packing.
     epx = px - 2.0 * edge_margin

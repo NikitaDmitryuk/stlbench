@@ -867,7 +867,7 @@ def _load_cached_footprint(cache_dir: Path, key: str) -> BaseGeometry | None:
         return None
     try:
         with path.open("rb") as fh:
-            loaded = pickle.load(fh)
+            loaded = pickle.load(fh)  # noqa: S301 - trusted local cache keyed by source content.
     except (OSError, pickle.PickleError, EOFError, AttributeError, ValueError):
         return None
     return loaded if isinstance(loaded, BaseGeometry) else None

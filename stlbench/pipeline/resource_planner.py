@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -59,8 +60,9 @@ def total_system_memory_bytes() -> int | None:
         pass
 
     try:
-        raw = subprocess.check_output(
-            ["sysctl", "-n", "hw.memsize"],
+        sysctl = shutil.which("sysctl") or "/usr/sbin/sysctl"
+        raw = subprocess.check_output(  # noqa: S603 - fixed executable path with static args.
+            [sysctl, "-n", "hw.memsize"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()

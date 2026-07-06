@@ -1,6 +1,6 @@
 [project]
 name = "stlbench"
-version = "1.3.0"
+version = "1.3.1"
 description = "STL preparation toolkit for resin 3D printing: uniform scaling, bed packing, fill, autopack."
 authors = [
     {name = "NikitaDmitryuk", email = "dmitryuk.nikita@gmail.com"}
@@ -84,7 +84,7 @@ target-version = "py311"
 src = ["stlbench", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "UP", "B", "SIM"]
+select = ["E", "F", "W", "UP", "B", "SIM", "BLE", "S112", "S301", "S607"]
 ignore = ["E501"]
 
 [tool.mypy]

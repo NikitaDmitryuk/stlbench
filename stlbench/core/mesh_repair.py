@@ -246,7 +246,8 @@ def _run_pymeshlab_filter(
     try:
         getattr(meshset, name)(**kwargs)
         applied.append(name)
-    except Exception as exc:  # pragma: no cover - PyMeshLab errors are data-dependent
+    # PyMeshLab repair filters fail per mesh; keep processing and report the warning.
+    except Exception as exc:  # noqa: BLE001
         warnings.append(f"{name}: {exc}")
     finally:
         timings[name] = time.perf_counter() - start
@@ -332,7 +333,8 @@ def _full_pymeshlab_repair(
         try:
             func()
             applied.append(name)
-        except Exception as exc:  # pragma: no cover - data-dependent repair failures
+        # Trimesh repair failures are data-dependent; keep the best repaired mesh.
+        except Exception as exc:  # noqa: BLE001
             warnings.append(f"{name}: {exc}")
         finally:
             timings[name] = time.perf_counter() - start
