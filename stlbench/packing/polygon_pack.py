@@ -26,11 +26,11 @@ import numpy as np
 import pyclipper
 import shapely
 from shapely import affinity
+from shapely.errors import GEOSException
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
 from shapely.prepared import prep
-from shapely.errors import GEOSException
 
 from stlbench.packing.rectpack_plate import PackedPlate, PackedRect, pack_rectangles_on_plates
 

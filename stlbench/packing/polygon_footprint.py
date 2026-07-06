@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import shapely
 import trimesh
+from shapely.errors import GEOSException
 from shapely.geometry import MultiPoint, Polygon
 from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
-from shapely.errors import GEOSException
 
 # Threshold above which we skip the union-of-triangles approach and use the
 # convex hull of all XY vertices instead.  Random face subsampling fails for
