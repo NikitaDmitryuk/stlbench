@@ -773,6 +773,13 @@ def cmd_prepare(
             "--grid-step", help="Layout grid resolution in mm (smaller = denser packing, slower)."
         ),
     ] = 2.0,
+    max_plates: Annotated[
+        int | None,
+        typer.Option(
+            "--max-plates",
+            help="Max print areas for prepare; auto-scales layout to fit within this count.",
+        ),
+    ] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
     repair: Annotated[
         bool,
@@ -893,6 +900,7 @@ def cmd_prepare(
                 bitmap_beam_width=bitmap_beam_width,
                 footprint_cache=footprint_cache,
                 packing_result_cache=packing_result_cache,
+                max_plates=max_plates,
                 recursive=recursive,
                 verbose=verbose,
                 grid_step_mm=grid_step,

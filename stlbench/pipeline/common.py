@@ -14,6 +14,7 @@ from stlbench.config.defaults import (
     ORIENTATION_POLICY_DEFAULT,
     ORIENTATION_SCALE_TOLERANCE_DEFAULT,
 )
+from stlbench.config.enums import OrientationPolicy, ResinBalance, coerce_enum
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import AppSettings
 from stlbench.core.mesh_repair import (
@@ -103,19 +104,25 @@ def resolve_resin_orientation_options(
         source = settings.orientation
         return ResinOrientationOptions(
             resin_balance=resin_balance or source.resin_balance,
+            long_part_angle_policy=source.long_part_angle_policy,
+            assembly_side_policy=source.assembly_side_policy,
             long_part_target_angle_min_deg=source.long_part_target_angle_min_deg,
             long_part_target_angle_max_deg=source.long_part_target_angle_max_deg,
             long_part_low_angle_penalty_below_deg=source.long_part_low_angle_penalty_below_deg,
             long_part_high_angle_penalty_above_deg=source.long_part_high_angle_penalty_above_deg,
         )
-    return ResinOrientationOptions(resin_balance=resin_balance or DEFAULT_RESIN_BALANCE)
+    return ResinOrientationOptions(
+        resin_balance=coerce_enum(
+            ResinBalance,
+            resin_balance or DEFAULT_RESIN_BALANCE,
+            "--resin-balance",
+        )
+    )
 
 
-def resolve_orientation_policy(policy: str | None) -> str:
+def resolve_orientation_policy(policy: str | None) -> OrientationPolicy:
     out = policy or ORIENTATION_POLICY_DEFAULT
-    if out not in {"printable", "max-scale"}:
-        raise ValueError("--orientation-policy must be printable or max-scale.")
-    return out
+    return coerce_enum(OrientationPolicy, out, "--orientation-policy")
 
 
 def resolve_orientation_scale_tolerance(value: float | None) -> float:

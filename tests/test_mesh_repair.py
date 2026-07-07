@@ -5,6 +5,7 @@ import json
 import numpy as np
 import trimesh
 
+from stlbench.core.mesh_cleanup import remove_degenerate_faces
 from stlbench.core.mesh_repair import (
     RepairOptions,
     load_repair_cache,
@@ -14,6 +15,63 @@ from stlbench.core.mesh_repair import (
     write_repair_cache,
     write_repair_report,
 )
+
+
+def test_remove_degenerate_faces_preserves_valid_faces_and_compacts_vertices():
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [9.0, 9.0, 9.0],
+        ]
+    )
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [0, 0, 1],
+            [0, 1, 3],
+        ]
+    )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    cleaned, removed = remove_degenerate_faces(mesh)
+
+    assert removed == 2
+    assert len(cleaned.faces) == 1
+    assert len(cleaned.vertices) == 3
+    assert np.isclose(float(cleaned.area_faces[0]), 0.5)
+
+
+def test_repair_removes_zero_area_triangles_for_slicer_hollowing():
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+        ]
+    )
+    faces = np.array(
+        [
+            [0, 1, 2],
+            [0, 0, 1],
+            [0, 1, 3],
+        ]
+    )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    repaired, report = repair_mesh(
+        mesh,
+        RepairOptions(enabled=True, close_holes=False, remove_small_components=False),
+    )
+
+    assert report.before["degenerate_faces"] == 2
+    assert report.after["degenerate_faces"] == 0
+    assert len(repaired.faces) == report.after["faces"]
+    assert "remove_degenerate_faces_pre" in report.applied_filters
+    assert any(warning == "removed 2 zero-area triangle(s)" for warning in report.warnings)
 
 
 def test_repair_disabled_preserves_mesh_and_reports_disabled():

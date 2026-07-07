@@ -35,6 +35,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,14 @@ from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
+from stlbench.config.enums import (
+    ExportCompressionMode,
+    PackerBackend,
+    PrepareOrientationQuality,
+    PrepareOrientationStrategy,
+    ScaleFitMethod,
+    coerce_enum,
+)
 from stlbench.core.fit import compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.mesh_repair import RepairOptions, RepairReport, repair_report_step
@@ -106,6 +115,14 @@ from stlbench.profiling import ProfileOptions, make_profiler
 _IDENTITY3 = np.eye(3, dtype=np.float64)
 
 
+class _OrientationActorCommand(StrEnum):
+    STOP = "stop"
+    STOPPED = "stopped"
+    SCALE = "scale"
+    ORIENT = "orient"
+    ERROR = "error"
+
+
 @dataclass
 class PrepareRunArgs:
     input_dir: Path
@@ -135,6 +152,8 @@ class PrepareRunArgs:
     bitmap_beam_width: int | None = None
     packing_result_cache: bool = True
     footprint_cache: bool = True
+    max_plates: int | None = None
+    scale_tolerance: float | None = None
     progress: bool = True
     export_compression: str = "default"
     orientation_strategy: str = "auto"
@@ -162,12 +181,12 @@ class _ScaleOrientJob:
     px: float
     py: float
     pz: float
-    method: str
+    method: ScaleFitMethod | str
     any_rotation: bool
     repair_options: RepairOptions
     name: str
     repair_cache_dir: Path | None
-    orientation_strategy: str
+    orientation_strategy: PrepareOrientationStrategy | str
 
 
 @dataclass(frozen=True)
@@ -186,8 +205,8 @@ class _PrepareCacheJob:
     resin_options: ResinOrientationOptions
     repair_options: RepairOptions
     repair_cache_dir: Path | None
-    orientation_strategy: str
-    orientation_quality: str
+    orientation_strategy: PrepareOrientationStrategy | str
+    orientation_quality: PrepareOrientationQuality | str
 
 
 @dataclass(frozen=True)
@@ -196,12 +215,19 @@ class _ExportPlateJob:
     refs: tuple[PreparedMeshRef, ...]
     output_dir: Path
     names: tuple[str, ...]
-    compression_mode: str
+    compression_mode: ExportCompressionMode | str
+    mesh_scale: float = 1.0
 
 
 @dataclass(frozen=True)
 class _FootprintJob:
     ref: PreparedMeshRef
+
+
+@dataclass(frozen=True)
+class _CachedPackingResult:
+    plates: list[PackedPlate]
+    layout_pack_scale: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +352,9 @@ def _write_cached_footprint(cache_dir: Path | None, key: str, geometry: BaseGeom
         raise
 
 
-def _prepare_packer_version(packer: str) -> str:
-    return "prepare_bitmap_v1" if packer == "bitmap" else "prepare_exact_v1"
+def _prepare_packer_version(packer: PackerBackend | str) -> str:
+    packer = coerce_enum(PackerBackend, packer, "packer")
+    return "prepare_bitmap_v1" if packer is PackerBackend.BITMAP else "prepare_exact_v1"
 
 
 def _packing_cache_key(
@@ -338,10 +365,13 @@ def _packing_cache_key(
     gap_mm: float,
     edge_margin_mm: float,
     part_heights: list[float],
-    packer: str,
+    packer: PackerBackend | str,
     bitmap_options: BitmapPackOptions | None,
     grid_step_mm: float,
+    max_plates: int | None = None,
+    scale_tolerance: float | None = None,
 ) -> str:
+    packer = coerce_enum(PackerBackend, packer, "packer")
     return _json_hash(
         {
             "version": 1,
@@ -351,18 +381,26 @@ def _packing_cache_key(
             "gap_mm": round(float(gap_mm), 9),
             "edge_margin_mm": round(float(edge_margin_mm), 9),
             "part_heights": (
-                [round(float(h), 6) for h in part_heights] if packer == "exact" else None
+                [round(float(h), 6) for h in part_heights]
+                if packer is PackerBackend.EXACT
+                else None
             ),
-            "packer": packer,
+            "packer": packer.value,
             "packer_version": _prepare_packer_version(packer),
             "bitmap_grid_mm": bitmap_options.grid_mm if bitmap_options is not None else None,
             "bitmap_beam_width": bitmap_options.beam_width if bitmap_options is not None else None,
             "grid_step_mm": round(float(grid_step_mm), 9),
+            "max_plates": max_plates,
+            "scale_tolerance": (
+                round(float(scale_tolerance), 9) if scale_tolerance is not None else None
+            ),
         }
     )
 
 
-def _load_packing_result(cache_dir: Path | None, key: str, packer: str) -> list[PackedPlate] | None:
+def _load_packing_result(
+    cache_dir: Path | None, key: str, packer: PackerBackend | str
+) -> _CachedPackingResult | None:
     if cache_dir is None:
         return None
     path = cache_dir / "results" / key / "result.json"
@@ -380,14 +418,24 @@ def _load_packing_result(cache_dir: Path | None, key: str, packer: str) -> list[
         return None
     if any(plate is None for plate in plates):
         return None
-    return [plate for plate in plates if plate is not None]
+    try:
+        raw_scale = payload.get("layout_pack_scale")
+        layout_pack_scale = None if raw_scale is None else float(raw_scale)
+    except (TypeError, ValueError):
+        return None
+    return _CachedPackingResult(
+        plates=[plate for plate in plates if plate is not None],
+        layout_pack_scale=layout_pack_scale,
+    )
 
 
 def _write_packing_result(
     cache_dir: Path | None,
     key: str,
-    packer: str,
+    packer: PackerBackend | str,
     plates: list[PackedPlate],
+    *,
+    layout_pack_scale: float | None = None,
 ) -> None:
     if cache_dir is None:
         return
@@ -396,6 +444,7 @@ def _write_packing_result(
         {
             "packer_version": _prepare_packer_version(packer),
             "plates": [_plate_to_json(plate) for plate in plates],
+            "layout_pack_scale": layout_pack_scale,
         },
     )
 
@@ -567,7 +616,7 @@ def _pack_bitmap_multi_plate(
         remaining = [idx for idx in remaining if idx not in placed]
     metadata.update(
         {
-            "strategy": "bitmap",
+            "strategy": PackerBackend.BITMAP.value,
             "baseline_plates": len(plates),
             "final_plates": len(plates),
             "edge_margin_mm": edge_margin_mm,
@@ -583,11 +632,173 @@ def _pack_bitmap_multi_plate(
     return _renumber_plates(plates)
 
 
-def _resolve_prepare_packer(value: str | None, settings_value: str | None) -> str:
-    out = value or settings_value or "auto"
-    if out not in {"auto", "bitmap", "exact"}:
-        raise ValueError("--packer must be auto, bitmap, or exact.")
-    return "exact" if out == "auto" else out
+def _scale_polygons(polygons: list[BaseGeometry], scale: float) -> list[BaseGeometry]:
+    if abs(scale - 1.0) <= 1e-12:
+        return polygons
+    return [
+        affinity.scale(poly, xfact=float(scale), yfact=float(scale), origin=(0.0, 0.0))
+        for poly in polygons
+    ]
+
+
+def _scale_plate_dimensions(plates: list[PackedPlate], factor: float) -> list[PackedPlate]:
+    if abs(factor - 1.0) <= 1e-12:
+        return plates
+    return [
+        PackedPlate(
+            index=plate.index,
+            rects=tuple(
+                PackedRect(
+                    part_index=rect.part_index,
+                    x=rect.x,
+                    y=rect.y,
+                    width=rect.width * factor,
+                    height=rect.height * factor,
+                    rotation_deg=rect.rotation_deg,
+                )
+                for rect in plate.rects
+            ),
+        )
+        for plate in plates
+    ]
+
+
+def _try_pack_prepare_at_scale(
+    base_polygons: list[BaseGeometry],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    edge_margin_mm: float,
+    scale: float,
+    *,
+    packer: PackerBackend | str,
+    bitmap_options: BitmapPackOptions,
+    grid_step_mm: float,
+    max_plates: int,
+    part_heights: list[float],
+) -> tuple[list[PackedPlate] | None, dict[str, object]]:
+    scaled = _scale_polygons(base_polygons, scale)
+    metadata: dict[str, object] = {"layout_pack_scale": float(scale)}
+    try:
+        packer = coerce_enum(PackerBackend, packer, "packer")
+        if packer is PackerBackend.BITMAP:
+            plates = _pack_bitmap_multi_plate(
+                scaled,
+                bed_w,
+                bed_h,
+                gap_mm,
+                edge_margin_mm,
+                bitmap_options,
+                metadata,
+                max_plates=max_plates,
+            )
+        else:
+            plates = pack_polygons_on_plates(
+                scaled,
+                bed_w,
+                bed_h,
+                gap_mm=gap_mm,
+                grid_step_mm=grid_step_mm,
+                max_plates=max_plates,
+                part_heights=[h * scale for h in part_heights],
+                metadata=metadata,
+                edge_margin_mm=edge_margin_mm,
+            )
+    except (RuntimeError, ValueError):
+        return None, metadata
+    if len(plates) > max_plates or not _validate_layout_geometry(
+        scaled, plates, bed_w, bed_h, gap_mm
+    ):
+        return None, metadata
+    return plates, metadata
+
+
+def _search_prepare_layout_scale(
+    base_polygons: list[BaseGeometry],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    edge_margin_mm: float,
+    *,
+    packer: PackerBackend | str,
+    bitmap_options: BitmapPackOptions,
+    grid_step_mm: float,
+    max_plates: int,
+    part_heights: list[float],
+    tolerance: float,
+    max_iter: int = 50,
+) -> tuple[float, list[PackedPlate] | None, dict[str, object]]:
+    attempts = 0
+    best_scale = 0.0
+    best_plates: list[PackedPlate] | None = None
+    best_metadata: dict[str, object] = {}
+
+    lo, hi = 0.0, 1.0
+    for _ in range(max_iter):
+        if hi - lo < tolerance:
+            break
+        mid = (lo + hi) / 2.0
+        attempts += 1
+        plates, metadata = _try_pack_prepare_at_scale(
+            base_polygons,
+            bed_w,
+            bed_h,
+            gap_mm,
+            edge_margin_mm,
+            mid,
+            packer=packer,
+            bitmap_options=bitmap_options,
+            grid_step_mm=grid_step_mm,
+            max_plates=max_plates,
+            part_heights=part_heights,
+        )
+        if plates is not None:
+            lo = mid
+            best_scale = mid
+            best_plates = plates
+            best_metadata = metadata
+        else:
+            hi = mid
+
+    if best_plates is None:
+        return 0.0, None, {"attempts_run": attempts}
+
+    final_plates, final_metadata = _try_pack_prepare_at_scale(
+        base_polygons,
+        bed_w,
+        bed_h,
+        gap_mm,
+        edge_margin_mm,
+        best_scale,
+        packer=packer,
+        bitmap_options=bitmap_options,
+        grid_step_mm=grid_step_mm,
+        max_plates=max_plates,
+        part_heights=part_heights,
+    )
+    if final_plates is not None:
+        best_plates = final_plates
+        best_metadata = final_metadata
+    best_metadata.update(
+        {
+            "scale_search_enabled": True,
+            "max_plates": max_plates,
+            "layout_pack_scale": best_scale,
+            "scale_tolerance": tolerance,
+            "attempts_run": attempts,
+            "final_plates": len(best_plates),
+        }
+    )
+    return best_scale, best_plates, best_metadata
+
+
+def _resolve_prepare_packer(
+    value: str | None,
+    settings_value: PackerBackend | str | None,
+) -> PackerBackend:
+    out = value or settings_value or PackerBackend.AUTO
+    packer = coerce_enum(PackerBackend, out, "--packer")
+    return PackerBackend.EXACT if packer is PackerBackend.AUTO else packer
 
 
 def _resolve_prepare_bitmap_options(
@@ -706,12 +917,25 @@ def _find_support_orientation_for_prepare(
     job: _PrepareCacheJob,
     timings: dict[str, Any],
 ) -> tuple[np.ndarray, float, Any]:
+    orientation_strategy = coerce_enum(
+        PrepareOrientationStrategy,
+        job.orientation_strategy,
+        "orientation_strategy",
+    )
+    orientation_quality = coerce_enum(
+        PrepareOrientationQuality,
+        job.orientation_quality,
+        "orientation_quality",
+    )
     support_fn = (
         find_stable_overhang_rotation_legacy
-        if job.orientation_strategy == "legacy"
+        if orientation_strategy is PrepareOrientationStrategy.LEGACY
         else find_stable_overhang_rotation
     )
-    if job.orientation_strategy != "legacy" and job.orientation_quality == "adaptive":
+    if (
+        orientation_strategy is not PrepareOrientationStrategy.LEGACY
+        and orientation_quality is PrepareOrientationQuality.ADAPTIVE
+    ):
         support_fn = find_stable_overhang_rotation_adaptive  # type: ignore[assignment]
     try:
         result = support_fn(
@@ -742,6 +966,10 @@ def _find_support_orientation_for_prepare(
             metrics.surface_damage_proxy,
             metrics.salient_down_area_ratio,
             metrics.flat_safe_down_area_ratio,
+            metrics.sacrificial_support_ratio,
+            metrics.visible_support_ratio,
+            metrics.assembly_side_alignment,
+            metrics.assembly_side_confidence,
             metrics.source_up_dot_build_up,
             metrics.upside_down_penalty,
             metrics.angle_band_penalty,
@@ -756,11 +984,11 @@ def _find_support_orientation_for_prepare(
             raise ValueError("selected orientation does not fit printer bounds")
         return rotation, score_after, metrics
     except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError, QhullError) as exc:
-        if job.orientation_strategy == "legacy":
+        if orientation_strategy is PrepareOrientationStrategy.LEGACY:
             raise
         timings["fallback"] = True
         timings["fallback_reason"] = str(exc)
-        timings["strategy_used"] = "legacy"
+        timings["strategy_used"] = PrepareOrientationStrategy.LEGACY.value
         timings["adaptive_enabled"] = False
         timings["adaptive_reason"] = "legacy_fallback"
         rotation, score_after, metrics = find_stable_overhang_rotation_legacy(
@@ -803,7 +1031,12 @@ def _scale_orientation_worker(
         del m
         gc.collect()
     timings["total_s"] = time.perf_counter() - start
-    timings["strategy"] = job.orientation_strategy
+    orientation_strategy = coerce_enum(
+        PrepareOrientationStrategy,
+        job.orientation_strategy,
+        "orientation_strategy",
+    )
+    timings["strategy"] = orientation_strategy.value
     return (
         job.index,
         transform,
@@ -820,18 +1053,23 @@ def _compute_scale_orientation_loaded(
     job: _ScaleOrientJob,
     timings: dict[str, float | str],
 ) -> tuple[np.ndarray, tuple[float, float, float]]:
+    orientation_strategy = coerce_enum(
+        PrepareOrientationStrategy,
+        job.orientation_strategy,
+        "orientation_strategy",
+    )
     search_start = time.perf_counter()
     transform, dims = select_orientation_for_scale(
         mesh,
         job.px,
         job.py,
         job.pz,
-        job.method,  # type: ignore[arg-type]
+        job.method,
         any_rotation=job.any_rotation,
         random_samples=ORIENTATION_SAMPLES_DEFAULT,
         seed=ORIENTATION_SEED_DEFAULT,
         compute_printability_metrics=False,
-        use_fast_z=job.orientation_strategy != "legacy",
+        use_fast_z=orientation_strategy is not PrepareOrientationStrategy.LEGACY,
     )
     timings["search_s"] = time.perf_counter() - search_start
     return transform, dims
@@ -850,11 +1088,21 @@ def _prepare_cache_worker(
     dict[str, float | str | bool],
 ]:
     start = time.perf_counter()
+    orientation_strategy = coerce_enum(
+        PrepareOrientationStrategy,
+        job.orientation_strategy,
+        "orientation_strategy",
+    )
+    orientation_quality = coerce_enum(
+        PrepareOrientationQuality,
+        job.orientation_quality,
+        "orientation_quality",
+    )
     timings: dict[str, float | str | bool] = {
         "part": job.name,
-        "strategy_requested": job.orientation_strategy,
-        "strategy_used": job.orientation_strategy,
-        "orientation_quality": job.orientation_quality,
+        "strategy_requested": orientation_strategy.value,
+        "strategy_used": orientation_strategy.value,
+        "orientation_quality": orientation_quality.value,
         "fallback": False,
         "adaptive_enabled": False,
         "adaptive_reason": "",
@@ -912,6 +1160,10 @@ def _prepare_cache_worker(
             "surface_damage_proxy": metrics.surface_damage_proxy,
             "salient_down_area_ratio": metrics.salient_down_area_ratio,
             "flat_safe_down_area_ratio": metrics.flat_safe_down_area_ratio,
+            "sacrificial_support_ratio": metrics.sacrificial_support_ratio,
+            "visible_support_ratio": metrics.visible_support_ratio,
+            "assembly_side_alignment": metrics.assembly_side_alignment,
+            "assembly_side_confidence": metrics.assembly_side_confidence,
             "source_up_dot_build_up": metrics.source_up_dot_build_up,
             "upside_down_penalty": metrics.upside_down_penalty,
             "angle_band_penalty": metrics.angle_band_penalty,
@@ -997,11 +1249,21 @@ def _prepare_cache_loaded_worker(
     dict[str, float | str | bool],
 ]:
     start = time.perf_counter()
+    orientation_strategy = coerce_enum(
+        PrepareOrientationStrategy,
+        job.orientation_strategy,
+        "orientation_strategy",
+    )
+    orientation_quality = coerce_enum(
+        PrepareOrientationQuality,
+        job.orientation_quality,
+        "orientation_quality",
+    )
     timings: dict[str, float | str | bool] = {
         "part": job.name,
-        "strategy_requested": job.orientation_strategy,
-        "strategy_used": job.orientation_strategy,
-        "orientation_quality": job.orientation_quality,
+        "strategy_requested": orientation_strategy.value,
+        "strategy_used": orientation_strategy.value,
+        "orientation_quality": orientation_quality.value,
         "fallback": False,
         "adaptive_enabled": False,
         "adaptive_reason": "",
@@ -1053,6 +1315,10 @@ def _prepare_cache_loaded_worker(
             "surface_damage_proxy": metrics.surface_damage_proxy,
             "salient_down_area_ratio": metrics.salient_down_area_ratio,
             "flat_safe_down_area_ratio": metrics.flat_safe_down_area_ratio,
+            "sacrificial_support_ratio": metrics.sacrificial_support_ratio,
+            "visible_support_ratio": metrics.visible_support_ratio,
+            "assembly_side_alignment": metrics.assembly_side_alignment,
+            "assembly_side_confidence": metrics.assembly_side_confidence,
             "source_up_dot_build_up": metrics.source_up_dot_build_up,
             "upside_down_penalty": metrics.upside_down_penalty,
             "angle_band_penalty": metrics.angle_band_penalty,
@@ -1126,15 +1392,21 @@ def _orientation_actor_main(command_q: Any, result_q: Any) -> None:
     while True:
         command = command_q.get()
         kind = command[0]
-        if kind == "stop":
+        if kind == _OrientationActorCommand.STOP:
             for mesh, _report in retained.values():
                 clear_mesh_cache(mesh)
             retained.clear()
             gc.collect()
-            result_q.put(("stopped", -1, {"pid": pid, "max_rss_mb": _process_max_rss_mb()}))
+            result_q.put(
+                (
+                    _OrientationActorCommand.STOPPED,
+                    -1,
+                    {"pid": pid, "max_rss_mb": _process_max_rss_mb()},
+                )
+            )
             return
         try:
-            if kind == "scale":
+            if kind == _OrientationActorCommand.SCALE:
                 _kind, job, retain_mesh = command
                 start = time.perf_counter()
                 timings: dict[str, float | str | bool] = {
@@ -1157,11 +1429,15 @@ def _orientation_actor_main(command_q: Any, result_q: Any) -> None:
                     del mesh
                     gc.collect()
                 timings["total_s"] = time.perf_counter() - start
-                timings["strategy"] = job.orientation_strategy
+                timings["strategy"] = coerce_enum(
+                    PrepareOrientationStrategy,
+                    job.orientation_strategy,
+                    "orientation_strategy",
+                ).value
                 timings["pid"] = str(pid)
                 result_q.put(
                     (
-                        "scale",
+                        _OrientationActorCommand.SCALE,
                         job.index,
                         (
                             transform,
@@ -1174,7 +1450,7 @@ def _orientation_actor_main(command_q: Any, result_q: Any) -> None:
                         ),
                     )
                 )
-            elif kind == "orient":
+            elif kind == _OrientationActorCommand.ORIENT:
                 _kind, job = command
                 retained_payload = retained.pop(job.index, None)
                 if retained_payload is not None:
@@ -1201,13 +1477,19 @@ def _orientation_actor_main(command_q: Any, result_q: Any) -> None:
                         load_repair_s=time.perf_counter() - load_start,
                         retained=False,
                     )
-                result_q.put(("orient", job.index, (*result, _process_max_rss_mb())))
+                result_q.put(
+                    (
+                        _OrientationActorCommand.ORIENT,
+                        job.index,
+                        (*result, _process_max_rss_mb()),
+                    )
+                )
             else:
                 raise ValueError(f"unknown orientation actor command: {kind!r}")
         except BaseException as exc:  # noqa: BLE001 - propagate child failure to parent
             result_q.put(
                 (
-                    "error",
+                    _OrientationActorCommand.ERROR,
                     getattr(command[1], "index", -1) if len(command) > 1 else -1,
                     {
                         "pid": pid,
@@ -1227,7 +1509,7 @@ def _stop_orientation_actors(
         return
     for command_q in actor_queues:
         with suppress(OSError, EOFError, BrokenPipeError):
-            command_q.put(("stop",))
+            command_q.put((_OrientationActorCommand.STOP,))
     stopped = 0
     if actor_result_q is not None:
         deadline = time.monotonic() + 5.0
@@ -1238,7 +1520,7 @@ def _stop_orientation_actors(
                 continue
             except (OSError, EOFError, BrokenPipeError):
                 break
-            if kind == "stopped":
+            if kind == _OrientationActorCommand.STOPPED:
                 stopped += 1
     for proc in actor_processes:
         proc.join(timeout=5.0)
@@ -1254,7 +1536,10 @@ def _export_plate_worker(job: _ExportPlateJob) -> tuple[Path, float]:
     out_js = job.output_dir / f"plate_{job.plate.index + 1:02d}.json"
 
     def _load_part(part_index: int) -> trimesh.Trimesh:
-        return load_mesh(refs_by_index[part_index].cache_path)
+        mesh = load_mesh(refs_by_index[part_index].cache_path)
+        if abs(job.mesh_scale - 1.0) > 1e-12:
+            mesh.apply_scale(job.mesh_scale)
+        return mesh
 
     export_plate_3mf_lazy(
         _load_part,
@@ -1262,7 +1547,7 @@ def _export_plate_worker(job: _ExportPlateJob) -> tuple[Path, float]:
         out_3mf,
         names=list(job.names),
         out_manifest=out_js,
-        compression_mode=job.compression_mode,  # type: ignore[arg-type]
+        compression_mode=job.compression_mode,
     )
     gc.collect()
     return out_3mf, time.perf_counter() - start
@@ -1383,10 +1668,34 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     )
     gap = resolve_gap(args.gap_mm, st)
     edge_margin = resolve_edge_margin(args.edge_margin_mm, st)
+    max_plates = (
+        args.max_plates if args.max_plates is not None else (st.packing.max_plates if st else None)
+    )
+    scale_tolerance = (
+        float(args.scale_tolerance)
+        if args.scale_tolerance is not None
+        else (st.autopack.scale_tolerance if st else 1e-4)
+    )
     resin_options = resolve_resin_orientation_options(args.resin_balance, st)
-    method: str = args.method or "sorted"
-    requested_packer = args.packer or (st.autopack.packer if st else None) or "auto"
+    requested_packer_raw = args.packer or (st.autopack.packer if st else None) or PackerBackend.AUTO
     try:
+        method = coerce_enum(ScaleFitMethod, args.method or ScaleFitMethod.SORTED, "--method")
+        requested_packer = coerce_enum(PackerBackend, requested_packer_raw, "--packer")
+        export_compression = coerce_enum(
+            ExportCompressionMode,
+            args.export_compression,
+            "--export-compression",
+        )
+        orientation_strategy = coerce_enum(
+            PrepareOrientationStrategy,
+            args.orientation_strategy,
+            "--orientation-strategy",
+        )
+        orientation_quality = coerce_enum(
+            PrepareOrientationQuality,
+            args.orientation_quality,
+            "--orientation-quality",
+        )
         packer = _resolve_prepare_packer(args.packer, st.autopack.packer if st else None)
         bitmap_options = _resolve_prepare_bitmap_options(
             grid_mm=args.bitmap_grid_mm,
@@ -1397,14 +1706,17 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         return finish_profile(profiler, console, 2)
-    if args.export_compression not in {"default", "fast", "store"}:
-        console.print("[red]--export-compression must be default, fast, or store.[/red]")
+    if max_plates is not None and max_plates < 1:
+        console.print("[red]--max-plates must be >= 1.[/red]")
         return finish_profile(profiler, console, 2)
-    if args.orientation_strategy not in {"auto", "legacy"}:
-        console.print("[red]--orientation-strategy must be auto or legacy.[/red]")
+    if scale_tolerance <= 0:
+        console.print("[red]prepare scale tolerance must be > 0.[/red]")
         return finish_profile(profiler, console, 2)
-    if args.orientation_quality not in {"default", "adaptive"}:
-        console.print("[red]--orientation-quality must be default or adaptive.[/red]")
+    if max_plates is not None and args.resume:
+        console.print(
+            "[red]--max-plates cannot be combined with --resume yet; rerun without "
+            "--resume so prepare can rebuild the orientation cache at the search base scale.[/red]"
+        )
         return finish_profile(profiler, console, 2)
 
     px, py, pz = px_raw, py_raw, pz_raw
@@ -1417,7 +1729,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     console.print(
         f"Gap: {gap} mm  |  edge margin: {edge_margin} mm  |  post_fit_scale: {post_fit_scale}"
     )
-    if packer == "bitmap" and requested_packer == "bitmap":
+    if packer is PackerBackend.BITMAP and requested_packer is PackerBackend.BITMAP:
         console.print(
             "[yellow]Warning: prepare bitmap packing is a fast heuristic backend; "
             "use --packer auto/exact for quality-first plate count.[/yellow]"
@@ -1444,25 +1756,29 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         return finish_profile(profiler, console, 2)
     profile_metadata["resource_plan"] = worker_plan.to_json()
     profile_metadata["orientation_options"] = {
-        "strategy": args.orientation_strategy,
-        "quality": args.orientation_quality,
-        "resin_balance": resin_options.resin_balance,
+        "strategy": orientation_strategy.value,
+        "quality": orientation_quality.value,
+        "resin_balance": str(resin_options.resin_balance),
+        "long_part_angle_policy": str(resin_options.long_part_angle_policy),
+        "assembly_side_policy": str(resin_options.assembly_side_policy),
         "long_part_target_angle_min_deg": resin_options.long_part_target_angle_min_deg,
         "long_part_target_angle_max_deg": resin_options.long_part_target_angle_max_deg,
         "long_part_low_angle_penalty_below_deg": resin_options.long_part_low_angle_penalty_below_deg,
         "long_part_high_angle_penalty_above_deg": resin_options.long_part_high_angle_penalty_above_deg,
     }
     profile_metadata["packing_options"] = {
-        "requested_packer": requested_packer,
-        "resolved_packer": packer,
-        "packer": packer,
-        "bitmap_grid_mm": bitmap_options.grid_mm if packer == "bitmap" else None,
-        "bitmap_beam_width": bitmap_options.beam_width if packer == "bitmap" else None,
+        "requested_packer": requested_packer.value,
+        "resolved_packer": packer.value,
+        "packer": packer.value,
+        "bitmap_grid_mm": bitmap_options.grid_mm if packer is PackerBackend.BITMAP else None,
+        "bitmap_beam_width": bitmap_options.beam_width if packer is PackerBackend.BITMAP else None,
         "footprint_cache": args.footprint_cache,
         "packing_result_cache": args.packing_result_cache,
+        "max_plates": max_plates,
+        "scale_tolerance": scale_tolerance,
     }
     profile_metadata["export"] = {
-        "compression": args.export_compression,
+        "compression": export_compression.value,
         "writer": "stlbench-direct",
     }
     if args.verbose:
@@ -1482,6 +1798,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         cache_dir = Path(temp_cache.name)
     else:
         cache_dir = args.output_dir / "cache"
+    s_max_value: float | None = None
+    cache_scale_value: float | None = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Fast path: resume from orient cache
@@ -1508,7 +1826,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         if args.verbose:
             console.print(f"[dim]scale-orient: {_n} workers for {len(paths)} meshes[/dim]")
 
-        use_fused_orientation = args.orientation_strategy == "auto"
+        use_fused_orientation = orientation_strategy is PrepareOrientationStrategy.AUTO
         actor_processes: list[BaseProcess] = []
         actor_queues: list[Any] = []
         actor_result_q: Any | None = None
@@ -1549,7 +1867,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                     actor_idx = retained_actor.get(idx, idx % len(actor_queues))
                     actor_queues[actor_idx].put(
                         (
-                            "scale",
+                            _OrientationActorCommand.SCALE,
                             _ScaleOrientJob(
                                 index=idx,
                                 path=path,
@@ -1561,7 +1879,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                                 repair_options=repair_options,
                                 name=names[idx],
                                 repair_cache_dir=repair_cache_dir,
-                                orientation_strategy=args.orientation_strategy,
+                                orientation_strategy=orientation_strategy,
                             ),
                             idx in retained_indices,
                         )
@@ -1569,7 +1887,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 scale_done = 0
                 while scale_done < len(paths):
                     kind, idx, payload = actor_result_q.get()
-                    if kind == "error":
+                    if kind == _OrientationActorCommand.ERROR:
                         profile_metadata["orientation_actor_fallback"] = {
                             "stage": "scale",
                             "part_index": idx,
@@ -1580,7 +1898,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                             f"[red]fused orientation scale failed for part {idx}: {payload}[/red]"
                         )
                         return finish_profile(profiler, console, 1)
-                    if kind != "scale":
+                    if kind != _OrientationActorCommand.SCALE:
                         continue
                     (
                         transform,
@@ -1621,7 +1939,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                                 repair_options=repair_options,
                                 name=names[idx],
                                 repair_cache_dir=repair_cache_dir,
-                                orientation_strategy=args.orientation_strategy,
+                                orientation_strategy=orientation_strategy,
                             ),
                         ): idx
                         for idx, path in enumerate(paths)
@@ -1662,22 +1980,32 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
 
         with profiler.stage("scale computation"):
             try:
-                s_max, reports = compute_global_scale((px, py, pz), oriented_dims, names, method)  # type: ignore[arg-type]
+                s_max, reports = compute_global_scale((px, py, pz), oriented_dims, names, method)
             except ValueError as e:
                 console.print(f"[red]{e}[/red]")
                 _stop_orientation_actors(actor_queues, actor_processes, actor_result_q)
                 return finish_profile(profiler, console, 1)
 
-        s_final = s_max * post_fit_scale
+        cache_scale = s_max if max_plates is not None else s_max * post_fit_scale
+        s_max_value = float(s_max)
+        cache_scale_value = float(cache_scale)
+        profile_metadata["scale"] = {
+            "s_max": s_max_value,
+            "cache_scale": cache_scale_value,
+            "post_fit_scale": post_fit_scale,
+            "max_plates": max_plates,
+        }
         lim_name = reports[0].name
-        console.print(f"s_max={s_max:.6f}  post_fit={post_fit_scale}  s_final={s_final:.6f}")
+        console.print(
+            f"s_max={s_max:.6f}  post_fit={post_fit_scale}  cache_scale={cache_scale:.6f}"
+        )
         console.print(f"Limiting part: {lim_name}")
 
         table = Table(show_header=True, header_style="bold")
         table.add_column("part", max_width=42)
         table.add_column("scaled (mm)", justify="right")
         for r in reports:
-            sd = (r.dx * s_final, r.dy * s_final, r.dz * s_final)
+            sd = (r.dx * cache_scale, r.dy * cache_scale, r.dz * cache_scale)
             table.add_row(r.name, f"{sd[0]:.2f} × {sd[1]:.2f} × {sd[2]:.2f}")
         console.print(table)
 
@@ -1732,7 +2060,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                     actor_idx = retained_actor.get(idx, idx % len(actor_queues))
                     actor_queues[actor_idx].put(
                         (
-                            "orient",
+                            _OrientationActorCommand.ORIENT,
                             _PrepareCacheJob(
                                 index=idx,
                                 path=path,
@@ -1741,7 +2069,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                                 scale_transform=scale_transforms[idx],
                                 source_up=scale_transforms[idx][:3, :3]
                                 @ np.array([0.0, 0.0, 1.0], dtype=np.float64),
-                                scale=s_final,
+                                scale=cache_scale,
                                 overhang_threshold_deg=args.overhang_threshold_deg,
                                 n_orient_candidates=args.n_orient_candidates,
                                 printer_xyz=(epx, epy, pz),
@@ -1749,15 +2077,15 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                                 resin_options=resin_options,
                                 repair_options=repair_options,
                                 repair_cache_dir=repair_cache_dir,
-                                orientation_strategy=args.orientation_strategy,
-                                orientation_quality=args.orientation_quality,
+                                orientation_strategy=orientation_strategy,
+                                orientation_quality=orientation_quality,
                             ),
                         )
                     )
                 orient_done = 0
                 while orient_done < len(paths):
                     kind, idx, payload = actor_result_q.get()
-                    if kind == "error":
+                    if kind == _OrientationActorCommand.ERROR:
                         profile_metadata["orientation_actor_fallback"] = {
                             "stage": "orient",
                             "part_index": idx,
@@ -1768,7 +2096,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                             f"[red]fused orientation failed for part {idx}: {payload}[/red]"
                         )
                         return finish_profile(profiler, console, 1)
-                    if kind != "orient":
+                    if kind != _OrientationActorCommand.ORIENT:
                         continue
                     (
                         _idx,
@@ -1801,7 +2129,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                                 scale_transform=scale_transforms[idx],
                                 source_up=scale_transforms[idx][:3, :3]
                                 @ np.array([0.0, 0.0, 1.0], dtype=np.float64),
-                                scale=s_final,
+                                scale=cache_scale,
                                 overhang_threshold_deg=args.overhang_threshold_deg,
                                 n_orient_candidates=args.n_orient_candidates,
                                 printer_xyz=(epx, epy, pz),
@@ -1809,8 +2137,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                                 resin_options=resin_options,
                                 repair_options=repair_options,
                                 repair_cache_dir=repair_cache_dir,
-                                orientation_strategy=args.orientation_strategy,
-                                orientation_quality=args.orientation_quality,
+                                orientation_strategy=orientation_strategy,
+                                orientation_quality=orientation_quality,
                             ),
                         ): idx
                         for idx, path in enumerate(paths)
@@ -1897,17 +2225,18 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         console.print("[red]Internal error: layout started without prepared mesh references.[/red]")
         return finish_profile(profiler, console, 1)
 
-    # Pre-check: each part must fit the bed in at least one orientation before packing.
+    # Pre-check: without scale search, each part must fit the bed before packing.
     epx = px - 2.0 * edge_margin
     epy = py - 2.0 * edge_margin
-    for ref in prepared_refs:
-        dx, dy, _dz = ref.dims
-        if not ((dx <= epx and dy <= epy) or (dy <= epx and dx <= epy)):
-            console.print(
-                f"[red]Part {ref.name!r} ({dx:.1f}×{dy:.1f} mm) does not fit "
-                f"on bed {epx:.1f}×{epy:.1f} mm after edge margin.[/red]"
-            )
-            return finish_profile(profiler, console, 1)
+    if max_plates is None:
+        for ref in prepared_refs:
+            dx, dy, _dz = ref.dims
+            if not ((dx <= epx and dy <= epy) or (dy <= epx and dx <= epy)):
+                console.print(
+                    f"[red]Part {ref.name!r} ({dx:.1f}×{dy:.1f} mm) does not fit "
+                    f"on bed {epx:.1f}×{epy:.1f} mm after edge margin.[/red]"
+                )
+                return finish_profile(profiler, console, 1)
 
     n_parts = len(prepared_refs)
 
@@ -1964,24 +2293,100 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         edge_margin_mm=edge_margin,
         part_heights=part_heights,
         packer=packer,
-        bitmap_options=bitmap_options if packer == "bitmap" else None,
+        bitmap_options=bitmap_options if packer is PackerBackend.BITMAP else None,
         grid_step_mm=args.grid_step_mm,
+        max_plates=max_plates,
+        scale_tolerance=scale_tolerance if max_plates is not None else None,
+    )
+    layout_pack_scale = 1.0
+    export_mesh_scale = 1.0
+    final_source_scale = (
+        cache_scale_value * export_mesh_scale
+        if cache_scale_value is not None
+        else export_mesh_scale
     )
 
     with profiler.stage("packing"), make_progress(console, enabled=args.progress) as progress:
         ptask = progress.add_task("Packing…", total=n_parts)
-        cached_plates = _load_packing_result(packing_cache_dir, packing_key, packer)
-        if cached_plates is not None and _validate_layout_geometry(
-            packed_shadows, cached_plates, px, py, gap
+        cached_result = _load_packing_result(packing_cache_dir, packing_key, packer)
+        cached_plates = cached_result.plates if cached_result is not None else None
+        cached_layout_scale: float | None
+        if max_plates is None:
+            validation_shadows = packed_shadows
+            cached_layout_scale = 1.0
+        else:
+            cached_layout_scale = (
+                cached_result.layout_pack_scale
+                if cached_result is not None and cached_result.layout_pack_scale is not None
+                else None
+            )
+            validation_shadows = (
+                _scale_polygons(packed_shadows, cached_layout_scale * post_fit_scale)
+                if cached_layout_scale is not None
+                else []
+            )
+        if (
+            cached_plates is not None
+            and cached_layout_scale is not None
+            and _validate_layout_geometry(validation_shadows, cached_plates, px, py, gap)
         ):
             plates = cached_plates
+            layout_pack_scale = cached_layout_scale
+            export_mesh_scale = (
+                layout_pack_scale * post_fit_scale if max_plates is not None else 1.0
+            )
+            final_source_scale = (
+                cache_scale_value * export_mesh_scale
+                if cache_scale_value is not None
+                else export_mesh_scale
+            )
             packing_metadata["cache_hit"] = True
-            packing_metadata["strategy"] = packer
+            packing_metadata["strategy"] = packer.value
             packing_metadata["final_plates"] = len(plates)
             progress.update(ptask, completed=n_parts)
         else:
             packing_metadata["cache_hit"] = False
-            if packer == "bitmap":
+            if max_plates is not None:
+                layout_pack_scale, search_plates, search_metadata = profiler.profiled_call(
+                    f"prepare.packing.{packer.value}.scale_search",
+                    _search_prepare_layout_scale,
+                    packed_shadows,
+                    px,
+                    py,
+                    gap,
+                    edge_margin,
+                    packer=packer,
+                    bitmap_options=bitmap_options,
+                    grid_step_mm=args.grid_step_mm,
+                    max_plates=max_plates,
+                    part_heights=part_heights,
+                    tolerance=scale_tolerance,
+                )
+                packing_metadata.update(search_metadata)
+                if search_plates is None or layout_pack_scale <= 0.0:
+                    console.print(
+                        "[red]Could not pack parts into the requested max plates at any "
+                        "positive scale. Try larger --max-plates, smaller --gap-mm, or "
+                        "smaller --edge-margin-mm.[/red]"
+                    )
+                    return finish_profile(profiler, console, 1)
+                export_mesh_scale = layout_pack_scale * post_fit_scale
+                final_source_scale = (
+                    cache_scale_value * export_mesh_scale
+                    if cache_scale_value is not None
+                    else export_mesh_scale
+                )
+                plates = _scale_plate_dimensions(search_plates, post_fit_scale)
+                final_shadows = _scale_polygons(packed_shadows, export_mesh_scale)
+                if not _validate_layout_geometry(final_shadows, plates, px, py, gap):
+                    console.print(
+                        "[red]Final prepare layout does not fit after applying "
+                        "--post-fit-scale. Use post_fit_scale <= 1.0, increase "
+                        "--max-plates, or reduce margins/gap.[/red]"
+                    )
+                    return finish_profile(profiler, console, 1)
+                progress.update(ptask, completed=n_parts)
+            elif packer is PackerBackend.BITMAP:
                 plates = profiler.profiled_call(
                     "prepare.packing.bitmap",
                     _pack_bitmap_multi_plate,
@@ -2008,18 +2413,32 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                     metadata=packing_metadata,
                     edge_margin_mm=edge_margin,
                 )
-            if not _validate_layout_geometry(packed_shadows, plates, px, py, gap):
+            if not _validate_layout_geometry(
+                _scale_polygons(packed_shadows, export_mesh_scale), plates, px, py, gap
+            ):
                 console.print(
                     "[red]Internal error: prepare layout failed geometry validation.[/red]"
                 )
                 return finish_profile(profiler, console, 1)
             if not args.dry_run:
-                _write_packing_result(packing_cache_dir, packing_key, packer, plates)
+                _write_packing_result(
+                    packing_cache_dir,
+                    packing_key,
+                    packer,
+                    plates,
+                    layout_pack_scale=layout_pack_scale if max_plates is not None else None,
+                )
         packing_metadata["cache_key"] = packing_key
-        packing_metadata["requested_packer"] = requested_packer
-        packing_metadata["resolved_packer"] = packer
-        packing_metadata["packer"] = packer
+        packing_metadata["requested_packer"] = requested_packer.value
+        packing_metadata["resolved_packer"] = packer.value
+        packing_metadata["packer"] = packer.value
         packing_metadata["final_plates"] = len(plates)
+        packing_metadata["max_plates"] = max_plates
+        packing_metadata["s_max"] = s_max_value
+        packing_metadata["layout_pack_scale"] = layout_pack_scale
+        packing_metadata["post_fit_scale"] = post_fit_scale
+        packing_metadata["export_mesh_scale"] = export_mesh_scale
+        packing_metadata["final_scale"] = final_source_scale
     profile_metadata["packing"] = packing_metadata
 
     console.print(f"Plates: {len(plates)}")
@@ -2087,7 +2506,8 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                         refs=export_refs,
                         output_dir=args.output_dir,
                         names=output_names,
-                        compression_mode=args.export_compression,
+                        compression_mode=export_compression,
+                        mesh_scale=export_mesh_scale,
                     ),
                 ): pl
                 for pl in plates
@@ -2102,6 +2522,24 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     with profiler.stage("transform log"):
         transform_parts: list[dict] = []
         refs_by_index = {ref.index: ref for ref in prepared_refs}
+        export_scale_matrix = uniform_scale_matrix(export_mesh_scale)
+        export_scale_steps: list[dict[str, object]] = []
+        if max_plates is not None:
+            export_scale_steps = [
+                transform_step(
+                    "layout_pack_scale",
+                    matrix=uniform_scale_matrix(layout_pack_scale),
+                    params={
+                        "scale_factor": layout_pack_scale,
+                        "max_plates": max_plates,
+                    },
+                ),
+                transform_step(
+                    "post_fit_scale",
+                    matrix=uniform_scale_matrix(post_fit_scale),
+                    params={"scale_factor": post_fit_scale},
+                ),
+            ]
         for pl in plates:
             plate_file = args.output_dir / f"plate_{pl.index + 1:02d}.3mf"
             for rect in pl.rects:
@@ -2113,11 +2551,16 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                         cache_bounds = np.asarray(cached_mesh.bounds, dtype=np.float64)
                     finally:
                         clear_mesh_cache(cached_mesh)
+                export_cache_bounds = (
+                    transform_bounds(cache_bounds, export_scale_matrix)
+                    if max_plates is not None
+                    else cache_bounds
+                )
                 placement_transform, placement_steps = placement_transform_for_bounds(
-                    cache_bounds, rect
+                    export_cache_bounds, rect
                 )
                 source_to_export = (
-                    placement_transform @ ref.source_to_cache_matrix
+                    placement_transform @ export_scale_matrix @ ref.source_to_cache_matrix
                     if ref.source_to_cache_matrix is not None
                     else None
                 )
@@ -2151,7 +2594,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                         source_bounds_mm=source_bounds_mm,
                         final_bounds_mm=final_bounds_mm,
                         source_to_export_matrix=source_to_export,
-                        steps=[*ref.transform_steps, *placement_steps],
+                        steps=[*ref.transform_steps, *export_scale_steps, *placement_steps],
                         plate_x_mm=rect.x,
                         plate_y_mm=rect.y,
                         rotation_deg=rect.rotation_deg,
@@ -2163,7 +2606,16 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             command="prepare",
             output_files=output_files,
             parts=transform_parts,
-            metadata={"resume": args.resume},
+            metadata={
+                "resume": args.resume,
+                "max_plates": max_plates,
+                "s_max": s_max_value,
+                "layout_pack_scale": layout_pack_scale,
+                "post_fit_scale": post_fit_scale,
+                "export_mesh_scale": export_mesh_scale,
+                "final_scale": final_source_scale,
+                "final_plate_count": len(plates),
+            },
         )
     if repair_reports:
         write_command_repair_report(

@@ -14,9 +14,9 @@ from typing import Any
 import numpy as np
 import trimesh
 
-from stlbench.core.mesh_cleanup import remove_small_components
+from stlbench.core.mesh_cleanup import remove_degenerate_faces, remove_small_components
 
-REPAIR_STRATEGY_VERSION = "7"
+REPAIR_STRATEGY_VERSION = "8"
 
 
 @dataclass(frozen=True)
@@ -362,9 +362,32 @@ def repair_mesh(
         )
 
     original_sig = _mesh_signature(mesh)
+    applied: list[str] = []
+    warnings: list[str] = []
+    timings: dict[str, float] = {}
+
     start = time.perf_counter()
-    repaired, applied, warnings, timings = _full_pymeshlab_repair(mesh, opts)
+    working, removed = remove_degenerate_faces(mesh)
+    timings["remove_degenerate_faces_pre"] = time.perf_counter() - start
+    if removed:
+        applied.append("remove_degenerate_faces_pre")
+        warnings.append(f"removed {removed} zero-area triangle(s)")
+
+    start = time.perf_counter()
+    repaired, pymeshlab_applied, pymeshlab_warnings, pymeshlab_timings = _full_pymeshlab_repair(
+        working, opts
+    )
+    applied.extend(pymeshlab_applied)
+    warnings.extend(pymeshlab_warnings)
+    timings.update(pymeshlab_timings)
     timings["full_total"] = time.perf_counter() - start
+
+    start = time.perf_counter()
+    repaired, removed = remove_degenerate_faces(repaired)
+    timings["remove_degenerate_faces_post"] = time.perf_counter() - start
+    if removed:
+        applied.append("remove_degenerate_faces_post")
+        warnings.append(f"removed {removed} zero-area triangle(s)")
 
     if opts.remove_small_components:
         start = time.perf_counter()

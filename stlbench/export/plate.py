@@ -4,15 +4,17 @@ import json
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 from xml.sax.saxutils import escape
 
 import numpy as np
 import trimesh
 
+from stlbench.config.enums import ExportCompressionMode, coerce_enum
 from stlbench.packing.rectpack_plate import PackedPlate
 
-ExportCompressionMode = Literal["default", "fast", "store"]
+DEFAULT_ZIP_COMPRESSLEVEL = 5
+FAST_ZIP_COMPRESSLEVEL = 1
 
 
 class MeshLoader(Protocol):
@@ -67,14 +69,14 @@ def _validate_rect_local_bounds(
     return actual_w, actual_h
 
 
-def _compression_options(mode: ExportCompressionMode) -> tuple[int, int | None]:
-    if mode == "default":
-        return zipfile.ZIP_DEFLATED, 5
-    if mode == "fast":
-        return zipfile.ZIP_DEFLATED, 1
-    if mode == "store":
+def _compression_options(mode: ExportCompressionMode | str) -> tuple[int, int | None]:
+    mode = coerce_enum(ExportCompressionMode, mode, "compression_mode")
+    if mode is ExportCompressionMode.DEFAULT:
+        return zipfile.ZIP_DEFLATED, DEFAULT_ZIP_COMPRESSLEVEL
+    if mode is ExportCompressionMode.FAST:
+        return zipfile.ZIP_DEFLATED, FAST_ZIP_COMPRESSLEVEL
+    if mode is ExportCompressionMode.STORE:
         return zipfile.ZIP_STORED, None
-    raise ValueError("compression_mode must be default, fast, or store.")
 
 
 def _xml_attr(value: object) -> str:
@@ -105,7 +107,7 @@ def _export_3mf_direct(
     names: list[str],
     out_3mf: Path,
     *,
-    compression_mode: ExportCompressionMode,
+    compression_mode: ExportCompressionMode | str,
     batch_size: int = 4096,
 ) -> None:
     compression, compresslevel = _compression_options(compression_mode)
@@ -204,7 +206,7 @@ def export_plate_3mf(
     names: list[str] | None = None,
     out_manifest: Path | None = None,
     *,
-    compression_mode: ExportCompressionMode = "default",
+    compression_mode: ExportCompressionMode | str = ExportCompressionMode.DEFAULT,
 ) -> None:
     def _load_mesh(part_index: int) -> trimesh.Trimesh:
         return meshes[part_index]
@@ -228,7 +230,7 @@ def export_plate_3mf_lazy(
     out_manifest: Path | None = None,
     *,
     copy_mesh: bool = False,
-    compression_mode: ExportCompressionMode = "default",
+    compression_mode: ExportCompressionMode | str = ExportCompressionMode.DEFAULT,
 ) -> None:
     """Export a packed plate as a 3MF with one independent object per part.
 
@@ -250,6 +252,7 @@ def export_plate_3mf_lazy(
         except IndexError:
             continue
         m = loaded.copy() if copy_mesh else loaded
+        m.merge_vertices()
         m = _place_rect_local(m, r)
 
         base = (

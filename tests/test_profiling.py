@@ -9,15 +9,23 @@ from typing import Any
 import numpy as np
 import pytest
 import trimesh
+from shapely.geometry import box
 
+from stlbench.config.enums import PackerBackend
 from stlbench.core.mesh_repair import RepairOptions
 from stlbench.core.overhang import ResinOrientationOptions
+from stlbench.packing.bitmap_pack import BitmapPackOptions
 from stlbench.pipeline.run_layout import LayoutRunArgs, run_layout
 from stlbench.pipeline.run_prepare import (
     PrepareRunArgs,
+    _packing_cache_key,
     _prepare_cache_worker,
     _PrepareCacheJob,
+    _resolve_prepare_packer,
+    _scale_polygons,
+    _search_prepare_layout_scale,
     _select_retained_indices,
+    _validate_layout_geometry,
     run_prepare,
 )
 from stlbench.pipeline.run_scale import ScaleRunArgs, run_scale
@@ -81,6 +89,12 @@ def _assert_profile_artifacts(profile_dir: Path, command: str) -> dict[str, Any]
     return payload
 
 
+def test_resolve_prepare_packer_returns_enum() -> None:
+    assert _resolve_prepare_packer(None, None) is PackerBackend.EXACT
+    assert _resolve_prepare_packer("auto", None) is PackerBackend.EXACT
+    assert _resolve_prepare_packer("bitmap", None) is PackerBackend.BITMAP
+
+
 def test_select_retained_indices_respects_cap_and_largest_first(tmp_path: Path):
     sizes = [100, 30, 20, 10]
     paths: list[Path] = []
@@ -100,6 +114,82 @@ def test_select_retained_indices_respects_cap_and_largest_first(tmp_path: Path):
     assert metadata["estimated_retained_bytes"] == 520
     assert metadata["cap_bytes"] == 540
     assert metadata["max_retained_parts"] == 3
+
+
+def test_prepare_scale_search_shrinks_to_requested_plate_count():
+    polygons = [box(0.0, 0.0, 60.0, 60.0) for _ in range(4)]
+
+    scale, plates, metadata = _search_prepare_layout_scale(
+        polygons,
+        100.0,
+        100.0,
+        0.0,
+        0.0,
+        packer="exact",
+        bitmap_options=BitmapPackOptions(),
+        grid_step_mm=1.0,
+        max_plates=1,
+        part_heights=[10.0, 10.0, 10.0, 10.0],
+        tolerance=1e-3,
+    )
+
+    assert plates is not None
+    assert len(plates) == 1
+    assert scale == pytest.approx(100.0 / 120.0, abs=0.02)
+    assert metadata["max_plates"] == 1
+    assert metadata["attempts_run"] > 0
+    assert _validate_layout_geometry(_scale_polygons(polygons, scale), plates, 100.0, 100.0, 0.0)
+
+
+def test_prepare_scale_search_keeps_full_scale_when_full_scale_fits_two_plates():
+    polygons = [box(0.0, 0.0, 90.0, 90.0) for _ in range(2)]
+
+    scale, plates, metadata = _search_prepare_layout_scale(
+        polygons,
+        100.0,
+        100.0,
+        1.0,
+        0.0,
+        packer="exact",
+        bitmap_options=BitmapPackOptions(),
+        grid_step_mm=1.0,
+        max_plates=2,
+        part_heights=[10.0, 10.0],
+        tolerance=1e-3,
+    )
+
+    assert plates is not None
+    assert len(plates) == 2
+    assert scale >= 1.0 - 1e-3
+    assert metadata["final_plates"] == 2
+
+
+def test_prepare_packing_cache_key_includes_scale_search_options():
+    kwargs = {
+        "footprint_keys": ["a", "b"],
+        "bed_w": 100.0,
+        "bed_h": 100.0,
+        "gap_mm": 1.0,
+        "edge_margin_mm": 2.0,
+        "part_heights": [10.0, 20.0],
+        "packer": "exact",
+        "bitmap_options": None,
+        "grid_step_mm": 1.0,
+    }
+
+    base = _packing_cache_key(**kwargs, max_plates=1, scale_tolerance=1e-4)
+
+    assert base != _packing_cache_key(**kwargs, max_plates=2, scale_tolerance=1e-4)
+    assert base != _packing_cache_key(**kwargs, max_plates=1, scale_tolerance=1e-3)
+    assert base != _packing_cache_key(
+        **{
+            **kwargs,
+            "packer": "bitmap",
+            "bitmap_options": BitmapPackOptions(),
+        },
+        max_plates=1,
+        scale_tolerance=1e-4,
+    )
 
 
 def test_execution_profiler_writes_artifacts_and_merges_worker_stats(tmp_path: Path):
@@ -305,6 +395,61 @@ def test_run_prepare_fast_export_writes_loadable_3mf_and_profile_metadata(tmp_pa
         assert isinstance(loaded, trimesh.Scene)
         total_geometry += len(loaded.geometry)
     assert total_geometry == 2
+
+
+def test_run_prepare_max_plates_exports_one_plate_and_scale_metadata(tmp_path: Path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    _write_box(input_dir / "a.stl", (60.0, 60.0, 60.0))
+    _write_box(input_dir / "b.stl", (60.0, 60.0, 60.0))
+    out_dir = tmp_path / "out"
+    profile_dir = tmp_path / "profile"
+
+    rc = run_prepare(
+        PrepareRunArgs(
+            input_dir=input_dir,
+            output_dir=out_dir,
+            config_path=None,
+            printer_xyz=(100.0, 100.0, 100.0),
+            gap_mm=0.0,
+            edge_margin_mm=0.0,
+            post_fit_scale=0.9,
+            method="sorted",
+            overhang_threshold_deg=45.0,
+            n_orient_candidates=1,
+            dry_run=False,
+            recursive=False,
+            packer="exact",
+            max_plates=1,
+            scale_tolerance=1e-3,
+            workers="1",
+            progress=False,
+            orientation_strategy="legacy",
+            orientation_quality="default",
+            profile_options=ProfileOptions(enabled=True, profile_dir=profile_dir, limit=20),
+        )
+    )
+
+    assert rc == 0
+    assert sorted(out_dir.glob("plate_*.3mf")) == [out_dir / "plate_01.3mf"]
+    log = json.loads((out_dir / "transforms.json").read_text(encoding="utf-8"))
+    assert log["metadata"]["max_plates"] == 1
+    assert log["metadata"]["layout_pack_scale"] < 1.0
+    assert log["metadata"]["post_fit_scale"] == pytest.approx(0.9)
+    assert log["metadata"]["final_plate_count"] == 1
+    assert all(
+        {"layout_pack_scale", "post_fit_scale"}.issubset({step["name"] for step in part["steps"]})
+        for part in log["parts"]
+    )
+    payload = _assert_profile_artifacts(profile_dir, "prepare")
+    packing = payload["metadata"]["packing"]
+    assert packing["max_plates"] == 1
+    assert packing["final_plates"] == 1
+    assert packing["layout_pack_scale"] < 1.0
+    assert packing["post_fit_scale"] == pytest.approx(0.9)
+    assert packing["final_scale"] == pytest.approx(
+        packing["s_max"] * packing["layout_pack_scale"] * packing["post_fit_scale"]
+    )
 
 
 def test_run_prepare_adaptive_orientation_quality_records_diagnostics(tmp_path: Path):

@@ -224,6 +224,7 @@ __marimo__/
 *.gltf
 examples/kratos/
 examples/roman/
+examples/aid/
 examples/gandalf/scaled/
 examples/gandalf/oriented/
 examples/gandalf/plates/

@@ -23,6 +23,10 @@ edge_margin_mm = 2.0
 
 [orientation]
 resin_balance = "balanced"
+# Apply the 30-50° long-part angle band only to very thin linear parts by default.
+long_part_angle_policy = "thin_linear"
+# Detect low-saliency assembly/hidden sides and prefer putting support scars there.
+assembly_side_policy = "auto"
 long_part_target_angle_min_deg = 30.0
 long_part_target_angle_max_deg = 50.0
 long_part_low_angle_penalty_below_deg = 20.0

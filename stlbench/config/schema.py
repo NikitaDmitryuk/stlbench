@@ -5,6 +5,13 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, model_validator
 
+from stlbench.config.enums import (
+    AssemblySidePolicy,
+    LongPartAnglePolicy,
+    PackerBackend,
+    ResinBalance,
+)
+
 
 class PrinterSection(BaseModel):
     name: str = ""
@@ -22,10 +29,13 @@ class ScalingSection(BaseModel):
 class PackingSection(BaseModel):
     gap_mm: float = Field(default=2.0, ge=0.0)
     edge_margin_mm: float = Field(default=2.0, ge=0.0)
+    max_plates: int | None = Field(default=None, ge=1)
 
 
 class OrientationSection(BaseModel):
-    resin_balance: str = Field(default="balanced", pattern="^(balanced|stability|compact)$")
+    resin_balance: ResinBalance = ResinBalance.BALANCED
+    long_part_angle_policy: LongPartAnglePolicy = LongPartAnglePolicy.THIN_LINEAR
+    assembly_side_policy: AssemblySidePolicy = AssemblySidePolicy.AUTO
     long_part_target_angle_min_deg: float = Field(default=30.0, ge=0.0, le=90.0)
     long_part_target_angle_max_deg: float = Field(default=50.0, ge=0.0, le=90.0)
     long_part_low_angle_penalty_below_deg: float = Field(default=20.0, ge=0.0, le=90.0)
@@ -52,7 +62,7 @@ class RepairSection(BaseModel):
 
 
 class AutopackSection(BaseModel):
-    packer: str = Field(default="auto", pattern="^(auto|bitmap|exact)$")
+    packer: PackerBackend = PackerBackend.AUTO
     pack_workers: int | str = "auto"
     result_cache: bool = True
     attempt_cache: bool = True

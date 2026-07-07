@@ -10,6 +10,7 @@ import trimesh
 from rich.console import Console
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
+from stlbench.config.enums import ScaleFitMethod
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.overhang import (
@@ -230,7 +231,7 @@ def run_fill(args: FillRunArgs) -> int:
     if args.scale:
         with profiler.stage("scale"):
             dims = aabb_edge_lengths(np.asarray(mesh.bounds))
-            s, _ = compute_global_scale((px, py, pz), [dims], [inp.name], "sorted")
+            s, _ = compute_global_scale((px, py, pz), [dims], [inp.name], ScaleFitMethod.SORTED)
             pf = st.scaling.post_fit_scale if st else 1.0
             s_final = s * pf
             scale_matrix = uniform_scale_matrix(s_final)

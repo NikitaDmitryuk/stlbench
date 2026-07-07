@@ -17,6 +17,8 @@ from typing import Any, TypeVar, cast
 
 from rich.console import Console
 
+from stlbench.config.enums import ProfileSortKey, coerce_enum
+
 T = TypeVar("T")
 R = TypeVar("R")
 
@@ -245,9 +247,10 @@ class ExecutionProfiler:
         return stats
 
     def _sort_key(self) -> str:
-        if self.options.sort not in {"cumulative", "tottime", "calls"}:
-            return "cumulative"
-        return self.options.sort
+        try:
+            return coerce_enum(ProfileSortKey, self.options.sort, "profile sort").value
+        except ValueError:
+            return ProfileSortKey.CUMULATIVE.value
 
     def _top_functions(self, stats: pstats.Stats) -> list[dict[str, Any]]:
         stats.sort_stats(self._sort_key())

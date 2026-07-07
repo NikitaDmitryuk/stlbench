@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 
-Method = Literal["sorted", "conservative"]
+from stlbench.config.enums import ScaleFitMethod, coerce_enum
+
+Method = ScaleFitMethod | str
 
 
 def aabb_edge_lengths(bounds: np.ndarray) -> tuple[float, float, float]:
@@ -100,7 +101,9 @@ def compute_global_scale(
     reports: list[PartScaleReport] = []
     limits: list[float] = []
 
-    if method == "sorted":
+    method = coerce_enum(ScaleFitMethod, method, "method")
+
+    if method is ScaleFitMethod.SORTED:
         for i, (name, dims) in enumerate(zip(part_names, parts_dims, strict=True)):
             _require_positive_dims(dims, name)
             s_lim, axis = s_max_for_part_printer_axes(px, py, pz, *dims)
@@ -121,7 +124,7 @@ def compute_global_scale(
                     file_dz=fz,
                 )
             )
-    elif method == "conservative":
+    elif method is ScaleFitMethod.CONSERVATIVE:
         p_min = min(px, py, pz)
         for i, (name, dims) in enumerate(zip(part_names, parts_dims, strict=True)):
             s_lim = s_max_for_part_conservative(p_min, *dims)
@@ -142,9 +145,6 @@ def compute_global_scale(
                     file_dz=fz,
                 )
             )
-    else:
-        raise ValueError(f"Unknown method: {method}")
-
     s_max = min(limits)
     return s_max, reports
 

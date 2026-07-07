@@ -13,9 +13,9 @@ from stlbench.config.defaults import (
     ORIENTATION_SAMPLES_DEFAULT,
     ORIENTATION_SEED_DEFAULT,
 )
+from stlbench.config.enums import ScaleFitMethod, coerce_enum
 from stlbench.config.schema import AppSettings
 from stlbench.core.fit import (
-    Method,
     PartScaleReport,
     aabb_edge_lengths,
     compute_global_scale,
@@ -131,7 +131,15 @@ def run_scale(args: ScaleRunArgs) -> int:
         else (st.scaling.post_fit_scale if st is not None else 1.0)
     )
 
-    method_s: Method = args.method or "sorted"  # type: ignore[assignment]
+    try:
+        method_s = coerce_enum(
+            ScaleFitMethod,
+            args.method or ScaleFitMethod.SORTED,
+            "--method",
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return finish_profile(profiler, console, 2)
 
     rot_samples = (
         int(args.rotation_samples)
@@ -175,7 +183,7 @@ def run_scale(args: ScaleRunArgs) -> int:
             maximize=args.maximize,
             random_samples=rot_samples,
             seed=seed,
-            policy=orientation_policy,  # type: ignore[arg-type]
+            policy=orientation_policy,
             scale_tolerance=scale_tolerance,
         )
 
@@ -233,8 +241,10 @@ def run_scale(args: ScaleRunArgs) -> int:
         if st and st.printer.name:
             console.print(f"Printer profile: {st.printer.name}")
         console.print(f"Printer: {px:.4f} x {py:.4f} x {pz:.4f}")
-        console.print(f"Method: {method_s}")
-        console.print(f"Orientation policy: {orientation_policy}, tolerance: {scale_tolerance:.3f}")
+        console.print(f"Method: {method_s.value}")
+        console.print(
+            f"Orientation policy: {orientation_policy.value}, tolerance: {scale_tolerance:.3f}"
+        )
         if args.any_rotation:
             mode = "maximize" if args.maximize else "axis-permutations"
             console.print(f"Rotation: {mode}")

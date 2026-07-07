@@ -1,9 +1,12 @@
 """Tests for stlbench.core.overhang."""
 
+from typing import cast
+
 import numpy as np
 import pytest
 import trimesh
 
+from stlbench.config.enums import AssemblySidePolicy
 from stlbench.core.overhang import (
     ResinOrientationOptions,
     _face_saliency,
@@ -14,6 +17,26 @@ from stlbench.core.overhang import (
     find_stable_overhang_rotation_legacy,
     overhang_score,
 )
+
+
+def _assembly_side_probe_mesh() -> trimesh.Trimesh:
+    body = trimesh.creation.icosphere(subdivisions=2, radius=14.0)
+    connector = trimesh.creation.box(extents=[20.0, 8.0, 20.0])
+    connector.apply_translation([0.0, -16.0, 0.0])
+    detail = trimesh.creation.box(extents=[8.0, 4.0, 8.0])
+    detail.apply_translation([0.0, 15.5, 0.0])
+    return cast(trimesh.Trimesh, trimesh.util.concatenate([body, connector, detail]))
+
+
+def _decorated_base_mesh() -> trimesh.Trimesh:
+    base = trimesh.creation.box(extents=[80.0, 22.0, 70.0])
+    parts = [base]
+    for x in (-24.0, 0.0, 24.0):
+        for z in (-20.0, 0.0, 20.0):
+            bump = trimesh.creation.box(extents=[10.0, 5.0, 10.0])
+            bump.apply_translation([x, 13.5, z])
+            parts.append(bump)
+    return cast(trimesh.Trimesh, trimesh.util.concatenate(parts))
 
 
 def _tilted_box(angle_deg: float = 30.0) -> trimesh.Trimesh:
@@ -175,6 +198,63 @@ def test_stable_overhang_rejects_vertical_long_rod_when_target_exists():
     assert metrics.vertical_penalty == pytest.approx(0.0)
 
 
+def test_default_long_part_angle_policy_ignores_broad_elongated_part():
+    mesh = trimesh.creation.box(extents=[80.0, 35.0, 10.0])
+
+    _rotation, _, metrics = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=80,
+        printer_dims=(200.0, 200.0, 200.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(resin_balance="balanced"),
+    )
+
+    assert metrics.pca_aspect >= 6.0
+    assert metrics.pca_line_ratio > 0.35
+    assert metrics.angle_band_penalty == pytest.approx(0.0)
+    assert metrics.horizontal_penalty == pytest.approx(0.0)
+    assert metrics.vertical_penalty == pytest.approx(0.0)
+    assert metrics.selection_reason != "long_part_target_band"
+
+
+def test_disabled_long_part_angle_policy_ignores_thin_rod_angle_band():
+    mesh = trimesh.creation.box(extents=[120.0, 6.0, 6.0])
+
+    _rotation, _, metrics = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=80,
+        printer_dims=(200.0, 200.0, 200.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(
+            resin_balance="balanced",
+            long_part_angle_policy="disabled",
+        ),
+    )
+
+    assert metrics.angle_band_penalty == pytest.approx(0.0)
+    assert metrics.horizontal_penalty == pytest.approx(0.0)
+    assert metrics.vertical_penalty == pytest.approx(0.0)
+    assert metrics.selection_reason != "long_part_target_band"
+
+
+def test_linear_long_part_angle_policy_keeps_legacy_broad_matching():
+    mesh = trimesh.creation.box(extents=[80.0, 35.0, 10.0])
+
+    _rotation, _, metrics = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=80,
+        printer_dims=(200.0, 200.0, 200.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(
+            resin_balance="balanced",
+            long_part_angle_policy="linear",
+        ),
+    )
+
+    assert 30.0 <= metrics.long_axis_angle_from_bed_deg <= 50.0
+    assert metrics.selection_reason == "long_part_target_band"
+
+
 def test_stable_overhang_penalizes_vertical_flat_plate():
     mesh = trimesh.creation.box(extents=[70.0, 4.0, 40.0])
 
@@ -205,6 +285,64 @@ def test_source_up_preservation_rejects_upside_down_candidate():
     assert metrics.source_up_dot_build_up > 0.45
     assert metrics.upside_down_penalty == pytest.approx(0.0)
     assert metrics.selection_reason == "source_up_preserved"
+
+
+def test_assembly_side_policy_moves_support_to_hidden_side():
+    mesh = _assembly_side_probe_mesh()
+
+    rotation, _, metrics = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=80,
+        printer_dims=(120.0, 120.0, 120.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(resin_balance="balanced"),
+        source_up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    )
+    oriented = apply_min_overhang_orientation(mesh, rotation)
+
+    assert metrics.assembly_side_confidence >= 0.55
+    assert metrics.assembly_side_alignment > 0.35
+    assert metrics.sacrificial_support_ratio >= metrics.visible_support_ratio
+    assert metrics.selection_reason == "assembly_side_support"
+    assert oriented.extents[2] < 120.0
+
+
+def test_assembly_side_policy_can_be_disabled():
+    mesh = _assembly_side_probe_mesh()
+
+    _rotation, _, metrics = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=80,
+        printer_dims=(120.0, 120.0, 120.0),
+        support_tolerance_ratio=0.5,
+        resin_options=ResinOrientationOptions(
+            resin_balance="balanced",
+            assembly_side_policy=AssemblySidePolicy.DISABLED,
+        ),
+        source_up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    )
+
+    assert metrics.assembly_side_confidence == pytest.approx(0.0)
+    assert metrics.sacrificial_support_ratio == pytest.approx(0.0)
+    assert metrics.selection_reason != "assembly_side_support"
+
+
+def test_decorated_base_prefers_sacrificial_side_support_over_visible_support():
+    mesh = _decorated_base_mesh()
+
+    _rotation, _, metrics = find_stable_overhang_rotation(
+        mesh,
+        n_candidates=100,
+        printer_dims=(120.0, 120.0, 120.0),
+        support_tolerance_ratio=0.6,
+        resin_options=ResinOrientationOptions(resin_balance="balanced"),
+        source_up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    )
+
+    assert metrics.assembly_side_confidence >= 0.55
+    assert metrics.sacrificial_support_ratio > 0.0
+    assert metrics.visible_support_ratio < metrics.sacrificial_support_ratio
+    assert metrics.selection_reason == "assembly_side_support"
 
 
 def test_bumpy_surface_has_higher_saliency_than_flat_base():
