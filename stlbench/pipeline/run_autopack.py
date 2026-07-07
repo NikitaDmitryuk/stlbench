@@ -19,6 +19,7 @@ from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
+from stlbench.config.enums import PackerBackend, ScaleFitMethod, coerce_enum
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.core.mesh_cleanup import remove_small_components
 from stlbench.core.mesh_repair import repair_cache_key, repair_report_step
@@ -195,11 +196,12 @@ def _resolve_autopack_scale_tolerance(value: float | None, settings_value: float
     return out
 
 
-def _resolve_autopack_packer(value: str | None, settings_value: str | None) -> str:
-    out = value or settings_value or "auto"
-    if out not in {"auto", "bitmap", "exact"}:
-        raise ValueError("--autopack-packer must be auto, bitmap, or exact.")
-    return out
+def _resolve_autopack_packer(
+    value: str | None,
+    settings_value: PackerBackend | str | None,
+) -> PackerBackend:
+    out = value or settings_value or PackerBackend.AUTO
+    return coerce_enum(PackerBackend, out, "--autopack-packer")
 
 
 def _resolve_bitmap_options(
@@ -284,7 +286,7 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
 
 def _pack_cache_key(
     *,
-    packer: str = "exact",
+    packer: PackerBackend | str = PackerBackend.EXACT,
     bitmap_options: BitmapPackOptions | None = None,
     source_paths: list[Path],
     repair_cache_keys: list[str | None],
@@ -321,8 +323,13 @@ def _pack_cache_key(
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _packer_version(packer: str) -> str:
-    return "bitmap_pack_v3" if packer in {"auto", "bitmap"} else "polygon_pack_nfp_v1"
+def _packer_version(packer: PackerBackend | str) -> str:
+    packer = coerce_enum(PackerBackend, packer, "packer")
+    return (
+        "bitmap_pack_v3"
+        if packer in {PackerBackend.AUTO, PackerBackend.BITMAP}
+        else "polygon_pack_nfp_v1"
+    )
 
 
 def _scale_key(scale: float) -> str:
@@ -566,7 +573,7 @@ def _pack_bitmap_at_scale_cached(
     write_cache: bool,
     stats: _PackCacheStats,
 ) -> _PackAttempt:
-    packer_version = _packer_version("bitmap")
+    packer_version = _packer_version(PackerBackend.BITMAP)
     cached = _load_pack_attempt(cache_dir, pack_key, scale, packer_version=packer_version)
     if cached is not None:
         stats.attempt_cache_hits += 1
@@ -605,7 +612,7 @@ def _search_scale_bitmap_cached(
     max_iter: int = 50,
 ) -> _AutopackSearchResult:
     stats = _PackCacheStats()
-    packer_version = _packer_version("bitmap")
+    packer_version = _packer_version(PackerBackend.BITMAP)
     if read_result_cache:
         cached_result = _load_autopack_result(cache_dir, pack_key, packer_version=packer_version)
         if cached_result is not None:
@@ -1025,12 +1032,12 @@ def run_autopack(args: AutopackRunArgs) -> int:
                 epx,
                 epy,
                 epz,
-                "sorted",
+                ScaleFitMethod.SORTED,
                 any_rotation=args.any_rotation,
                 maximize=args.maximize,
                 random_samples=rot_samples,
                 seed=ORIENTATION_SEED_DEFAULT,
-                policy=orientation_policy,  # type: ignore[arg-type]
+                policy=orientation_policy,
                 scale_tolerance=scale_tolerance,
             )
             return file_d, t4, ext
@@ -1059,7 +1066,12 @@ def run_autopack(args: AutopackRunArgs) -> int:
     oriented_dims: list[tuple[float, float, float]] = [r[2] for r in _results]
 
     with profiler.stage("scale upper bound"):
-        s_upper, _ = compute_global_scale((epx, epy, epz), oriented_dims, names, "sorted")
+        s_upper, _ = compute_global_scale(
+            (epx, epy, epz),
+            oriented_dims,
+            names,
+            ScaleFitMethod.SORTED,
+        )
     geometric_upper = s_upper
 
     def _apply_orientation(m_t4: tuple[trimesh.Trimesh, np.ndarray]) -> trimesh.Trimesh:
@@ -1148,10 +1160,12 @@ def run_autopack(args: AutopackRunArgs) -> int:
     cache_settings_attempt = st.autopack.attempt_cache if st is not None else True
     result_cache_enabled = bool(args.autopack_result_cache and cache_settings_result)
     attempt_cache_enabled = bool(args.autopack_attempt_cache and cache_settings_attempt)
-    effective_packer = "bitmap" if autopack_packer == "auto" else autopack_packer
+    effective_packer = (
+        PackerBackend.BITMAP if autopack_packer is PackerBackend.AUTO else autopack_packer
+    )
     pack_key = _pack_cache_key(
         packer=effective_packer,
-        bitmap_options=bitmap_options if effective_packer == "bitmap" else None,
+        bitmap_options=bitmap_options if effective_packer is PackerBackend.BITMAP else None,
         source_paths=paths,
         repair_cache_keys=[report.cache_key for report in repair_reports],
         footprint_keys=footprint_keys,
@@ -1170,9 +1184,13 @@ def run_autopack(args: AutopackRunArgs) -> int:
         "attempt_cache_enabled": attempt_cache_enabled,
         "pack_workers": pack_workers,
         "scale_tolerance": autopack_scale_tolerance,
-        "packer": effective_packer,
-        "bitmap_grid_mm": bitmap_options.grid_mm if effective_packer == "bitmap" else None,
-        "bitmap_beam_width": bitmap_options.beam_width if effective_packer == "bitmap" else None,
+        "packer": effective_packer.value,
+        "bitmap_grid_mm": (
+            bitmap_options.grid_mm if effective_packer is PackerBackend.BITMAP else None
+        ),
+        "bitmap_beam_width": (
+            bitmap_options.beam_width if effective_packer is PackerBackend.BITMAP else None
+        ),
     }
     profile_metadata["autopack_cache"] = autopack_cache_metadata
 
@@ -1181,7 +1199,7 @@ def run_autopack(args: AutopackRunArgs) -> int:
         make_progress(console, enabled=args.progress) as progress,
     ):
         ptask = progress.add_task("Searching single-plate scale…", total=1)
-        if effective_packer == "bitmap":
+        if effective_packer is PackerBackend.BITMAP:
             search_result = _search_scale_bitmap_cached(
                 base_shadows,
                 epx,
@@ -1229,7 +1247,7 @@ def run_autopack(args: AutopackRunArgs) -> int:
 
     s_best = s_pack * post_fit_scale
     if plate is not None and post_fit_scale > 1.0:
-        if effective_packer == "bitmap":
+        if effective_packer is PackerBackend.BITMAP:
             final_attempt = _pack_bitmap_at_scale_cached(
                 base_shadows,
                 epx,

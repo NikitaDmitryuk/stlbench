@@ -1,8 +1,15 @@
 """Defaults used when options are not set in TOML."""
 
+from stlbench.config.enums import (
+    AssemblySidePolicy,
+    LongPartAnglePolicy,
+    OrientationPolicy,
+    ResinBalance,
+)
+
 # Orientation mode for scale math if --orientation is omitted (resin: free rotation search).
 ORIENTATION_MODE_DEFAULT = "free"
-ORIENTATION_POLICY_DEFAULT = "printable"
+ORIENTATION_POLICY_DEFAULT = OrientationPolicy.PRINTABLE
 ORIENTATION_SCALE_TOLERANCE_DEFAULT = 0.98
 ORIENTATION_SAMPLES_DEFAULT = 4096
 ORIENTATION_SEED_DEFAULT = 0
@@ -11,7 +18,9 @@ ORIENTATION_SEED_DEFAULT = 0
 DEFAULT_PACKING_GAP_MM = 2.0
 DEFAULT_EDGE_MARGIN_MM = 2.0
 
-DEFAULT_RESIN_BALANCE = "balanced"
+DEFAULT_RESIN_BALANCE = ResinBalance.BALANCED
+DEFAULT_LONG_PART_ANGLE_POLICY = LongPartAnglePolicy.THIN_LINEAR
+DEFAULT_ASSEMBLY_SIDE_POLICY = AssemblySidePolicy.AUTO
 DEFAULT_LONG_PART_TARGET_ANGLE_MIN_DEG = 30.0
 DEFAULT_LONG_PART_TARGET_ANGLE_MAX_DEG = 50.0
 DEFAULT_LONG_PART_LOW_ANGLE_PENALTY_BELOW_DEG = 20.0

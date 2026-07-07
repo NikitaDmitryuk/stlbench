@@ -1,9 +1,41 @@
-"""Mesh cleanup utilities: remove small disconnected components."""
+"""Mesh cleanup utilities for slicer-oriented mesh repair."""
 
 from __future__ import annotations
 
 import numpy as np
 import trimesh
+
+
+def remove_degenerate_faces(
+    mesh: trimesh.Trimesh,
+    area_epsilon: float = 1e-12,
+) -> tuple[trimesh.Trimesh, int]:
+    """Remove zero-area and near-zero-area triangles from *mesh*.
+
+    Resin slicer hollowing can fail on triangles whose vertices repeat or are
+    collinear.  This cleanup is deterministic and deliberately narrow: valid
+    faces are preserved, removed faces are dropped, and newly unreferenced
+    vertices are compacted away.
+    """
+    if len(mesh.faces) == 0:
+        return mesh, 0
+
+    try:
+        areas = np.asarray(mesh.area_faces, dtype=np.float64)
+    except (ValueError, IndexError):
+        return mesh, 0
+    keep = np.isfinite(areas) & (areas > float(area_epsilon))
+    removed = int(np.sum(~keep))
+    if removed == 0:
+        return mesh, 0
+
+    cleaned = trimesh.Trimesh(
+        vertices=mesh.vertices,
+        faces=mesh.faces[keep],
+        process=False,
+    )
+    cleaned.remove_unreferenced_vertices()
+    return cleaned, removed
 
 
 def remove_small_components(

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 import trimesh
 
-from stlbench.export.plate import export_plate_3mf_lazy
+from stlbench.config.enums import ExportCompressionMode
+from stlbench.export.plate import _compression_options, export_plate_3mf_lazy
 from stlbench.packing.rectpack_plate import PackedPlate, PackedRect
 
 
@@ -51,6 +54,40 @@ def test_export_plate_3mf_lazy_writes_manifest_and_loads_only_plate_parts(tmp_pa
     assert payload["parts"][0]["rotation_deg"] == 90.0
 
 
+def test_compression_options_accept_enum_modes():
+    assert _compression_options(ExportCompressionMode.DEFAULT) == (zipfile.ZIP_DEFLATED, 5)
+    assert _compression_options(ExportCompressionMode.FAST) == (zipfile.ZIP_DEFLATED, 1)
+    assert _compression_options(ExportCompressionMode.STORE) == (zipfile.ZIP_STORED, None)
+
+
+def test_export_plate_3mf_lazy_welds_duplicate_vertices(tmp_path: Path):
+    mesh = trimesh.Trimesh(
+        vertices=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]
+        ),
+        faces=np.array([[0, 1, 2], [3, 4, 5]]),
+        process=False,
+    )
+    plate = PackedPlate(
+        index=0,
+        rects=(PackedRect(part_index=0, x=0.0, y=0.0, width=1.0, height=1.0),),
+    )
+    out_3mf = tmp_path / "plate.3mf"
+
+    export_plate_3mf_lazy(lambda _part_index: mesh.copy(), plate, out_3mf)
+
+    with zipfile.ZipFile(out_3mf) as zf:
+        model_xml = zf.read("3D/3dmodel.model").decode("utf-8")
+    assert model_xml.count("<vertex ") == 3
+
+
 @pytest.mark.parametrize("compression_mode", ["default", "fast", "store"])
 def test_export_plate_3mf_lazy_compression_modes_are_loadable(
     tmp_path: Path, compression_mode: str
@@ -75,7 +112,7 @@ def test_export_plate_3mf_lazy_compression_modes_are_loadable(
         out_3mf,
         names=["a.stl", "b.stl"],
         out_manifest=out_json,
-        compression_mode=compression_mode,  # type: ignore[arg-type]
+        compression_mode=compression_mode,
     )
 
     loaded = trimesh.load(out_3mf, force="scene")
@@ -97,7 +134,7 @@ def test_export_plate_3mf_lazy_rejects_invalid_compression_mode(tmp_path: Path):
             lambda _part_index: mesh.copy(),
             plate,
             tmp_path / "plate.3mf",
-            compression_mode="invalid",  # type: ignore[arg-type]
+            compression_mode="invalid",
         )
 
 

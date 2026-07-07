@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Protocol
 
 import numpy as np
 import trimesh
 
+from stlbench.config.enums import OrientationPolicy, ScaleFitMethod, coerce_enum
 from stlbench.core.fit import Method, s_max_for_part_conservative, s_max_for_part_printer_axes
 from stlbench.core.orientation import (
     _random_rotation_matrix,
@@ -14,11 +15,17 @@ from stlbench.core.orientation import (
 )
 from stlbench.packing.rectpack_plate import footprint_fits_bin_mm
 
-OrientationPolicy = Literal["max-scale", "printable"]
+OrientationPolicyValue = OrientationPolicy | str
 
 DEFAULT_ORIENTATION_SCALE_TOLERANCE = 0.98
 OVERHANG_ANGLE_DEG = 45.0
 LONG_PART_ASPECT = 3.0
+LONG_AXIS_VERTICAL_START_Z = 0.7
+LONG_AXIS_VERTICAL_WEIGHT = 12.0
+PRINTABILITY_HEIGHT_WEIGHT = 0.80
+PRINTABILITY_XY_AREA_WEIGHT = 0.70
+PRINTABILITY_DOWN_AREA_WEIGHT = 1.40
+PRINTABILITY_CENTER_Z_WEIGHT = 0.35
 
 
 @dataclass(frozen=True)
@@ -74,13 +81,16 @@ class HeuristicPrintabilityScorer:
         long_vertical = 0.0
         if candidate.pca_aspect >= LONG_PART_ASPECT:
             # Starts gently around 45° from horizontal and becomes strong near vertical.
-            long_vertical = max(0.0, candidate.long_axis_z - 0.7) ** 2 * 12.0
+            long_vertical = (
+                max(0.0, candidate.long_axis_z - LONG_AXIS_VERTICAL_START_Z) ** 2
+                * LONG_AXIS_VERTICAL_WEIGHT
+            )
 
         return ScoreComponents(
-            height=0.80 * height_ratio,
-            xy_area=0.70 * xy_ratio,
-            down_area=1.40 * candidate.down_area_ratio,
-            center_z=0.35 * center_ratio,
+            height=PRINTABILITY_HEIGHT_WEIGHT * height_ratio,
+            xy_area=PRINTABILITY_XY_AREA_WEIGHT * xy_ratio,
+            down_area=PRINTABILITY_DOWN_AREA_WEIGHT * candidate.down_area_ratio,
+            center_z=PRINTABILITY_CENTER_Z_WEIGHT * center_ratio,
             long_axis_vertical=long_vertical,
         )
 
@@ -212,6 +222,7 @@ def _generate_z_orientation_candidates_fast(
     printer_xyz: tuple[float, float, float],
     method: Method,
 ) -> list[OrientationCandidate]:
+    method = coerce_enum(ScaleFitMethod, method, "method")
     verts = mesh_vertices_for_orientation(mesh)
     rotations = _z_rotation_candidates()
     lows, extents = _z_rotated_bounds_all(verts, rotations)
@@ -224,7 +235,7 @@ def _generate_z_orientation_candidates_fast(
         ex, ey, ez = float(d[0]), float(d[1]), float(d[2])
         if ex <= 0 or ey <= 0 or ez <= 0:
             continue
-        if method == "sorted":
+        if method is ScaleFitMethod.SORTED:
             scale_limit, _ = s_max_for_part_printer_axes(px, py, pz, ex, ey, ez)
         else:
             scale_limit = s_max_for_part_conservative(p_min, ex, ey, ez)
@@ -260,6 +271,7 @@ def generate_orientation_candidates(
     seed: int = 0,
     compute_printability_metrics: bool = True,
 ) -> list[OrientationCandidate]:
+    method = coerce_enum(ScaleFitMethod, method, "method")
     verts = mesh_vertices_for_orientation(mesh)
     bases, perms = _candidate_rotations(
         any_rotation=any_rotation,
@@ -293,7 +305,7 @@ def generate_orientation_candidates(
             ex, ey, ez = float(d[0]), float(d[1]), float(d[2])
             if ex <= 0 or ey <= 0 or ez <= 0:
                 continue
-            if method == "sorted":
+            if method is ScaleFitMethod.SORTED:
                 scale_limit, _ = s_max_for_part_printer_axes(px, py, pz, ex, ey, ez)
             else:
                 scale_limit = s_max_for_part_conservative(p_min, ex, ey, ez)
@@ -355,7 +367,7 @@ def select_orientation_candidate(
     candidates: list[OrientationCandidate],
     printer_xyz: tuple[float, float, float],
     *,
-    policy: OrientationPolicy = "printable",
+    policy: OrientationPolicyValue = OrientationPolicy.PRINTABLE,
     scale_tolerance: float = DEFAULT_ORIENTATION_SCALE_TOLERANCE,
     scorer: OrientationScorer | None = None,
 ) -> OrientationCandidate:
@@ -365,10 +377,9 @@ def select_orientation_candidate(
         raise ValueError("scale_tolerance must be in (0, 1].")
 
     max_scale = max(c.scale_limit for c in candidates)
-    if policy == "max-scale":
+    policy = coerce_enum(OrientationPolicy, policy, "orientation policy")
+    if policy is OrientationPolicy.MAX_SCALE:
         return min(candidates, key=lambda c: (-c.scale_limit, c.xy_area, c.height))
-    if policy != "printable":
-        raise ValueError(f"Unknown orientation policy: {policy}")
 
     threshold = max_scale * scale_tolerance
     eligible = [c for c in candidates if c.scale_limit >= threshold]
@@ -389,13 +400,13 @@ def select_layout_transform(
     random_samples: int = 4096,
     seed: int = 0,
     any_rotation: bool = False,
-    policy: OrientationPolicy = "printable",
+    policy: OrientationPolicyValue = OrientationPolicy.PRINTABLE,
     scale_tolerance: float = DEFAULT_ORIENTATION_SCALE_TOLERANCE,
 ) -> tuple[bool, np.ndarray, float, float]:
     candidates = generate_orientation_candidates(
         mesh,
         (bed_x, bed_y, pz),
-        "sorted",
+        ScaleFitMethod.SORTED,
         any_rotation=any_rotation,
         maximize=True,
         random_samples=random_samples,
@@ -429,7 +440,7 @@ def select_orientation_for_scale(
     maximize: bool = False,
     random_samples: int = 4096,
     seed: int = 0,
-    policy: OrientationPolicy = "printable",
+    policy: OrientationPolicyValue = OrientationPolicy.PRINTABLE,
     scale_tolerance: float = DEFAULT_ORIENTATION_SCALE_TOLERANCE,
     compute_printability_metrics: bool = True,
     use_fast_z: bool = True,

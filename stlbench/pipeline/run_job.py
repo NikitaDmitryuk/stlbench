@@ -40,6 +40,7 @@ from rich.console import Console
 from rich.table import Table
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
+from stlbench.config.enums import ScaleFitMethod
 from stlbench.config.loader import load_app_settings
 from stlbench.config.schema import PartSpec, StepName
 from stlbench.core.fit import compute_global_scale
@@ -147,7 +148,7 @@ def _pass1_scale_first(
     px: float,
     py: float,
     pz: float,
-    method: str,
+    method: ScaleFitMethod,
     any_rotation: bool,
     maximize: bool,
     rotation_samples: int,
@@ -170,7 +171,7 @@ def _pass1_scale_first(
         px,
         py,
         pz,
-        method,  # type: ignore[arg-type]
+        method,
         any_rotation=any_rotation,
         maximize=maximize,
         random_samples=rotation_samples,
@@ -384,7 +385,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
         resolve_repair_cache_enabled(args.repair_cache, settings) and not args.dry_run,
     )
     resin_options = resolve_resin_orientation_options(args.resin_balance, settings)
-    method = "sorted"
+    method = ScaleFitMethod.SORTED
 
     px, py, pz = px_raw, py_raw, pz_raw
     epx, epy = px - 2.0 * edge_margin_mm, py - 2.0 * edge_margin_mm
@@ -501,7 +502,7 @@ def run_job(args: JobRunArgs) -> int:  # noqa: C901
                     (epx, epy, pz),
                     scale_dims_checked,
                     scale_names,
-                    method,  # type: ignore[arg-type]
+                    method,
                 )
             except ValueError as e:
                 console.print(f"[red]{e}[/red]")

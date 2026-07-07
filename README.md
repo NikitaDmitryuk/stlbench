@@ -84,7 +84,13 @@ Exports one `plate_NN.3mf` + `plate_NN.json` manifest per plate.
 
 Key options: `--overhang-angle` (default 45°), `--orient-candidates` (default 200),
 `--gap-mm`, `--edge-margin-mm`, `--resin-balance`, `--workers`,
-`--post-fit-scale`, `--dry-run`, `--recursive`, `--resume`, `--profile`.
+`--post-fit-scale`, `--max-plates`, `--dry-run`, `--recursive`, `--resume`,
+`--profile`.
+
+Use `--max-plates N` to have `prepare` find the largest packable layout scale
+that fits in no more than `N` print areas. `--post-fit-scale` is still applied
+after that search, so values like `0.9` or `0.95` continue to reserve room for
+future supports.
 
 ## Orientation and packing principles
 
@@ -103,10 +109,9 @@ heuristic. The goals are ordered by practical printing risk:
    top or high-saliency detail toward the build plate, so figurine heads, faces, and
    visible surfaces are less likely to receive supports when comparable alternatives
    exist.
-4. **Long thin parts** — line-like parts such as spears are kept in a balanced
-   `30–50°` angle band by default. This avoids both failure modes: almost vertical
-   tips with too few supports, and fully horizontal shafts with supports along the
-   whole length.
+4. **Long thin parts** — by default, only very thin line-like parts such as spears
+   are kept in a balanced `30–50°` angle band. Broad elongated parts are allowed
+   to use any angle chosen by the support/layout score.
 5. **Plate count and layout quality** — after orientation, layout first minimises the
    number of plates, then tries to keep similar-height parts together, then spreads
    parts across the available area. The packer validates every accepted placement
@@ -119,6 +124,9 @@ The main user-facing orientation knob is `resin_balance`:
 | `balanced` | Default. Keeps the trade-off between support quality, plate count, and cleanup effort. |
 | `stability` | Gives more weight to support/surface safety, allowing somewhat larger footprints. |
 | `compact` | Gives more weight to footprint and plate count, while still penalising high-damage surfaces. |
+
+`[orientation] long_part_angle_policy` controls whether the long-part angle band is
+used: `thin_linear` (default), `linear` (legacy broader matching), or `disabled`.
 
 Profiling (`--profile`) writes `profile.json`, `profile.txt`, and `profile.pstats`.
 The JSON includes orientation diagnostics such as `source_up_dot_build_up`,
@@ -150,6 +158,7 @@ post_fit_scale = 0.95
 
 [packing]
 gap_mm = 2.0
+max_plates = 4   # optional for `prepare`: auto-scale to this many plates or fewer
 
 [pipeline]
 default_steps = ["scale", "orient", "layout"]   # default for parts without explicit steps
@@ -339,8 +348,8 @@ see [`configs/mars5_ultra.toml`](configs/mars5_ultra.toml) for a complete exampl
 |--------------|-------------------------------------------------------------------------------|--------------------------------------|
 | `[printer]`  | `name`, `width_mm`, `depth_mm`, `height_mm`                                   | Build volume (required)              |
 | `[scaling]`  | `post_fit_scale` (>0), `any_rotation`, `maximize`                             | Scale behaviour (see `scale` command) |
-| `[packing]`  | `gap_mm`, `edge_margin_mm`                                                    | Part-to-part gap and inset from bed edge |
-| `[orientation]` | `resin_balance`, long-part angle thresholds                               | Resin orientation trade-offs |
+| `[packing]`  | `gap_mm`, `edge_margin_mm`, `max_plates`                                      | Part-to-part gap, bed inset, optional prepare plate cap |
+| `[orientation]` | `resin_balance`, `long_part_angle_policy`, long-part angle thresholds     | Resin orientation trade-offs |
 | `[pipeline]` | `default_steps`                                                               | Default step list for `job` command  |
 | `[[parts]]`  | `path`, `steps`                                                               | Per-part entries for `job` command   |
 

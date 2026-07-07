@@ -8,6 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from stlbench.config.defaults import DEFAULT_PACKING_GAP_MM
+from stlbench.config.enums import ScaleFitMethod
 from stlbench.core.fit import aabb_edge_lengths, compute_global_scale
 from stlbench.pipeline.common import (
     finish_profile,
@@ -81,7 +82,7 @@ def run_info(args: InfoRunArgs) -> int:
             n_verts = len(m.vertices)
             n_faces = len(m.faces)
 
-            s, _ = compute_global_scale((px, py, pz), [d], [name], "sorted")
+            s, _ = compute_global_scale((px, py, pz), [d], [name], ScaleFitMethod.SORTED)
             fits = s >= 1.0 - 1e-9
 
             plate = profiler.profiled_call(
@@ -107,7 +108,7 @@ def run_info(args: InfoRunArgs) -> int:
     if len(dims_list) > 1:
         console.print()
         with profiler.stage("global scale"):
-            s_all, _ = compute_global_scale((px, py, pz), dims_list, names, "sorted")
+            s_all, _ = compute_global_scale((px, py, pz), dims_list, names, ScaleFitMethod.SORTED)
         pf = st.scaling.post_fit_scale if st else 1.0
         console.print(f"Global scale (all parts fit individually): {s_all:.6f}")
         console.print(f"With post_fit_scale ({pf}): {s_all * pf:.6f}")

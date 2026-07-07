@@ -20,32 +20,150 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import trimesh
 
 from stlbench.config.defaults import (
+    DEFAULT_ASSEMBLY_SIDE_POLICY,
+    DEFAULT_LONG_PART_ANGLE_POLICY,
     DEFAULT_LONG_PART_HIGH_ANGLE_PENALTY_ABOVE_DEG,
     DEFAULT_LONG_PART_LOW_ANGLE_PENALTY_BELOW_DEG,
     DEFAULT_LONG_PART_TARGET_ANGLE_MAX_DEG,
     DEFAULT_LONG_PART_TARGET_ANGLE_MIN_DEG,
     DEFAULT_RESIN_BALANCE,
 )
+from stlbench.config.enums import (
+    AssemblySidePolicy,
+    CandidateProfile,
+    LongPartAnglePolicy,
+    ResinBalance,
+    coerce_enum,
+)
+
+LEGACY_LINEAR_MIN_PCA_ASPECT = 3.0
+LEGACY_LINEAR_MAX_PCA_LINE_RATIO = 0.55
+THIN_LINEAR_MIN_PCA_ASPECT = 6.0
+THIN_LINEAR_MAX_PCA_LINE_RATIO = 0.35
+
+LONG_VERTICAL_Z_START = 0.57
+LONG_VERTICAL_ASPECT_DIVISOR = 1.5
+LONG_VERTICAL_MAX_ASPECT_MULTIPLIER = 10.0
+FLAT_PART_RATIO_THRESHOLD = 0.35
+FLAT_PART_MIN_PCA_ASPECT = 2.0
+FLAT_PART_VERTICAL_Z_START = 0.45
+FLAT_VERTICAL_PENALTY_WEIGHT = 4.0
+
+NON_LINEAR_FOOTPRINT_WEIGHT_MULTIPLIER = 0.30
+NON_LINEAR_HEIGHT_WEIGHT_MULTIPLIER = 3.0
+NON_LINEAR_CENTER_WEIGHT_MULTIPLIER = 1.8
+NON_LINEAR_CONTACT_WEIGHT_MULTIPLIER = 0.50
+NON_LINEAR_SURFACE_WEIGHT_MULTIPLIER = 1.35
+NON_LINEAR_UPSIDE_WEIGHT_MULTIPLIER = 1.35
+COMPACT_LINEAR_FOOTPRINT_WEIGHT_MULTIPLIER = 8.0
+COMPACT_LINEAR_HEIGHT_WEIGHT_MULTIPLIER = 0.50
+NON_LINEAR_CONTACT_MULTIPLIER = 0.35
+
+ADAPTIVE_SUPPORT_DELTA_TRIGGER = 0.16
+ADAPTIVE_SUPPORT_FIT_MARGIN_TRIGGER = 0.12
+ADAPTIVE_NEAR_BOUNDS_FIT_MARGIN = 0.08
+ADAPTIVE_CLOSE_PHASE1_DELTA_TRIGGER = 0.01
+
+ASSEMBLY_LOW_SALIENCY_MAX = 0.12
+ASSEMBLY_FLAT_CLUSTER_COS = 0.965
+ASSEMBLY_MIN_CLUSTER_AREA_RATIO = 0.075
+ASSEMBLY_MAX_LOW_SALIENCY_AREA_RATIO = 0.96
+ASSEMBLY_SOURCE_TOP_EXCLUSION_DOT = 0.55
+ASSEMBLY_MIN_CONFIDENCE = 0.55
+ASSEMBLY_SUPPORT_REWARD_WEIGHT = 4.0
+ASSEMBLY_VISIBLE_SUPPORT_WEIGHT = 2.20
+ASSEMBLY_ALIGNMENT_REWARD_WEIGHT = 1.5
+ASSEMBLY_SOURCE_UP_RELIEF = 0.65
+ASSEMBLY_TILTED_DOWN_Z = -0.72
+ASSEMBLY_Z_SPIN_STEPS = 6
+
+
+@dataclass(frozen=True)
+class StabilityScoreWeights:
+    support: float
+    footprint: float
+    height: float
+    center: float
+    contact: float
+    angle: float
+    hard_angle: float
+    surface: float
+    upside: float
+
+
+STABILITY_SCORE_WEIGHTS: dict[ResinBalance, StabilityScoreWeights] = {
+    ResinBalance.STABILITY: StabilityScoreWeights(
+        support=1.00,
+        footprint=0.35,
+        height=0.35,
+        center=0.35,
+        contact=0.80,
+        angle=2.8,
+        hard_angle=2.4,
+        surface=1.70,
+        upside=1.60,
+    ),
+    ResinBalance.COMPACT: StabilityScoreWeights(
+        support=0.65,
+        footprint=1.60,
+        height=0.20,
+        center=0.20,
+        contact=0.60,
+        angle=1.6,
+        hard_angle=1.5,
+        surface=0.75,
+        upside=0.75,
+    ),
+    ResinBalance.BALANCED: StabilityScoreWeights(
+        support=0.80,
+        footprint=1.10,
+        height=0.25,
+        center=0.25,
+        contact=0.90,
+        angle=2.2,
+        hard_angle=2.0,
+        surface=1.20,
+        upside=1.10,
+    ),
+}
 
 
 @dataclass(frozen=True)
 class ResinOrientationOptions:
-    resin_balance: str = DEFAULT_RESIN_BALANCE
+    resin_balance: ResinBalance | str = DEFAULT_RESIN_BALANCE
+    long_part_angle_policy: LongPartAnglePolicy | str = DEFAULT_LONG_PART_ANGLE_POLICY
+    assembly_side_policy: AssemblySidePolicy | str = DEFAULT_ASSEMBLY_SIDE_POLICY
     long_part_target_angle_min_deg: float = DEFAULT_LONG_PART_TARGET_ANGLE_MIN_DEG
     long_part_target_angle_max_deg: float = DEFAULT_LONG_PART_TARGET_ANGLE_MAX_DEG
     long_part_low_angle_penalty_below_deg: float = DEFAULT_LONG_PART_LOW_ANGLE_PENALTY_BELOW_DEG
     long_part_high_angle_penalty_above_deg: float = DEFAULT_LONG_PART_HIGH_ANGLE_PENALTY_ABOVE_DEG
 
     def __post_init__(self) -> None:
-        if self.resin_balance not in {"balanced", "stability", "compact"}:
-            raise ValueError(
-                f"resin_balance must be balanced, stability, or compact; got {self.resin_balance!r}."
-            )
+        object.__setattr__(
+            self,
+            "resin_balance",
+            coerce_enum(ResinBalance, self.resin_balance, "resin_balance"),
+        )
+        object.__setattr__(
+            self,
+            "long_part_angle_policy",
+            coerce_enum(
+                LongPartAnglePolicy,
+                self.long_part_angle_policy,
+                "long_part_angle_policy",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "assembly_side_policy",
+            coerce_enum(AssemblySidePolicy, self.assembly_side_policy, "assembly_side_policy"),
+        )
         if self.long_part_target_angle_min_deg > self.long_part_target_angle_max_deg:
             raise ValueError("long part target min angle must be <= max angle.")
         if self.long_part_low_angle_penalty_below_deg > self.long_part_target_angle_min_deg:
@@ -70,6 +188,10 @@ class OrientationStabilityMetrics:
     surface_damage_proxy: float
     salient_down_area_ratio: float
     flat_safe_down_area_ratio: float
+    sacrificial_support_ratio: float
+    visible_support_ratio: float
+    assembly_side_alignment: float
+    assembly_side_confidence: float
     source_up_dot_build_up: float
     upside_down_penalty: float
     angle_band_penalty: float
@@ -89,7 +211,15 @@ class OrientationSearchData:
     fits: np.ndarray
     phase1_scores: np.ndarray
     convex_hull_vertices: np.ndarray | None
-    candidate_profile: str
+    candidate_profile: CandidateProfile
+
+
+@dataclass(frozen=True)
+class AssemblySideData:
+    normal: np.ndarray
+    mask: np.ndarray
+    confidence: float
+    area_ratio: float
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +497,138 @@ def _principal_axis(vertices: np.ndarray) -> tuple[np.ndarray, float]:
     return axis, aspect
 
 
+def _detect_assembly_side(
+    face_normals: np.ndarray,
+    face_areas: np.ndarray,
+    face_saliency: np.ndarray,
+    options: ResinOrientationOptions,
+    source_up: np.ndarray | None,
+) -> AssemblySideData | None:
+    if options.assembly_side_policy is AssemblySidePolicy.DISABLED:
+        return None
+    total_area = float(np.sum(face_areas))
+    if total_area <= 1e-9 or len(face_normals) == 0:
+        return None
+
+    source_up_vec = _unit_or_default(source_up, (0.0, 0.0, 1.0))
+    source_top_weight = face_normals @ source_up_vec
+    eligible = (face_saliency <= ASSEMBLY_LOW_SALIENCY_MAX) & (
+        source_top_weight <= ASSEMBLY_SOURCE_TOP_EXCLUSION_DOT
+    )
+    low_area_ratio = float(np.sum(face_areas[eligible]) / total_area)
+    if (
+        low_area_ratio < ASSEMBLY_MIN_CLUSTER_AREA_RATIO
+        or low_area_ratio > ASSEMBLY_MAX_LOW_SALIENCY_AREA_RATIO
+    ):
+        return None
+
+    order = np.argsort(face_areas)[::-1]
+    best: AssemblySideData | None = None
+    used = np.zeros(len(face_normals), dtype=bool)
+    for idx in order:
+        if used[idx] or not bool(eligible[idx]):
+            continue
+        normal = face_normals[idx]
+        cluster = eligible & ((face_normals @ normal) >= ASSEMBLY_FLAT_CLUSTER_COS)
+        used |= cluster
+        cluster_area = float(np.sum(face_areas[cluster]))
+        area_ratio = cluster_area / total_area
+        if area_ratio < ASSEMBLY_MIN_CLUSTER_AREA_RATIO:
+            continue
+        mean_saliency = float(
+            np.sum(face_areas[cluster] * face_saliency[cluster]) / max(cluster_area, 1e-9)
+        )
+        source_top_ratio = float(
+            np.sum(face_areas[cluster] * np.clip(source_top_weight[cluster], 0.0, 1.0))
+            / max(cluster_area, 1e-9)
+        )
+        confidence = float(
+            np.clip(
+                (area_ratio / 0.18)
+                * (1.0 - mean_saliency / max(ASSEMBLY_LOW_SALIENCY_MAX, 1e-9))
+                * (1.0 - source_top_ratio),
+                0.0,
+                1.0,
+            )
+        )
+        if confidence < ASSEMBLY_MIN_CONFIDENCE:
+            continue
+        unit_normal = _unit_or_default(normal, (0.0, 0.0, 1.0))
+        candidate = AssemblySideData(
+            normal=unit_normal,
+            mask=cluster,
+            confidence=confidence,
+            area_ratio=area_ratio,
+        )
+        if best is None or (
+            candidate.confidence,
+            candidate.area_ratio,
+        ) > (
+            best.confidence,
+            best.area_ratio,
+        ):
+            best = candidate
+    return best
+
+
+def _rotation_around_axis(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    axis = _unit_or_default(axis, (0.0, 0.0, 1.0))
+    x, y, z = axis
+    c = float(np.cos(angle_rad))
+    s = float(np.sin(angle_rad))
+    one_c = 1.0 - c
+    return np.array(
+        [
+            [c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s],
+            [y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s],
+            [z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _assembly_side_rotations(assembly_side: AssemblySideData | None) -> list[np.ndarray]:
+    if assembly_side is None:
+        return []
+    normal = assembly_side.normal
+    tilted_y = float(np.sqrt(max(0.0, 1.0 - ASSEMBLY_TILTED_DOWN_Z**2)))
+    targets = [
+        _DOWN,
+        np.array([0.0, tilted_y, ASSEMBLY_TILTED_DOWN_Z], dtype=np.float64),
+        np.array([0.0, -tilted_y, ASSEMBLY_TILTED_DOWN_Z], dtype=np.float64),
+    ]
+    rotations: list[np.ndarray] = []
+    for target in targets:
+        base = _rotation_from_to(normal, target)
+        rotations.append(base)
+        for spin_idx in range(ASSEMBLY_Z_SPIN_STEPS):
+            angle = (spin_idx + 1) * (2.0 * np.pi / ASSEMBLY_Z_SPIN_STEPS)
+            rotations.append(_rotation_around_axis(_DOWN, angle) @ base)
+    return rotations
+
+
+def _is_linear_shape(pca_aspect: float, pca_line_ratio: float) -> bool:
+    return (
+        pca_aspect >= LEGACY_LINEAR_MIN_PCA_ASPECT
+        and pca_line_ratio <= LEGACY_LINEAR_MAX_PCA_LINE_RATIO
+    )
+
+
+def _uses_long_part_angle_policy(
+    options: ResinOrientationOptions,
+    pca_aspect: float,
+    pca_line_ratio: float,
+) -> bool:
+    if options.long_part_angle_policy is LongPartAnglePolicy.DISABLED:
+        return False
+    if options.long_part_angle_policy is LongPartAnglePolicy.LINEAR:
+        return _is_linear_shape(pca_aspect, pca_line_ratio)
+    return (
+        pca_aspect >= THIN_LINEAR_MIN_PCA_ASPECT
+        and pca_line_ratio <= THIN_LINEAR_MAX_PCA_LINE_RATIO
+    )
+
+
 def _stability_metrics(
     mesh: trimesh.Trimesh,
     rotation: np.ndarray,
@@ -385,6 +647,7 @@ def _stability_metrics(
     cos_t: float,
     options: ResinOrientationOptions,
     source_up: np.ndarray | None,
+    assembly_side: AssemblySideData | None,
 ) -> OrientationStabilityMetrics:
     rotated = vertices @ rotation.T
     lo = rotated.min(axis=0)
@@ -419,8 +682,37 @@ def _stability_metrics(
     )
     flat_safe_mask = (nz < -0.99) & (face_saliency < 0.15) & (source_top_weight < 0.25)
     flat_safe_down_area_ratio = float(np.sum(face_areas[flat_safe_mask]) / max(total_area, 1e-9))
+    if assembly_side is None:
+        sacrificial_support_ratio = 0.0
+        visible_support_ratio = float(
+            np.sum(
+                face_areas
+                * support_need
+                * np.maximum(face_saliency, np.clip(source_top_weight, 0.0, 1.0))
+            )
+            / max(total_area, 1e-9)
+        )
+        assembly_side_alignment = 0.0
+        assembly_side_confidence = 0.0
+    else:
+        sacrificial_mask = assembly_side.mask
+        visible_weight = np.maximum(
+            face_saliency,
+            np.clip(source_top_weight, 0.0, 1.0),
+        )
+        visible_weight = np.where(sacrificial_mask, 0.0, visible_weight)
+        sacrificial_support_ratio = float(
+            np.sum(face_areas[sacrificial_mask] * support_need[sacrificial_mask])
+            / max(total_area, 1e-9)
+        )
+        visible_support_ratio = float(
+            np.sum(face_areas * support_need * visible_weight) / max(total_area, 1e-9)
+        )
+        assembly_side_alignment = float(np.clip(-(assembly_side.normal @ rotation[2]), 0.0, 1.0))
+        assembly_side_confidence = assembly_side.confidence
 
-    is_long = pca_aspect >= 3.0 and pca_line_ratio <= 0.55
+    is_long = _is_linear_shape(pca_aspect, pca_line_ratio)
+    uses_angle_policy = _uses_long_part_angle_policy(options, pca_aspect, pca_line_ratio)
     target_min = options.long_part_target_angle_min_deg
     target_max = options.long_part_target_angle_max_deg
     low_cut = options.long_part_low_angle_penalty_below_deg
@@ -428,7 +720,7 @@ def _stability_metrics(
     horizontal_penalty = 0.0
     vertical_penalty = 0.0
     angle_band_penalty = 0.0
-    if is_long:
+    if uses_angle_policy:
         if long_axis_angle < target_min:
             angle_band_penalty = ((target_min - long_axis_angle) / max(target_min, 1.0)) ** 2
         elif long_axis_angle > target_max:
@@ -440,42 +732,60 @@ def _stability_metrics(
 
     long_penalty = 0.0
     if is_long:
-        long_penalty = max(0.0, long_axis_z - 0.57) ** 2 * min(10.0, pca_aspect / 1.5)
+        long_penalty = max(0.0, long_axis_z - LONG_VERTICAL_Z_START) ** 2 * min(
+            LONG_VERTICAL_MAX_ASPECT_MULTIPLIER,
+            pca_aspect / LONG_VERTICAL_ASPECT_DIVISOR,
+        )
 
     dims_sorted = np.sort(extents)
     flat_ratio = float(dims_sorted[0] / max(dims_sorted[2], 1e-9))
     flat_vertical_penalty = 0.0
-    if flat_ratio < 0.35 and pca_aspect >= 2.0:
-        flat_vertical_penalty = max(0.0, long_axis_z - 0.45) ** 2 * 4.0
+    if flat_ratio < FLAT_PART_RATIO_THRESHOLD and pca_aspect >= FLAT_PART_MIN_PCA_ASPECT:
+        flat_vertical_penalty = (
+            max(0.0, long_axis_z - FLAT_PART_VERTICAL_Z_START) ** 2 * FLAT_VERTICAL_PENALTY_WEIGHT
+        )
 
     footprint_norm = xy_footprint_area / max(
         printer_dims[0] * printer_dims[1] if printer_dims is not None else xy_footprint_area,
         1e-9,
     )
-    if options.resin_balance == "stability":
-        support_w, footprint_w, height_w, center_w, contact_w = 1.00, 0.35, 0.35, 0.35, 0.80
-        angle_w, hard_angle_w = 2.8, 2.4
-        surface_w, upside_w = 1.70, 1.60
-    elif options.resin_balance == "compact":
-        support_w, footprint_w, height_w, center_w, contact_w = 0.65, 1.60, 0.20, 0.20, 0.60
-        angle_w, hard_angle_w = 1.6, 1.5
-        surface_w, upside_w = 0.75, 0.75
-    else:
-        support_w, footprint_w, height_w, center_w, contact_w = 0.80, 1.10, 0.25, 0.25, 0.90
-        angle_w, hard_angle_w = 2.2, 2.0
-        surface_w, upside_w = 1.20, 1.10
+    weights = STABILITY_SCORE_WEIGHTS[cast(ResinBalance, options.resin_balance)]
+    support_w = weights.support
+    footprint_w = weights.footprint
+    height_w = weights.height
+    center_w = weights.center
+    contact_w = weights.contact
+    angle_w = weights.angle
+    hard_angle_w = weights.hard_angle
+    surface_w = weights.surface
+    upside_w = weights.upside
     if not is_long:
-        footprint_w *= 0.30
-        height_w *= 3.0
-        center_w *= 1.8
-        contact_w *= 0.50
-        surface_w *= 1.35
-        upside_w *= 1.35
-    elif options.resin_balance == "compact":
-        footprint_w *= 8.0
-        height_w *= 0.50
+        footprint_w *= NON_LINEAR_FOOTPRINT_WEIGHT_MULTIPLIER
+        height_w *= NON_LINEAR_HEIGHT_WEIGHT_MULTIPLIER
+        center_w *= NON_LINEAR_CENTER_WEIGHT_MULTIPLIER
+        contact_w *= NON_LINEAR_CONTACT_WEIGHT_MULTIPLIER
+        surface_w *= NON_LINEAR_SURFACE_WEIGHT_MULTIPLIER
+        upside_w *= NON_LINEAR_UPSIDE_WEIGHT_MULTIPLIER
+    elif options.resin_balance is ResinBalance.COMPACT:
+        footprint_w *= COMPACT_LINEAR_FOOTPRINT_WEIGHT_MULTIPLIER
+        height_w *= COMPACT_LINEAR_HEIGHT_WEIGHT_MULTIPLIER
 
-    long_contact = support_contact_proxy * (1.0 if is_long else 0.35)
+    long_contact = support_contact_proxy * (1.0 if is_long else NON_LINEAR_CONTACT_MULTIPLIER)
+    if assembly_side_confidence >= ASSEMBLY_MIN_CONFIDENCE and assembly_side_alignment > 0.35:
+        upside_w *= 1.0 - ASSEMBLY_SOURCE_UP_RELIEF * assembly_side_confidence
+
+    assembly_reward = (
+        ASSEMBLY_SUPPORT_REWARD_WEIGHT * assembly_side_confidence * sacrificial_support_ratio
+        + ASSEMBLY_ALIGNMENT_REWARD_WEIGHT
+        * assembly_side_confidence
+        * assembly_side_alignment
+        * assembly_side.area_ratio
+        if assembly_side is not None
+        else 0.0
+    )
+    assembly_visible_penalty = (
+        ASSEMBLY_VISIBLE_SUPPORT_WEIGHT * assembly_side_confidence * visible_support_ratio
+    )
     stability_score = (
         support_w * support_norm
         + footprint_w * footprint_norm
@@ -488,14 +798,24 @@ def _stability_metrics(
         + upside_w * upside_down_penalty
         + long_penalty
         + flat_vertical_penalty
+        + assembly_visible_penalty
+        - assembly_reward
     )
     selection_reason = "pure_overhang"
-    if is_long and target_min <= long_axis_angle <= target_max:
+    if uses_angle_policy and target_min <= long_axis_angle <= target_max:
         selection_reason = "long_part_target_band"
-    elif is_long and (angle_band_penalty > 0 or horizontal_penalty > 0 or vertical_penalty > 0):
+    elif uses_angle_policy and (
+        angle_band_penalty > 0 or horizontal_penalty > 0 or vertical_penalty > 0
+    ):
         selection_reason = "balanced_long_part"
     elif flat_vertical_penalty > 0:
         selection_reason = "flat_plate_stability"
+    elif (
+        assembly_side_confidence >= ASSEMBLY_MIN_CONFIDENCE
+        and assembly_side_alignment > 0.35
+        and sacrificial_support_ratio >= visible_support_ratio
+    ):
+        selection_reason = "assembly_side_support"
     elif upside_down_penalty <= 1e-6 and source_up_dot_build_up > 0.35:
         selection_reason = "source_up_preserved"
     elif surface_damage_proxy < 0.20:
@@ -517,6 +837,10 @@ def _stability_metrics(
         surface_damage_proxy=surface_damage_proxy,
         salient_down_area_ratio=salient_down_area_ratio,
         flat_safe_down_area_ratio=flat_safe_down_area_ratio,
+        sacrificial_support_ratio=sacrificial_support_ratio,
+        visible_support_ratio=visible_support_ratio,
+        assembly_side_alignment=assembly_side_alignment,
+        assembly_side_confidence=assembly_side_confidence,
         source_up_dot_build_up=source_up_dot_build_up,
         upside_down_penalty=upside_down_penalty,
         angle_band_penalty=angle_band_penalty,
@@ -558,8 +882,9 @@ def _build_candidates(
     mesh: trimesh.Trimesh,
     n_mesh_candidates: int,
     *,
-    candidate_profile: str = "default",
+    candidate_profile: CandidateProfile | str = CandidateProfile.DEFAULT,
 ) -> np.ndarray:
+    candidate_profile = coerce_enum(CandidateProfile, candidate_profile, "candidate_profile")
     """Return (K, 3) array of candidate 'bottom' unit directions.
 
     Combines:
@@ -573,12 +898,10 @@ def _build_candidates(
     top_idx = np.argpartition(areas, -k)[-k:]
     mesh_cands = normals[top_idx]
 
-    if candidate_profile == "adaptive":
+    if candidate_profile is CandidateProfile.ADAPTIVE:
         ico_subdivisions = 2
-    elif candidate_profile == "default":
+    elif candidate_profile is CandidateProfile.DEFAULT:
         ico_subdivisions = 1
-    else:
-        raise ValueError(f"unknown orientation candidate profile: {candidate_profile!r}")
     ico = trimesh.creation.icosphere(subdivisions=ico_subdivisions)
     # Six axis-aligned directions guarantee at least one Phase-1 candidate for
     # meshes that only fit in a narrow angular window (e.g. tall/thin parts).
@@ -648,8 +971,9 @@ def _build_orientation_search_data(
     n_candidates: int,
     printer_dims: tuple[float, float, float] | None,
     *,
-    candidate_profile: str = "default",
+    candidate_profile: CandidateProfile | str = CandidateProfile.DEFAULT,
 ) -> OrientationSearchData:
+    candidate_profile = coerce_enum(CandidateProfile, candidate_profile, "candidate_profile")
     _PRINTER_PENALTY = 1e9
     cos_t = float(np.cos(np.radians(overhang_threshold_deg)))
     fn, af, face_saliency = _subsample_surface_data(mesh)
@@ -899,6 +1223,7 @@ def find_stable_overhang_rotation_legacy(
 
     fn, af, face_saliency = _subsample_surface_data(mesh)
     total_area = float(np.sum(mesh.area_faces))
+    assembly_side = _detect_assembly_side(fn, af, face_saliency, options, source_up)
     candidates = _build_candidates(mesh, n_candidates)
     rotations = np.array([_rotation_from_to(cand, _DOWN) for cand in candidates])
     raw_scores = _batch_overhang_scores(fn, af, rotations, cos_t)
@@ -910,6 +1235,13 @@ def find_stable_overhang_rotation_legacy(
         if score_f <= best_overhang + support_tolerance_ratio * max(total_area, 1.0) and (
             printer_dims is None or _fits_printer(mesh, rotation, *printer_dims)
         ):
+            all_rotations.append(rotation)
+            all_scores.append(score_f)
+    for rotation in _assembly_side_rotations(assembly_side):
+        if printer_dims is not None and not _fits_printer(mesh, rotation, *printer_dims):
+            continue
+        score_f = overhang_score(mesh, rotation, cos_t=cos_t)
+        if score_f <= best_overhang + support_tolerance_ratio * max(total_area, 1.0):
             all_rotations.append(rotation)
             all_scores.append(score_f)
 
@@ -935,6 +1267,7 @@ def find_stable_overhang_rotation_legacy(
             cos_t,
             options,
             source_up,
+            assembly_side,
         )
         for rotation, score in zip(all_rotations, all_scores, strict=True)
     ]
@@ -942,13 +1275,13 @@ def find_stable_overhang_rotation_legacy(
         i
         for i, m in enumerate(metrics)
         if (
-            m.pca_aspect >= 3.0
+            _uses_long_part_angle_policy(options, m.pca_aspect, m.pca_line_ratio)
             and options.long_part_target_angle_min_deg
             <= m.long_axis_angle_from_bed_deg
             <= options.long_part_target_angle_max_deg
         )
     ]
-    if in_target_band and options.resin_balance == "balanced":
+    if in_target_band and options.resin_balance is ResinBalance.BALANCED:
         # For long parts the target angle band exists to avoid both failure modes:
         # fully horizontal "support along the whole shaft" and near-vertical fragile tips.
         candidates_idx = in_target_band
@@ -1026,13 +1359,15 @@ def _adaptive_trigger_reason(
         data.convex_hull_vertices if data.convex_hull_vertices is not None else np.empty((0, 3))
     )
     fit_margin = _fit_margin_ratio(fit_vertices, rotation, printer_dims)
-    is_linear_part = metrics.pca_aspect >= 3.0 and metrics.pca_line_ratio <= 0.55
+    is_linear_part = _is_linear_shape(metrics.pca_aspect, metrics.pca_line_ratio)
     if is_linear_part:
         reasons.append("linear_part")
     band_delta = metrics.support_score_delta / max(total_area, 1.0)
-    if band_delta >= 0.16 and (is_linear_part or fit_margin <= 0.12):
+    if band_delta >= ADAPTIVE_SUPPORT_DELTA_TRIGGER and (
+        is_linear_part or fit_margin <= ADAPTIVE_SUPPORT_FIT_MARGIN_TRIGGER
+    ):
         reasons.append("support_tolerance_edge")
-    if fit_margin <= 0.08:
+    if fit_margin <= ADAPTIVE_NEAR_BOUNDS_FIT_MARGIN:
         reasons.append("near_printer_bounds")
     if is_linear_part and metrics.selection_reason in {
         "balanced_long_part",
@@ -1040,8 +1375,8 @@ def _adaptive_trigger_reason(
         "flat_plate_stability",
     }:
         reasons.append(f"selection_{metrics.selection_reason}")
-    if _phase1_second_delta_ratio(data, total_area) <= 0.01 and (
-        is_linear_part or fit_margin <= 0.08
+    if _phase1_second_delta_ratio(data, total_area) <= ADAPTIVE_CLOSE_PHASE1_DELTA_TRIGGER and (
+        is_linear_part or fit_margin <= ADAPTIVE_NEAR_BOUNDS_FIT_MARGIN
     ):
         reasons.append("close_phase1_candidates")
     return ",".join(reasons)
@@ -1056,10 +1391,13 @@ def _stable_overhang_rotation_with_diagnostics(
     support_tolerance_ratio: float = 0.20,
     resin_options: ResinOrientationOptions | None = None,
     source_up: np.ndarray | None = None,
-    candidate_profile: str = "default",
+    candidate_profile: CandidateProfile | str = CandidateProfile.DEFAULT,
 ) -> tuple[np.ndarray, float, OrientationStabilityMetrics, dict[str, float | str | bool | int]]:
+    candidate_profile = coerce_enum(CandidateProfile, candidate_profile, "candidate_profile")
     options = resin_options or ResinOrientationOptions()
-    effective_candidates = n_candidates * 2 if candidate_profile == "adaptive" else n_candidates
+    effective_candidates = (
+        n_candidates * 2 if candidate_profile is CandidateProfile.ADAPTIVE else n_candidates
+    )
     data = _build_orientation_search_data(
         mesh,
         overhang_threshold_deg=overhang_threshold_deg,
@@ -1074,12 +1412,29 @@ def _stable_overhang_rotation_with_diagnostics(
     )
 
     total_area = float(np.sum(mesh.area_faces))
+    assembly_side = _detect_assembly_side(
+        data.face_normals,
+        data.face_areas,
+        data.face_saliency,
+        options,
+        source_up,
+    )
     all_rotations = [best_overhang_R]
     all_scores = [best_overhang]
     max_allowed = best_overhang + support_tolerance_ratio * max(total_area, 1.0)
     for rotation, score, fits in zip(data.rotations, data.raw_scores, data.fits, strict=True):
         score_f = float(score)
         if score_f <= max_allowed and (printer_dims is None or bool(fits)):
+            all_rotations.append(rotation)
+            all_scores.append(score_f)
+    for rotation in _assembly_side_rotations(assembly_side):
+        if printer_dims is not None:
+            if data.convex_hull_vertices is None:
+                raise RuntimeError("Printer fit check requires convex hull vertices.")
+            if not _fits_printer_vertices(data.convex_hull_vertices, rotation, *printer_dims):
+                continue
+        score_f = _fast_overhang_from_data(data, rotation)
+        if score_f <= max_allowed:
             all_rotations.append(rotation)
             all_scores.append(score_f)
 
@@ -1105,6 +1460,7 @@ def _stable_overhang_rotation_with_diagnostics(
             data.cos_t,
             options,
             source_up,
+            assembly_side,
         )
         for rotation, score in zip(all_rotations, all_scores, strict=True)
     ]
@@ -1112,13 +1468,13 @@ def _stable_overhang_rotation_with_diagnostics(
         i
         for i, m in enumerate(metrics)
         if (
-            m.pca_aspect >= 3.0
+            _uses_long_part_angle_policy(options, m.pca_aspect, m.pca_line_ratio)
             and options.long_part_target_angle_min_deg
             <= m.long_axis_angle_from_bed_deg
             <= options.long_part_target_angle_max_deg
         )
     ]
-    if in_target_band and options.resin_balance == "balanced":
+    if in_target_band and options.resin_balance is ResinBalance.BALANCED:
         candidates_idx = in_target_band
     else:
         candidates_idx = list(range(len(all_rotations)))
@@ -1133,8 +1489,12 @@ def _stable_overhang_rotation_with_diagnostics(
     rotation = all_rotations[best_idx]
     selected_metrics = metrics[best_idx]
     diagnostics: dict[str, float | str | bool | int] = {
-        "candidate_profile": candidate_profile,
+        "candidate_profile": candidate_profile.value,
         "candidate_count": int(len(data.rotations)),
+        "assembly_side_candidate_count": int(len(_assembly_side_rotations(assembly_side))),
+        "assembly_side_detected": assembly_side is not None,
+        "assembly_side_confidence": assembly_side.confidence if assembly_side is not None else 0.0,
+        "assembly_side_area_ratio": assembly_side.area_ratio if assembly_side is not None else 0.0,
         "fitting_candidate_count": int(np.count_nonzero(data.fits)),
         "phase1_second_delta_ratio": _phase1_second_delta_ratio(data, total_area),
         "fit_margin_ratio": _fit_margin_ratio(
@@ -1176,7 +1536,7 @@ def find_stable_overhang_rotation(
         support_tolerance_ratio=support_tolerance_ratio,
         resin_options=resin_options,
         source_up=source_up,
-        candidate_profile="default",
+        candidate_profile=CandidateProfile.DEFAULT,
     )
     return rotation, score, metrics
 
@@ -1201,7 +1561,7 @@ def find_stable_overhang_rotation_adaptive(
             support_tolerance_ratio=support_tolerance_ratio,
             resin_options=resin_options,
             source_up=source_up,
-            candidate_profile="default",
+            candidate_profile=CandidateProfile.DEFAULT,
         )
     )
     baseline_support_s = time.perf_counter() - baseline_start
@@ -1229,7 +1589,7 @@ def find_stable_overhang_rotation_adaptive(
             support_tolerance_ratio=support_tolerance_ratio,
             resin_options=resin_options,
             source_up=source_up,
-            candidate_profile="adaptive",
+            candidate_profile=CandidateProfile.ADAPTIVE,
         )
     )
     diagnostics["adaptive_support_s"] = time.perf_counter() - adaptive_start
