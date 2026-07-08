@@ -92,7 +92,7 @@ def _assert_profile_artifacts(profile_dir: Path, command: str) -> dict[str, Any]
 def test_resolve_prepare_packer_returns_enum() -> None:
     assert _resolve_prepare_packer(None, None) is PackerBackend.EXACT
     assert _resolve_prepare_packer("auto", None) is PackerBackend.EXACT
-    assert _resolve_prepare_packer("bitmap", None) is PackerBackend.BITMAP
+    assert _resolve_prepare_packer("bitmap", None) is PackerBackend.EXACT
 
 
 def test_select_retained_indices_respects_cap_and_largest_first(tmp_path: Path):
@@ -138,10 +138,19 @@ def test_prepare_scale_search_shrinks_to_requested_plate_count():
     assert scale == pytest.approx(100.0 / 120.0, abs=0.02)
     assert metadata["max_plates"] == 1
     assert metadata["attempts_run"] > 0
-    assert metadata["scale_search_version"] == "scale_search_v3"
+    assert metadata["scale_search_version"] == "scale_search_v5"
+    assert metadata["search_strategy"] == "parallel_exact_monte_carlo_v1"
     assert metadata["scale_attempts"]
+    assert metadata["exact_final_attempts"] == 0
     assert metadata["best_reused_as_final"] is True
+    assert metadata["reused_feasibility_as_final"] is True
+    assert metadata["final_refine_skipped"] is True
+    assert metadata["batch_rounds"] >= 1
+    assert metadata["parallel_attempts"] >= 1
     assert not any(attempt["kind"] == "final" for attempt in metadata["scale_attempts"])
+    assert all(
+        attempt["packer"] != PackerBackend.BITMAP.value for attempt in metadata["scale_attempts"]
+    )
     assert _validate_layout_geometry(_scale_polygons(polygons, scale), plates, 100.0, 100.0, 0.0)
 
 
@@ -166,6 +175,8 @@ def test_prepare_scale_search_keeps_full_scale_when_full_scale_fits_two_plates()
     assert len(plates) == 2
     assert scale >= 1.0 - 1e-3
     assert metadata["final_plates"] == 2
+    assert metadata["exact_final_attempts"] == 0
+    assert metadata["best_reused_as_final"] is True
 
 
 def test_prepare_scale_search_precheck_skips_impossible_scales_before_exact_pack():
@@ -611,7 +622,7 @@ def test_run_prepare_reuses_footprint_and_packing_cache(tmp_path: Path):
     assert payload["metadata"]["packing"]["cache_hit"] is True
 
 
-def test_run_prepare_auto_uses_exact_cache_not_bitmap_cache(tmp_path: Path):
+def test_run_prepare_bitmap_request_uses_exact_prepare_cache(tmp_path: Path):
     input_dir = tmp_path / "input"
     input_dir.mkdir()
     _write_box(input_dir / "a.stl", (10.0, 20.0, 30.0))
@@ -636,7 +647,7 @@ def test_run_prepare_auto_uses_exact_cache_not_bitmap_cache(tmp_path: Path):
     assert first_payload["metadata"]["packing_options"]["requested_packer"] == "auto"
     assert first_payload["metadata"]["packing_options"]["resolved_packer"] == "exact"
     assert first_payload["metadata"]["packing"]["resolved_packer"] == "exact"
-    assert first_payload["metadata"]["packing"]["cache_hit"] is False
+    assert first_payload["metadata"]["packing"]["cache_hit"] is True
 
     second_auto_profile = tmp_path / "prepare-auto-second-profile"
     rc = run_prepare(

@@ -6,6 +6,7 @@ import pytest
 import trimesh
 from shapely.geometry import Polygon, box
 
+from stlbench.config.enums import ExactPackQuality
 from stlbench.packing.polygon_footprint import mesh_to_packing_shadow, mesh_to_xy_shadow
 from stlbench.packing.polygon_pack import (
     _compact_plates,
@@ -464,3 +465,41 @@ def test_max_plates_limit_enforced():
     polys = [_box_poly(90.0, 90.0)] * 3
     with pytest.raises(RuntimeError):
         pack_polygons_on_plates(polys, bed_w=100.0, bed_h=100.0, gap_mm=1.0, max_plates=1)
+
+
+def test_exact_feasibility_quality_skips_compaction():
+    polys = [_l_shape_poly(), _box_poly(25.0, 25.0), _box_poly(20.0, 30.0)]
+    metadata: dict[str, object] = {}
+
+    plates = pack_polygons_on_plates(
+        polys,
+        bed_w=140.0,
+        bed_h=100.0,
+        gap_mm=2.0,
+        part_heights=[10.0, 8.0, 6.0],
+        metadata=metadata,
+        quality=ExactPackQuality.FEASIBILITY,
+    )
+
+    assert plates
+    assert metadata["quality"] == ExactPackQuality.FEASIBILITY.value
+    assert metadata["exact_compact_s"] == 0.0
+
+
+def test_exact_final_quality_records_compaction_timing():
+    polys = [_l_shape_poly(), _box_poly(25.0, 25.0), _box_poly(20.0, 30.0)]
+    metadata: dict[str, object] = {}
+
+    plates = pack_polygons_on_plates(
+        polys,
+        bed_w=140.0,
+        bed_h=100.0,
+        gap_mm=2.0,
+        part_heights=[10.0, 8.0, 6.0],
+        metadata=metadata,
+        quality=ExactPackQuality.FINAL,
+    )
+
+    assert plates
+    assert metadata["quality"] == ExactPackQuality.FINAL.value
+    assert metadata["exact_compact_s"] >= 0.0

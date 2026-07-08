@@ -37,6 +37,11 @@ class PackerBackend(StrEnum):
     EXACT = "exact"
 
 
+class ExactPackQuality(StrEnum):
+    FINAL = "final"
+    FEASIBILITY = "feasibility"
+
+
 class ExportCompressionMode(StrEnum):
     DEFAULT = "default"
     FAST = "fast"
