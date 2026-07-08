@@ -138,6 +138,10 @@ def test_prepare_scale_search_shrinks_to_requested_plate_count():
     assert scale == pytest.approx(100.0 / 120.0, abs=0.02)
     assert metadata["max_plates"] == 1
     assert metadata["attempts_run"] > 0
+    assert metadata["scale_search_version"] == "scale_search_v3"
+    assert metadata["scale_attempts"]
+    assert metadata["best_reused_as_final"] is True
+    assert not any(attempt["kind"] == "final" for attempt in metadata["scale_attempts"])
     assert _validate_layout_geometry(_scale_polygons(polygons, scale), plates, 100.0, 100.0, 0.0)
 
 
@@ -164,6 +168,32 @@ def test_prepare_scale_search_keeps_full_scale_when_full_scale_fits_two_plates()
     assert metadata["final_plates"] == 2
 
 
+def test_prepare_scale_search_precheck_skips_impossible_scales_before_exact_pack():
+    polygons = [box(0.0, 0.0, 50.0, 50.0) for _ in range(4)]
+
+    scale, plates, metadata = _search_prepare_layout_scale(
+        polygons,
+        100.0,
+        100.0,
+        100.0,
+        0.0,
+        packer="exact",
+        bitmap_options=BitmapPackOptions(),
+        grid_step_mm=1.0,
+        max_plates=1,
+        part_heights=[10.0, 10.0, 10.0, 10.0],
+        tolerance=1e-2,
+    )
+
+    assert scale >= 0.0
+    assert plates is None or len(plates) <= 1
+    assert metadata["skipped_by_precheck"] > 0
+    assert any(
+        attempt["kind"].endswith("-precheck") and attempt["fits"] is False
+        for attempt in metadata["scale_attempts"]
+    )
+
+
 def test_prepare_packing_cache_key_includes_scale_search_options():
     kwargs = {
         "footprint_keys": ["a", "b"],
@@ -177,10 +207,31 @@ def test_prepare_packing_cache_key_includes_scale_search_options():
         "grid_step_mm": 1.0,
     }
 
-    base = _packing_cache_key(**kwargs, max_plates=1, scale_tolerance=1e-4)
+    base = _packing_cache_key(
+        **kwargs,
+        max_plates=1,
+        scale_tolerance=1e-4,
+        post_fit_scale=0.95,
+    )
 
-    assert base != _packing_cache_key(**kwargs, max_plates=2, scale_tolerance=1e-4)
-    assert base != _packing_cache_key(**kwargs, max_plates=1, scale_tolerance=1e-3)
+    assert base != _packing_cache_key(
+        **kwargs,
+        max_plates=2,
+        scale_tolerance=1e-4,
+        post_fit_scale=0.95,
+    )
+    assert base != _packing_cache_key(
+        **kwargs,
+        max_plates=1,
+        scale_tolerance=1e-3,
+        post_fit_scale=0.95,
+    )
+    assert base != _packing_cache_key(
+        **kwargs,
+        max_plates=1,
+        scale_tolerance=1e-4,
+        post_fit_scale=0.9,
+    )
     assert base != _packing_cache_key(
         **{
             **kwargs,
@@ -189,6 +240,7 @@ def test_prepare_packing_cache_key_includes_scale_search_options():
         },
         max_plates=1,
         scale_tolerance=1e-4,
+        post_fit_scale=0.95,
     )
 
 
@@ -419,7 +471,7 @@ def test_run_prepare_max_plates_exports_one_plate_and_scale_metadata(tmp_path: P
             n_orient_candidates=1,
             dry_run=False,
             recursive=False,
-            packer="exact",
+            packer=None,
             max_plates=1,
             scale_tolerance=1e-3,
             workers="1",
@@ -443,6 +495,8 @@ def test_run_prepare_max_plates_exports_one_plate_and_scale_metadata(tmp_path: P
     )
     payload = _assert_profile_artifacts(profile_dir, "prepare")
     packing = payload["metadata"]["packing"]
+    assert payload["metadata"]["packing_options"]["requested_packer"] == "auto"
+    assert payload["metadata"]["packing_options"]["resolved_packer"] == "exact"
     assert packing["max_plates"] == 1
     assert packing["final_plates"] == 1
     assert packing["layout_pack_scale"] < 1.0
