@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import pyclipper
@@ -165,6 +166,27 @@ _DEFAULT_REFLOW_SWEEPS = 2
 _DEFAULT_REFLOW_TIME_BUDGET_S = 30.0
 
 
+@dataclass(frozen=True)
+class _PlacementVariant:
+    angle: float
+    polygon: BaseGeometry
+    nfp_polygon: BaseGeometry
+    width: float
+    height: float
+
+
+@dataclass
+class _ExactPackStats:
+    rotation_precompute_s: float = 0.0
+    nfp_s: float = 0.0
+    union_difference_s: float = 0.0
+    clearance_s: float = 0.0
+    grid_fallback_s: float = 0.0
+    placement_calls: int = 0
+    rotations_tested: int = 0
+    candidate_checks: int = 0
+
+
 def _axis_positions(max_value: float, step: float) -> list[float]:
     vals: list[float] = []
     cur = 0.0
@@ -262,6 +284,44 @@ def _rect_for_candidate(
     )
 
 
+def _build_placement_variants(
+    polygons: list[BaseGeometry],
+    stats: _ExactPackStats | None = None,
+) -> list[tuple[_PlacementVariant, ...]]:
+    start = time.perf_counter()
+    out: list[tuple[_PlacementVariant, ...]] = []
+    for shadow in polygons:
+        variants: list[_PlacementVariant] = []
+        for angle in _PLACEMENT_ANGLES:
+            rotated = _normalize(affinity.rotate(shadow, angle, origin=(0, 0)))
+            _, _, width, height = rotated.bounds
+            variants.append(
+                _PlacementVariant(
+                    angle=angle,
+                    polygon=rotated,
+                    nfp_polygon=rotated.convex_hull,
+                    width=float(width),
+                    height=float(height),
+                )
+            )
+        out.append(tuple(variants))
+    if stats is not None:
+        stats.rotation_precompute_s += time.perf_counter() - start
+    return out
+
+
+def _variant_for_rect(
+    variants: list[tuple[_PlacementVariant, ...]] | None,
+    polygons: list[BaseGeometry],
+    rect: PackedRect,
+) -> BaseGeometry:
+    if variants is not None:
+        for variant in variants[rect.part_index]:
+            if abs(variant.angle - rect.rotation_deg) <= 1e-9:
+                return affinity.translate(variant.polygon, rect.x, rect.y)
+    return placed_polygon_from_rect(polygons[rect.part_index], rect)
+
+
 def _grid_fallback_place(
     shadow: BaseGeometry,
     part_idx: int,
@@ -271,6 +331,8 @@ def _grid_fallback_place(
     gap_mm: float,
     grid_step_mm: float,
     candidate_key: Callable[[BaseGeometry, float, float], tuple[float, ...]] | None = None,
+    variants: tuple[_PlacementVariant, ...] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> tuple[PackedRect, BaseGeometry] | None:
     """Find a strict-gap placement by bounded scanline search.
 
@@ -278,11 +340,14 @@ def _grid_fallback_place(
     is slower, but catches obvious interior free-space placements that the
     convex-hull NFP acceleration can miss.
     """
+    start = time.perf_counter()
     step = max(float(grid_step_mm), 0.1)
     best: tuple[tuple[float, ...], PackedRect, BaseGeometry] | None = None
-    for angle in _PLACEMENT_ANGLES:
-        s = _normalize(affinity.rotate(shadow, angle, origin=(0, 0)))
-        _, _, w, h = s.bounds
+    placement_variants = variants or _build_placement_variants([shadow])[0]
+    for variant in placement_variants:
+        s = variant.polygon
+        w = variant.width
+        h = variant.height
         x_max = bed_w - w
         y_max = bed_h - h
         if x_max < -1e-6 or y_max < -1e-6:
@@ -298,13 +363,17 @@ def _grid_fallback_place(
                     continue
                 if not _clearance_ok(candidate, placed_clearance, gap_mm):
                     continue
-                rect = _rect_for_candidate(part_idx, tx, ty, angle, w, h)
+                rect = _rect_for_candidate(part_idx, tx, ty, variant.angle, w, h)
                 if candidate_key is None:
+                    if stats is not None:
+                        stats.grid_fallback_s += time.perf_counter() - start
                     return rect, candidate
                 key = candidate_key(candidate, ty, tx)
                 if best is None or key < best[0]:
                     best = (key, rect, candidate)
 
+    if stats is not None:
+        stats.grid_fallback_s += time.perf_counter() - start
     return None if best is None else (best[1], best[2])
 
 
@@ -319,6 +388,8 @@ def _try_place_one(
     gap_mm: float,
     grid_step_mm: float,
     candidate_key: Callable[[BaseGeometry, float, float], tuple[float, ...]] | None = None,
+    variants: tuple[_PlacementVariant, ...] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> tuple[PackedRect, BaseGeometry] | None:
     """Find the best NFP bottom-left placement for *shadow*.
 
@@ -326,6 +397,8 @@ def _try_place_one(
     (y, x) reference-point position, or ``None`` if the part cannot be placed.
     """
     prep_forbidden = prep(forbidden) if forbidden is not None else None
+    if stats is not None:
+        stats.placement_calls += 1
 
     best_pos: tuple[float, float] | None = None
     best_key: tuple[float, ...] | None = None
@@ -334,9 +407,14 @@ def _try_place_one(
     best_h = 0.0
     best_candidate: BaseGeometry | None = None
 
-    for angle in _PLACEMENT_ANGLES:
-        s = _normalize(affinity.rotate(shadow, angle, origin=(0, 0)))
-        _, _, w, h = s.bounds  # minx=miny=0 after _normalize
+    placement_variants = variants or _build_placement_variants([shadow])[0]
+    for variant in placement_variants:
+        if stats is not None:
+            stats.rotations_tested += 1
+        s = variant.polygon
+        s_nfp = variant.nfp_polygon
+        w = variant.width
+        h = variant.height
         x_max = bed_w - w
         y_max = bed_h - h
         if x_max < -1e-6 or y_max < -1e-6:
@@ -352,15 +430,20 @@ def _try_place_one(
             # 50-200, making MinkowskiSum ~200x faster. The hull overapproximates
             # the forbidden zone (conservative), but exact overlap is still checked
             # via prep_forbidden below.
-            s_nfp = s.convex_hull
             outer_nfps: list[BaseGeometry] = []
+            nfp_start = time.perf_counter()
             for buf in placed_buffered:
                 nfp = _outer_nfp(buf, s_nfp)
                 if nfp is not None and not nfp.is_empty:
                     outer_nfps.append(nfp)
+            if stats is not None:
+                stats.nfp_s += time.perf_counter() - nfp_start
             if outer_nfps:
+                combine_start = time.perf_counter()
                 combined = shapely.union_all(np.asarray(outer_nfps, dtype=object))
                 valid = inner_nfp.difference(combined)
+                if stats is not None:
+                    stats.union_difference_s += time.perf_counter() - combine_start
             else:
                 valid = inner_nfp
         else:
@@ -373,10 +456,15 @@ def _try_place_one(
         if not vertices:
             continue
         for vx, vy in vertices:
+            if stats is not None:
+                stats.candidate_checks += 1
             tx = max(0.0, min(float(vx), x_max))
             ty = max(0.0, min(float(vy), y_max))
             candidate = affinity.translate(s, tx, ty)
+            clearance_start = time.perf_counter()
             if not _within_bed(candidate, bed_w, bed_h):
+                if stats is not None:
+                    stats.clearance_s += time.perf_counter() - clearance_start
                 continue
 
             # Guard against NFP numerical imprecision: allow boundary touching
@@ -384,15 +472,21 @@ def _try_place_one(
             if prep_forbidden is not None:
                 inner = candidate.buffer(-1e-3)
                 if not inner.is_empty and prep_forbidden.intersects(inner):
+                    if stats is not None:
+                        stats.clearance_s += time.perf_counter() - clearance_start
                     continue
             if not _clearance_ok(candidate, placed_clearance, gap_mm):
+                if stats is not None:
+                    stats.clearance_s += time.perf_counter() - clearance_start
                 continue
+            if stats is not None:
+                stats.clearance_s += time.perf_counter() - clearance_start
 
             key = candidate_key(candidate, ty, tx) if candidate_key else (ty, tx)
             if best_key is None or key < best_key:
                 best_pos = (ty, tx)
                 best_key = key
-                best_angle = angle
+                best_angle = variant.angle
                 best_w = w
                 best_h = h
                 best_candidate = candidate
@@ -411,6 +505,8 @@ def _try_place_one(
             gap_mm,
             grid_step_mm,
             candidate_key,
+            variants=placement_variants,
+            stats=stats,
         )
 
     ty, tx = best_pos
@@ -447,12 +543,13 @@ def _build_placement_state(
     rects: list[PackedRect],
     polygons: list[BaseGeometry],
     gap_mm: float,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
 ) -> tuple[list[BaseGeometry], list[BaseGeometry], BaseGeometry | None]:
     placed_clearance: list[BaseGeometry] = []
     placed_buffered: list[BaseGeometry] = []
     forbidden: BaseGeometry | None = None
     for rect in rects:
-        placed_poly = placed_polygon_from_rect(polygons[rect.part_index], rect)
+        placed_poly = _variant_for_rect(variants, polygons, rect)
         forbidden = _add_placed_geometry(
             placed_poly,
             placed_clearance,
@@ -473,6 +570,8 @@ def _pack_plate(
     grid_step_mm: float,
     plate_idx: int,
     on_placed: Callable[[], None] | None = None,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> tuple[PackedPlate, list[int]]:
     """Pack as many of *part_indices* as possible onto one plate.
 
@@ -495,6 +594,8 @@ def _pack_plate(
             bed_h,
             gap_mm,
             grid_step_mm,
+            variants=variants[orig_idx] if variants is not None else None,
+            stats=stats,
         )
         if result is not None:
             rect, placed_poly = result
@@ -522,6 +623,8 @@ def _compact_plates(
     bed_h: float,
     gap_mm: float,
     grid_step_mm: float,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> list[PackedPlate]:
     if len(plates) <= 1:
         return plates
@@ -537,7 +640,7 @@ def _compact_plates(
                 for target_i in range(source_i):
                     target_rects = plate_rects[target_i]
                     placed_clearance, placed_buffered, forbidden = _build_placement_state(
-                        target_rects, polygons, gap_mm
+                        target_rects, polygons, gap_mm, variants
                     )
                     result = _try_place_one(
                         polygons[rect.part_index],
@@ -549,6 +652,8 @@ def _compact_plates(
                         bed_h,
                         gap_mm,
                         grid_step_mm,
+                        variants=variants[rect.part_index] if variants is not None else None,
+                        stats=stats,
                     )
                     if result is None:
                         continue
@@ -683,6 +788,8 @@ def _pack_order(
     grid_step_mm: float,
     max_plates: int,
     on_placed: Callable[[], None] | None = None,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> list[PackedPlate]:
     plates: list[PackedPlate] = []
     remaining = order
@@ -691,7 +798,16 @@ def _pack_order(
         if len(plates) >= max_plates:
             raise RuntimeError(f"Exceeded max_plates={max_plates}; not all parts could be placed.")
         plate, remaining = _pack_plate(
-            remaining, polygons, bed_w, bed_h, gap_mm, grid_step_mm, len(plates), on_placed
+            remaining,
+            polygons,
+            bed_w,
+            bed_h,
+            gap_mm,
+            grid_step_mm,
+            len(plates),
+            on_placed,
+            variants,
+            stats,
         )
         if not plate.rects:
             raise RuntimeError(
@@ -700,7 +816,7 @@ def _pack_order(
             )
         plates.append(plate)
 
-    return _compact_plates(plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm)
+    return _compact_plates(plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm, variants, stats)
 
 
 def _ordering_candidates(
@@ -749,6 +865,8 @@ def _try_pack_order_into_k(
     grid_step_mm: float,
     k: int,
     part_heights: Sequence[float] | None,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> list[PackedPlate] | None:
     rects_by_plate: list[list[PackedRect]] = [[] for _ in range(k)]
 
@@ -756,7 +874,7 @@ def _try_pack_order_into_k(
         best: tuple[tuple[float, float, int], int, PackedRect] | None = None
         for plate_idx in range(k):
             placed_clearance, placed_buffered, forbidden = _build_placement_state(
-                rects_by_plate[plate_idx], polygons, gap_mm
+                rects_by_plate[plate_idx], polygons, gap_mm, variants
             )
             result = _try_place_one(
                 polygons[part_idx],
@@ -768,6 +886,8 @@ def _try_pack_order_into_k(
                 bed_h,
                 gap_mm,
                 grid_step_mm,
+                variants=variants[part_idx] if variants is not None else None,
+                stats=stats,
             )
             if result is None:
                 continue
@@ -786,7 +906,7 @@ def _try_pack_order_into_k(
     plates = _renumber_plates(
         PackedPlate(index=i, rects=tuple(rects)) for i, rects in enumerate(rects_by_plate)
     )
-    return _compact_plates(plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm)
+    return _compact_plates(plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm, variants, stats)
 
 
 def _try_pack_height_groups(
@@ -798,6 +918,8 @@ def _try_pack_height_groups(
     grid_step_mm: float,
     k: int,
     part_heights: Sequence[float] | None,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> list[PackedPlate] | None:
     if part_heights is None:
         return None
@@ -807,7 +929,17 @@ def _try_pack_height_groups(
     overflow: list[int] = []
     for group in groups:
         group_order = sorted(group, key=lambda i: -polygons[i].area)
-        plate, unplaced = _pack_plate(group_order, polygons, bed_w, bed_h, gap_mm, grid_step_mm, 0)
+        plate, unplaced = _pack_plate(
+            group_order,
+            polygons,
+            bed_w,
+            bed_h,
+            gap_mm,
+            grid_step_mm,
+            0,
+            variants=variants,
+            stats=stats,
+        )
         rects_by_plate.append(list(plate.rects))
         overflow.extend(unplaced)
 
@@ -816,7 +948,7 @@ def _try_pack_height_groups(
             best: tuple[tuple[float, float, int], int, PackedRect] | None = None
             for plate_idx, rects in enumerate(rects_by_plate):
                 placed_clearance, placed_buffered, forbidden = _build_placement_state(
-                    rects, polygons, gap_mm
+                    rects, polygons, gap_mm, variants
                 )
                 result = _try_place_one(
                     polygons[part_idx],
@@ -828,6 +960,8 @@ def _try_pack_height_groups(
                     bed_h,
                     gap_mm,
                     grid_step_mm,
+                    variants=variants[part_idx] if variants is not None else None,
+                    stats=stats,
                 )
                 if result is None:
                     continue
@@ -848,7 +982,7 @@ def _try_pack_height_groups(
     plates = _renumber_plates(
         PackedPlate(index=i, rects=tuple(rects)) for i, rects in enumerate(rects_by_plate)
     )
-    return _compact_plates(plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm)
+    return _compact_plates(plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm, variants, stats)
 
 
 def _reflow_plate(
@@ -861,6 +995,8 @@ def _reflow_plate(
     *,
     max_sweeps: int,
     deadline: float,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> PackedPlate:
     rects = list(plate.rects)
     if len(rects) <= 1:
@@ -871,12 +1007,12 @@ def _reflow_plate(
         for old_rect in list(rects):
             if time.perf_counter() >= deadline:
                 return PackedPlate(index=plate.index, rects=tuple(rects))
-            current = placed_polygon_from_rect(polygons[old_rect.part_index], old_rect)
+            current = _variant_for_rect(variants, polygons, old_rect)
             others = [rect for rect in rects if rect is not old_rect]
-            existing = [placed_polygon_from_rect(polygons[r.part_index], r) for r in others]
+            existing = [_variant_for_rect(variants, polygons, r) for r in others]
             old_score = _candidate_spread_score(current, existing)
             placed_clearance, placed_buffered, forbidden = _build_placement_state(
-                others, polygons, gap_mm
+                others, polygons, gap_mm, variants
             )
 
             def key(
@@ -898,6 +1034,8 @@ def _reflow_plate(
                 gap_mm,
                 grid_step_mm,
                 key,
+                variants=variants[old_rect.part_index] if variants is not None else None,
+                stats=stats,
             )
             if result is None:
                 continue
@@ -922,6 +1060,8 @@ def _reflow_layout(
     *,
     max_sweeps: int = _DEFAULT_REFLOW_SWEEPS,
     time_budget_s: float = _DEFAULT_REFLOW_TIME_BUDGET_S,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
 ) -> list[PackedPlate]:
     deadline = time.perf_counter() + max(0.0, time_budget_s)
     reflowed = [
@@ -934,6 +1074,8 @@ def _reflow_layout(
             grid_step_mm,
             max_sweeps=max_sweeps,
             deadline=deadline,
+            variants=variants,
+            stats=stats,
         )
         for plate in plates
     ]
@@ -1025,6 +1167,9 @@ def pack_polygons_on_plates(
                 metadata["attempts"] = [{"kind": "rectpack", "plates": len(fast)}]
             return fast
 
+    exact_stats = _ExactPackStats()
+    variants = _build_placement_variants(polygons, exact_stats)
+
     baseline = _pack_order(
         order,
         polygons,
@@ -1034,6 +1179,8 @@ def pack_polygons_on_plates(
         grid_step_mm,
         max_plates,
         on_placed,
+        variants,
+        exact_stats,
     )
     best = baseline
     best_score = _layout_score(best, polygons, part_heights)
@@ -1064,6 +1211,8 @@ def pack_polygons_on_plates(
                         grid_step_mm,
                         k,
                         part_heights,
+                        variants,
+                        exact_stats,
                     )
                     if candidate is None:
                         attempts.append(
@@ -1096,6 +1245,8 @@ def pack_polygons_on_plates(
                     grid_step_mm,
                     k,
                     part_heights,
+                    variants,
+                    exact_stats,
                 )
                 if grouped is not None:
                     score = _layout_score(grouped, polygons, part_heights)
@@ -1129,6 +1280,8 @@ def pack_polygons_on_plates(
                 gap_mm,
                 grid_step_mm,
                 time_budget_s=min(5.0, max(1.0, len(polygons) * 0.25)),
+                variants=variants,
+                stats=exact_stats,
             )
             reflowed_score = _layout_score(reflowed, polygons, part_heights)
             if reflowed_score <= best_score:
@@ -1152,6 +1305,14 @@ def pack_polygons_on_plates(
         metadata["spread_score"] = -best_score[2]
         metadata["edge_margin_mm"] = edge_margin_mm
         metadata["effective_bed_mm"] = [effective_bed_w, effective_bed_h]
+        metadata["exact_precompute_s"] = exact_stats.rotation_precompute_s
+        metadata["exact_nfp_s"] = exact_stats.nfp_s
+        metadata["exact_union_difference_s"] = exact_stats.union_difference_s
+        metadata["exact_clearance_s"] = exact_stats.clearance_s
+        metadata["exact_grid_fallback_s"] = exact_stats.grid_fallback_s
+        metadata["exact_placement_calls"] = exact_stats.placement_calls
+        metadata["exact_rotations_tested"] = exact_stats.rotations_tested
+        metadata["exact_candidate_checks"] = exact_stats.candidate_checks
         metadata["attempts"] = attempts
 
     return _offset_plates(best, edge_margin_mm, edge_margin_mm)

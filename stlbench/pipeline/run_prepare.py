@@ -25,6 +25,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import pickle
 import queue
@@ -113,6 +114,17 @@ from stlbench.pipeline.resource_planner import (
 from stlbench.profiling import ProfileOptions, make_profiler
 
 _IDENTITY3 = np.eye(3, dtype=np.float64)
+_PREPARE_SCALE_SEARCH_VERSION = "scale_search_v3"
+_PREPARE_FAST_PROBE_STEPS = 12
+_PREPARE_FAST_PROBE_TOLERANCE = 0.01
+_PREPARE_FAST_PROBE_GRID_MM = 1.0
+_PREPARE_FAST_PROBE_BEAM_WIDTH = 8
+_PREPARE_LAYOUT_SCALE_TOLERANCE_FLOOR = 0.005
+_PREPARE_LAYOUT_PROBE_ROTATION_COUNT = 24
+_PREPARE_LAYOUT_PROBE_ANGLES: tuple[float, ...] = tuple(
+    360.0 * i / _PREPARE_LAYOUT_PROBE_ROTATION_COUNT
+    for i in range(_PREPARE_LAYOUT_PROBE_ROTATION_COUNT)
+)
 
 
 class _OrientationActorCommand(StrEnum):
@@ -354,7 +366,7 @@ def _write_cached_footprint(cache_dir: Path | None, key: str, geometry: BaseGeom
 
 def _prepare_packer_version(packer: PackerBackend | str) -> str:
     packer = coerce_enum(PackerBackend, packer, "packer")
-    return "prepare_bitmap_v1" if packer is PackerBackend.BITMAP else "prepare_exact_v1"
+    return "prepare_bitmap_v3" if packer is PackerBackend.BITMAP else "prepare_exact_v3"
 
 
 def _packing_cache_key(
@@ -370,11 +382,12 @@ def _packing_cache_key(
     grid_step_mm: float,
     max_plates: int | None = None,
     scale_tolerance: float | None = None,
+    post_fit_scale: float | None = None,
 ) -> str:
     packer = coerce_enum(PackerBackend, packer, "packer")
     return _json_hash(
         {
-            "version": 1,
+            "version": 3,
             "footprint_keys": footprint_keys,
             "bed_w": round(float(bed_w), 9),
             "bed_h": round(float(bed_h), 9),
@@ -393,6 +406,14 @@ def _packing_cache_key(
             "max_plates": max_plates,
             "scale_tolerance": (
                 round(float(scale_tolerance), 9) if scale_tolerance is not None else None
+            ),
+            "scale_search_version": (
+                _PREPARE_SCALE_SEARCH_VERSION if max_plates is not None else None
+            ),
+            "post_fit_scale": (
+                round(float(post_fit_scale), 9)
+                if max_plates is not None and post_fit_scale is not None
+                else None
             ),
         }
     )
@@ -547,7 +568,14 @@ def _pack_bitmap_multi_plate(
         subset_to_global = list(remaining)
         best_plate: PackedPlate | None = None
         best_count = 0
-        for count in range(len(subset_polygons), 0, -1):
+
+        def _try_count(
+            count: int,
+            *,
+            subset_polygons: list[BaseGeometry] = subset_polygons,
+            subset_to_global: list[int] = subset_to_global,
+        ) -> PackedPlate | None:
+            nonlocal total_candidates, total_rasterize, total_search
             candidate_polygons = subset_polygons[:count]
             mapping = tuple(subset_to_global)
             plate_index = len(plates)
@@ -585,16 +613,17 @@ def _pack_bitmap_multi_plate(
             total_candidates += result.stats.candidates_tested
             total_rasterize += result.stats.rasterize_s
             total_search += result.stats.search_s
+            ok = result.plate is not None
             attempts.append(
                 {
                     "plate": len(plates),
                     "try_parts": count,
-                    "ok": result.plate is not None,
+                    "ok": ok,
                     "candidates_tested": result.stats.candidates_tested,
                 }
             )
             if result.plate is None:
-                continue
+                return None
             global_rects = tuple(
                 PackedRect(
                     part_index=subset_to_global[rect.part_index],
@@ -606,9 +635,20 @@ def _pack_bitmap_multi_plate(
                 )
                 for rect in result.plate.rects
             )
-            best_plate = PackedPlate(index=len(plates), rects=global_rects)
+            return PackedPlate(index=len(plates), rects=global_rects)
+
+        lo_count = 1
+        hi_count = len(subset_polygons)
+        while lo_count <= hi_count:
+            count = (lo_count + hi_count) // 2
+            candidate_plate = _try_count(count)
+            if candidate_plate is None:
+                hi_count = count - 1
+                continue
+            best_plate = candidate_plate
             best_count = count
-            break
+            lo_count = count + 1
+
         if best_plate is None or best_count <= 0:
             raise RuntimeError("bitmap packer could not place any remaining part on a new plate.")
         plates.append(_offset_plate(best_plate, edge_margin_mm, edge_margin_mm, len(plates)))
@@ -642,6 +682,7 @@ def _scale_polygons(polygons: list[BaseGeometry], scale: float) -> list[BaseGeom
 
 
 def _scale_plate_dimensions(plates: list[PackedPlate], factor: float) -> list[PackedPlate]:
+    """Scale final part extents without moving already-valid placement origins."""
     if abs(factor - 1.0) <= 1e-12:
         return plates
     return [
@@ -676,11 +717,14 @@ def _try_pack_prepare_at_scale(
     grid_step_mm: float,
     max_plates: int,
     part_heights: list[float],
+    on_placed: Any | None = None,
 ) -> tuple[list[PackedPlate] | None, dict[str, object]]:
+    start = time.perf_counter()
     scaled = _scale_polygons(base_polygons, scale)
     metadata: dict[str, object] = {"layout_pack_scale": float(scale)}
     try:
         packer = coerce_enum(PackerBackend, packer, "packer")
+        metadata["packer"] = packer.value
         if packer is PackerBackend.BITMAP:
             plates = _pack_bitmap_multi_plate(
                 scaled,
@@ -703,14 +747,190 @@ def _try_pack_prepare_at_scale(
                 part_heights=[h * scale for h in part_heights],
                 metadata=metadata,
                 edge_margin_mm=edge_margin_mm,
+                on_placed=on_placed,
             )
-    except (RuntimeError, ValueError):
+    except (RuntimeError, ValueError) as exc:
+        metadata["duration_s"] = time.perf_counter() - start
+        metadata["fits"] = False
+        metadata["error"] = str(exc)
         return None, metadata
-    if len(plates) > max_plates or not _validate_layout_geometry(
+    valid = len(plates) <= max_plates and _validate_layout_geometry(
         scaled, plates, bed_w, bed_h, gap_mm
-    ):
+    )
+    metadata["duration_s"] = time.perf_counter() - start
+    metadata["fits"] = valid
+    metadata["plates"] = len(plates)
+    metadata["placed_count"] = sum(len(plate.rects) for plate in plates)
+    if not valid:
         return None, metadata
     return plates, metadata
+
+
+def _prepare_layout_scale_upper_bound(
+    base_polygons: list[BaseGeometry],
+    bed_w: float,
+    bed_h: float,
+    edge_margin_mm: float,
+    max_plates: int,
+) -> float:
+    effective_w = bed_w - 2.0 * edge_margin_mm
+    effective_h = bed_h - 2.0 * edge_margin_mm
+    if effective_w <= 0 or effective_h <= 0:
+        return 0.0
+
+    upper = 1.0
+    total_area = sum(max(float(poly.area), 0.0) for poly in base_polygons)
+    if total_area > 0.0:
+        upper = min(upper, math.sqrt((effective_w * effective_h * max_plates) / total_area))
+
+    for poly in base_polygons:
+        part_upper = 0.0
+        for angle in _PREPARE_LAYOUT_PROBE_ANGLES:
+            rotated = affinity.rotate(poly, angle, origin=(0.0, 0.0))
+            minx, miny, maxx, maxy = rotated.bounds
+            width = maxx - minx
+            height = maxy - miny
+            if width <= 0.0 or height <= 0.0:
+                continue
+            part_upper = max(part_upper, min(effective_w / width, effective_h / height))
+        if part_upper <= 0.0:
+            return 0.0
+        upper = min(upper, part_upper)
+    return max(0.0, min(1.0, float(upper)))
+
+
+def _prepare_layout_scale_precheck(
+    base_polygons: list[BaseGeometry],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    edge_margin_mm: float,
+    scale: float,
+    max_plates: int,
+) -> tuple[bool, dict[str, object]]:
+    effective_w = bed_w - 2.0 * edge_margin_mm
+    effective_h = bed_h - 2.0 * edge_margin_mm
+    metadata: dict[str, object] = {
+        "precheck_scale": float(scale),
+        "precheck_effective_bed_mm": [effective_w, effective_h],
+    }
+    if effective_w <= 0.0 or effective_h <= 0.0:
+        metadata["precheck_reason"] = "empty_bed_after_margin"
+        return False, metadata
+
+    scaled_area = sum(max(float(poly.area), 0.0) for poly in base_polygons) * scale * scale
+    bed_area = effective_w * effective_h * max_plates
+    metadata["precheck_area_mm2"] = scaled_area
+    metadata["precheck_bed_area_mm2"] = bed_area
+    if scaled_area > bed_area + 1e-6:
+        metadata["precheck_reason"] = "area_lower_bound"
+        return False, metadata
+
+    if gap_mm > 0.0:
+        buffered_area = 0.0
+        for poly in _scale_polygons(base_polygons, scale):
+            try:
+                buffered_area += float(poly.buffer(gap_mm * 0.5).area)
+            except (ValueError, FloatingPointError):
+                buffered_area = 0.0
+                break
+        expanded_bed_area = (effective_w + gap_mm) * (effective_h + gap_mm) * max_plates
+        metadata["precheck_buffered_area_mm2"] = buffered_area
+        metadata["precheck_expanded_bed_area_mm2"] = expanded_bed_area
+        if buffered_area > expanded_bed_area + 1e-6:
+            metadata["precheck_reason"] = "buffered_area_lower_bound"
+            return False, metadata
+
+    for part_index, poly in enumerate(base_polygons):
+        fits = False
+        for angle in _PREPARE_LAYOUT_PROBE_ANGLES:
+            rotated = affinity.rotate(poly, angle, origin=(0.0, 0.0))
+            minx, miny, maxx, maxy = rotated.bounds
+            width = (maxx - minx) * scale
+            height = (maxy - miny) * scale
+            if width <= effective_w + 1e-6 and height <= effective_h + 1e-6:
+                fits = True
+                break
+        if not fits:
+            metadata["precheck_reason"] = "part_does_not_fit_any_rotation"
+            metadata["precheck_part_index"] = part_index
+            return False, metadata
+
+    metadata["precheck_reason"] = "ok"
+    return True, metadata
+
+
+def _coarse_bitmap_options(bitmap_options: BitmapPackOptions) -> BitmapPackOptions:
+    return BitmapPackOptions(
+        grid_mm=max(float(bitmap_options.grid_mm), _PREPARE_FAST_PROBE_GRID_MM),
+        beam_width=min(int(bitmap_options.beam_width), _PREPARE_FAST_PROBE_BEAM_WIDTH),
+    )
+
+
+def _fast_probe_prepare_layout_scale(
+    base_polygons: list[BaseGeometry],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    edge_margin_mm: float,
+    *,
+    bitmap_options: BitmapPackOptions,
+    max_plates: int,
+    lo: float,
+    hi: float,
+    on_attempt: Any | None = None,
+) -> tuple[float, list[dict[str, object]]]:
+    attempts: list[dict[str, object]] = []
+    best = lo
+    if hi <= lo:
+        return best, attempts
+    probe_options = _coarse_bitmap_options(bitmap_options)
+    probe_tolerance = max(_PREPARE_FAST_PROBE_TOLERANCE, (hi - lo) / (2**_PREPARE_FAST_PROBE_STEPS))
+    for _ in range(_PREPARE_FAST_PROBE_STEPS):
+        if hi - lo <= probe_tolerance:
+            break
+        mid = (lo + hi) / 2.0
+        started = time.perf_counter()
+        scaled = _scale_polygons(base_polygons, mid)
+        metadata: dict[str, object] = {"layout_pack_scale": mid}
+        plates: list[PackedPlate] | None
+        try:
+            plates = _pack_bitmap_multi_plate(
+                scaled,
+                bed_w,
+                bed_h,
+                gap_mm,
+                edge_margin_mm,
+                probe_options,
+                metadata,
+                max_plates=max_plates,
+            )
+        except (RuntimeError, ValueError) as exc:
+            plates = None
+            metadata["error"] = str(exc)
+        fits = plates is not None and _validate_layout_geometry(
+            scaled, plates, bed_w, bed_h, gap_mm
+        )
+        if fits:
+            best = mid
+            lo = mid
+        else:
+            hi = mid
+        attempt = {
+            "kind": "fast-probe",
+            "scale": mid,
+            "packer": PackerBackend.BITMAP.value,
+            "fits": fits,
+            "plates": len(plates) if plates is not None else None,
+            "placed_count": (
+                sum(len(plate.rects) for plate in plates) if plates is not None else 0
+            ),
+            "duration_s": time.perf_counter() - started,
+        }
+        attempts.append(attempt)
+        if on_attempt is not None:
+            on_attempt(attempt)
+    return best, attempts
 
 
 def _search_prepare_layout_scale(
@@ -727,31 +947,137 @@ def _search_prepare_layout_scale(
     part_heights: list[float],
     tolerance: float,
     max_iter: int = 50,
+    on_attempt: Any | None = None,
+    on_placed: Any | None = None,
 ) -> tuple[float, list[PackedPlate] | None, dict[str, object]]:
+    requested_tolerance = float(tolerance)
+    packer = coerce_enum(PackerBackend, packer, "packer")
+    tolerance = (
+        max(requested_tolerance, _PREPARE_LAYOUT_SCALE_TOLERANCE_FLOOR)
+        if packer is PackerBackend.BITMAP
+        else requested_tolerance
+    )
     attempts = 0
+    exact_attempts = 0
+    skipped_by_precheck = 0
     best_scale = 0.0
     best_plates: list[PackedPlate] | None = None
     best_metadata: dict[str, object] = {}
+    attempt_log: list[dict[str, object]] = []
 
-    lo, hi = 0.0, 1.0
-    for _ in range(max_iter):
-        if hi - lo < tolerance:
-            break
-        mid = (lo + hi) / 2.0
+    def record_attempt(kind: str, scale: float, metadata: dict[str, object]) -> None:
+        attempt = {
+            "kind": kind,
+            "scale": float(scale),
+            "packer": metadata.get("packer", packer.value),
+            "fits": bool(metadata.get("fits", False)),
+            "plates": metadata.get("plates", metadata.get("final_plates")),
+            "placed_count": metadata.get("placed_count"),
+            "duration_s": metadata.get("duration_s"),
+        }
+        attempt_log.append(attempt)
+        if on_attempt is not None:
+            on_attempt(attempt)
+
+    def try_scale(kind: str, scale: float) -> tuple[list[PackedPlate] | None, dict[str, object]]:
+        nonlocal attempts, exact_attempts, skipped_by_precheck
+        precheck_ok, precheck_metadata = _prepare_layout_scale_precheck(
+            base_polygons,
+            bed_w,
+            bed_h,
+            gap_mm,
+            edge_margin_mm,
+            scale,
+            max_plates,
+        )
+        if not precheck_ok:
+            skipped_by_precheck += 1
+            metadata = {
+                "layout_pack_scale": float(scale),
+                "packer": packer.value,
+                "fits": False,
+                "plates": None,
+                "placed_count": None,
+                "duration_s": 0.0,
+                **precheck_metadata,
+            }
+            record_attempt(f"{kind}-precheck", scale, metadata)
+            return None, metadata
         attempts += 1
+        if packer is PackerBackend.EXACT:
+            exact_attempts += 1
         plates, metadata = _try_pack_prepare_at_scale(
             base_polygons,
             bed_w,
             bed_h,
             gap_mm,
             edge_margin_mm,
-            mid,
+            scale,
             packer=packer,
             bitmap_options=bitmap_options,
             grid_step_mm=grid_step_mm,
             max_plates=max_plates,
             part_heights=part_heights,
+            on_placed=on_placed,
         )
+        metadata.update({k: v for k, v in precheck_metadata.items() if k not in metadata})
+        record_attempt(kind, scale, metadata)
+        return plates, metadata
+
+    lo = 0.0
+    hi = _prepare_layout_scale_upper_bound(base_polygons, bed_w, bed_h, edge_margin_mm, max_plates)
+    if hi <= 0.0:
+        return (
+            0.0,
+            None,
+            {
+                "attempts_run": 0,
+                "scale_search_enabled": True,
+                "scale_search_version": _PREPARE_SCALE_SEARCH_VERSION,
+                "requested_scale_tolerance": requested_tolerance,
+                "effective_scale_tolerance": tolerance,
+                "exact_attempts": exact_attempts,
+                "skipped_by_precheck": skipped_by_precheck,
+                "best_reused_as_final": False,
+                "scale_attempts": attempt_log,
+            },
+        )
+
+    if packer is PackerBackend.EXACT:
+        probe_scale, probe_attempts = _fast_probe_prepare_layout_scale(
+            base_polygons,
+            bed_w,
+            bed_h,
+            gap_mm,
+            edge_margin_mm,
+            bitmap_options=bitmap_options,
+            max_plates=max_plates,
+            lo=0.0,
+            hi=hi,
+            on_attempt=on_attempt,
+        )
+        attempt_log.extend(probe_attempts)
+        if probe_scale > tolerance:
+            plates, metadata = try_scale("exact-probe", probe_scale)
+            if plates is not None:
+                lo = probe_scale
+                best_scale = probe_scale
+                best_plates = plates
+                best_metadata = metadata
+
+    if hi > 0.0 and hi - lo > tolerance:
+        plates, metadata = try_scale("upper-bound", hi)
+        if plates is not None:
+            best_scale = hi
+            best_plates = plates
+            best_metadata = metadata
+            lo = hi
+
+    for _ in range(max_iter):
+        if hi - lo < tolerance:
+            break
+        mid = (lo + hi) / 2.0
+        plates, metadata = try_scale("binary", mid)
         if plates is not None:
             lo = mid
             best_scale = mid
@@ -761,32 +1087,38 @@ def _search_prepare_layout_scale(
             hi = mid
 
     if best_plates is None:
-        return 0.0, None, {"attempts_run": attempts}
+        return (
+            0.0,
+            None,
+            {
+                "attempts_run": attempts,
+                "scale_search_enabled": True,
+                "scale_search_version": _PREPARE_SCALE_SEARCH_VERSION,
+                "requested_scale_tolerance": requested_tolerance,
+                "effective_scale_tolerance": tolerance,
+                "exact_attempts": exact_attempts,
+                "skipped_by_precheck": skipped_by_precheck,
+                "best_reused_as_final": False,
+                "scale_attempts": attempt_log,
+            },
+        )
 
-    final_plates, final_metadata = _try_pack_prepare_at_scale(
-        base_polygons,
-        bed_w,
-        bed_h,
-        gap_mm,
-        edge_margin_mm,
-        best_scale,
-        packer=packer,
-        bitmap_options=bitmap_options,
-        grid_step_mm=grid_step_mm,
-        max_plates=max_plates,
-        part_heights=part_heights,
-    )
-    if final_plates is not None:
-        best_plates = final_plates
-        best_metadata = final_metadata
     best_metadata.update(
         {
             "scale_search_enabled": True,
+            "scale_search_version": _PREPARE_SCALE_SEARCH_VERSION,
             "max_plates": max_plates,
             "layout_pack_scale": best_scale,
             "scale_tolerance": tolerance,
+            "requested_scale_tolerance": requested_tolerance,
+            "effective_scale_tolerance": tolerance,
             "attempts_run": attempts,
+            "exact_attempts": exact_attempts,
+            "skipped_by_precheck": skipped_by_precheck,
+            "best_reused_as_final": True,
             "final_plates": len(best_plates),
+            "scale_attempts": attempt_log,
+            "scale_search_upper_bound": hi,
         }
     )
     return best_scale, best_plates, best_metadata
@@ -1574,6 +1906,17 @@ def _fmt_bytes(value: int | None) -> str:
     return f"{value / (1024**2):.1f} MiB"
 
 
+def _fmt_optional_float(value: object, digits: int = 4) -> str:
+    if isinstance(value, int | float):
+        return f"{float(value):.{digits}f}"
+    if isinstance(value, str):
+        try:
+            return f"{float(value):.{digits}f}"
+        except ValueError:
+            return "?"
+    return "?"
+
+
 def _rss_to_mb(raw: float) -> float:
     if sys.platform == "darwin":
         return raw / (1024.0 * 1024.0)
@@ -2297,6 +2640,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         grid_step_mm=args.grid_step_mm,
         max_plates=max_plates,
         scale_tolerance=scale_tolerance if max_plates is not None else None,
+        post_fit_scale=post_fit_scale if max_plates is not None else None,
     )
     layout_pack_scale = 1.0
     export_mesh_scale = 1.0
@@ -2307,7 +2651,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     )
 
     with profiler.stage("packing"), make_progress(console, enabled=args.progress) as progress:
-        ptask = progress.add_task("Packing…", total=n_parts)
+        ptask = progress.add_task("Packing…", total=None if max_plates is not None else n_parts)
         cached_result = _load_packing_result(packing_cache_dir, packing_key, packer)
         cached_plates = cached_result.plates if cached_result is not None else None
         cached_layout_scale: float | None
@@ -2347,6 +2691,18 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
         else:
             packing_metadata["cache_hit"] = False
             if max_plates is not None:
+
+                def _on_scale_attempt(attempt: dict[str, object]) -> None:
+                    scale = attempt.get("scale")
+                    fits = "ok" if attempt.get("fits") else "miss"
+                    scale_text = _fmt_optional_float(scale)
+                    progress.update(
+                        ptask,
+                        description=(
+                            f"Packing scale {scale_text} [{attempt.get('kind', 'attempt')}, {fits}]"
+                        ),
+                    )
+
                 layout_pack_scale, search_plates, search_metadata = profiler.profiled_call(
                     f"prepare.packing.{packer.value}.scale_search",
                     _search_prepare_layout_scale,
@@ -2361,9 +2717,12 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                     max_plates=max_plates,
                     part_heights=part_heights,
                     tolerance=scale_tolerance,
+                    on_attempt=_on_scale_attempt,
+                    on_placed=lambda: progress.advance(ptask),
                 )
                 packing_metadata.update(search_metadata)
                 if search_plates is None or layout_pack_scale <= 0.0:
+                    profile_metadata["packing"] = packing_metadata
                     console.print(
                         "[red]Could not pack parts into the requested max plates at any "
                         "positive scale. Try larger --max-plates, smaller --gap-mm, or "
@@ -2379,13 +2738,37 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 plates = _scale_plate_dimensions(search_plates, post_fit_scale)
                 final_shadows = _scale_polygons(packed_shadows, export_mesh_scale)
                 if not _validate_layout_geometry(final_shadows, plates, px, py, gap):
-                    console.print(
-                        "[red]Final prepare layout does not fit after applying "
-                        "--post-fit-scale. Use post_fit_scale <= 1.0, increase "
-                        "--max-plates, or reduce margins/gap.[/red]"
+                    repack_plates, repack_metadata = profiler.profiled_call(
+                        f"prepare.packing.{packer.value}.post_fit_repack",
+                        _try_pack_prepare_at_scale,
+                        packed_shadows,
+                        px,
+                        py,
+                        gap,
+                        edge_margin,
+                        export_mesh_scale,
+                        packer=packer,
+                        bitmap_options=bitmap_options,
+                        grid_step_mm=args.grid_step_mm,
+                        max_plates=max_plates,
+                        part_heights=part_heights,
                     )
-                    return finish_profile(profiler, console, 1)
-                progress.update(ptask, completed=n_parts)
+                    packing_metadata["post_fit_repack"] = repack_metadata
+                    if repack_plates is None or not _validate_layout_geometry(
+                        final_shadows, repack_plates, px, py, gap
+                    ):
+                        profile_metadata["packing"] = packing_metadata
+                        console.print(
+                            "[red]Final prepare layout does not fit after applying "
+                            "--post-fit-scale. Use post_fit_scale <= 1.0, increase "
+                            "--max-plates, or reduce margins/gap.[/red]"
+                        )
+                        return finish_profile(profiler, console, 1)
+                    plates = repack_plates
+                    packing_metadata["post_fit_repack_applied"] = True
+                else:
+                    packing_metadata["post_fit_repack_applied"] = False
+                progress.update(ptask, total=n_parts, completed=n_parts, description="Packing…")
             elif packer is PackerBackend.BITMAP:
                 plates = profiler.profiled_call(
                     "prepare.packing.bitmap",
@@ -2416,6 +2799,7 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
             if not _validate_layout_geometry(
                 _scale_polygons(packed_shadows, export_mesh_scale), plates, px, py, gap
             ):
+                profile_metadata["packing"] = packing_metadata
                 console.print(
                     "[red]Internal error: prepare layout failed geometry validation.[/red]"
                 )
