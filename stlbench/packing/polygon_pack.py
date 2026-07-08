@@ -19,6 +19,7 @@ any grid discretisation.
 from __future__ import annotations
 
 import math
+import random
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -33,12 +34,32 @@ from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
 from shapely.prepared import prep
 
+from stlbench.config.enums import ExactPackQuality, coerce_enum
 from stlbench.packing.rectpack_plate import PackedPlate, PackedRect, pack_rectangles_on_plates
 
 _PLACEMENT_ROTATION_COUNT = 24
 _PLACEMENT_ANGLES: tuple[float, ...] = tuple(
     360.0 * i / _PLACEMENT_ROTATION_COUNT for i in range(_PLACEMENT_ROTATION_COUNT)
 )
+_FEASIBILITY_FAST_ANGLES: tuple[float, ...] = (
+    0.0,
+    30.0,
+    45.0,
+    60.0,
+    90.0,
+    120.0,
+    135.0,
+    150.0,
+    180.0,
+    210.0,
+    225.0,
+    240.0,
+    270.0,
+    300.0,
+    315.0,
+    330.0,
+)
+_FEASIBILITY_MONTE_CARLO_BUDGET_S = 6.0
 
 # Clipper integer scale: 1 unit = 1 µm → coordinates in range ±2^31
 _CLIPPER_SCALE = 1_000
@@ -182,9 +203,12 @@ class _ExactPackStats:
     union_difference_s: float = 0.0
     clearance_s: float = 0.0
     grid_fallback_s: float = 0.0
+    compact_s: float = 0.0
     placement_calls: int = 0
     rotations_tested: int = 0
     candidate_checks: int = 0
+    nfp_calls: int = 0
+    nfp_bbox_skips: int = 0
 
 
 def _axis_positions(max_value: float, step: float) -> list[float]:
@@ -247,6 +271,28 @@ def _centroid_xy(geom: BaseGeometry) -> tuple[float, float]:
     return float(c.x), float(c.y)
 
 
+def _bounds_intersect(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> bool:
+    return bool(a[0] <= b[2] and a[2] >= b[0] and a[1] <= b[3] and a[3] >= b[1])
+
+
+def _outer_nfp_can_intersect_inner(
+    fixed: BaseGeometry,
+    moving: BaseGeometry,
+    inner_bounds: tuple[float, float, float, float],
+) -> bool:
+    fixed_minx, fixed_miny, fixed_maxx, fixed_maxy = fixed.bounds
+    moving_minx, moving_miny, moving_maxx, moving_maxy = moving.bounds
+    possible_bounds = (
+        fixed_minx - moving_maxx,
+        fixed_miny - moving_maxy,
+        fixed_maxx - moving_minx,
+        fixed_maxy - moving_miny,
+    )
+    return _bounds_intersect(possible_bounds, inner_bounds)
+
+
 def _candidate_spread_score(candidate: BaseGeometry, existing: list[BaseGeometry]) -> float:
     if not existing:
         return 0.0
@@ -287,12 +333,13 @@ def _rect_for_candidate(
 def _build_placement_variants(
     polygons: list[BaseGeometry],
     stats: _ExactPackStats | None = None,
+    angles: Sequence[float] = _PLACEMENT_ANGLES,
 ) -> list[tuple[_PlacementVariant, ...]]:
     start = time.perf_counter()
     out: list[tuple[_PlacementVariant, ...]] = []
     for shadow in polygons:
         variants: list[_PlacementVariant] = []
-        for angle in _PLACEMENT_ANGLES:
+        for angle in angles:
             rotated = _normalize(affinity.rotate(shadow, angle, origin=(0, 0)))
             _, _, width, height = rotated.bounds
             variants.append(
@@ -424,6 +471,7 @@ def _try_place_one(
         x_max = max(x_max, 0.0)
         y_max = max(y_max, 0.0)
         inner_nfp = shapely_box(0.0, 0.0, max(x_max, 1e-6), max(y_max, 1e-6))
+        inner_bounds = inner_nfp.bounds
 
         if placed_buffered:
             # Convex hull of the rotated shadow: 10-30 vertices instead of
@@ -433,6 +481,12 @@ def _try_place_one(
             outer_nfps: list[BaseGeometry] = []
             nfp_start = time.perf_counter()
             for buf in placed_buffered:
+                if not _outer_nfp_can_intersect_inner(buf, s_nfp, inner_bounds):
+                    if stats is not None:
+                        stats.nfp_bbox_skips += 1
+                    continue
+                if stats is not None:
+                    stats.nfp_calls += 1
                 nfp = _outer_nfp(buf, s_nfp)
                 if nfp is not None and not nfp.is_empty:
                     outer_nfps.append(nfp)
@@ -626,6 +680,26 @@ def _compact_plates(
     variants: list[tuple[_PlacementVariant, ...]] | None = None,
     stats: _ExactPackStats | None = None,
 ) -> list[PackedPlate]:
+    start = time.perf_counter()
+    try:
+        return _compact_plates_impl(
+            plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm, variants, stats
+        )
+    finally:
+        if stats is not None:
+            stats.compact_s += time.perf_counter() - start
+
+
+def _compact_plates_impl(
+    plates: list[PackedPlate],
+    polygons: list[BaseGeometry],
+    bed_w: float,
+    bed_h: float,
+    gap_mm: float,
+    grid_step_mm: float,
+    variants: list[tuple[_PlacementVariant, ...]] | None = None,
+    stats: _ExactPackStats | None = None,
+) -> list[PackedPlate]:
     if len(plates) <= 1:
         return plates
 
@@ -790,6 +864,7 @@ def _pack_order(
     on_placed: Callable[[], None] | None = None,
     variants: list[tuple[_PlacementVariant, ...]] | None = None,
     stats: _ExactPackStats | None = None,
+    compact: bool = True,
 ) -> list[PackedPlate]:
     plates: list[PackedPlate] = []
     remaining = order
@@ -816,6 +891,8 @@ def _pack_order(
             )
         plates.append(plate)
 
+    if not compact:
+        return plates
     return _compact_plates(plates, polygons, bed_w, bed_h, gap_mm, grid_step_mm, variants, stats)
 
 
@@ -845,6 +922,36 @@ def _ordering_candidates(
         ),
     )
     candidates.append(by_long_side)
+
+    unique: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for candidate in candidates:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _feasibility_order_candidates(
+    order: list[int],
+    polygons: list[BaseGeometry],
+    part_heights: Sequence[float] | None,
+    seed: int | None,
+) -> list[list[int]]:
+    candidates = _ordering_candidates(order, polygons, part_heights)
+    if seed is None or len(order) <= 3:
+        return candidates
+
+    rng = random.Random(seed)
+    bucket_size = max(3, min(6, int(math.sqrt(len(order))) + 1))
+    for _ in range(2):
+        shuffled: list[int] = []
+        for start in range(0, len(order), bucket_size):
+            bucket = list(order[start : start + bucket_size])
+            rng.shuffle(bucket)
+            shuffled.extend(bucket)
+        candidates.append(shuffled)
 
     unique: list[list[int]] = []
     seen: set[tuple[int, ...]] = set()
@@ -1094,6 +1201,8 @@ def pack_polygons_on_plates(
     strategy: str = "balanced",
     metadata: dict[str, object] | None = None,
     edge_margin_mm: float = 0.0,
+    quality: ExactPackQuality | str = ExactPackQuality.FINAL,
+    exact_seed: int | None = None,
 ) -> list[PackedPlate]:
     """Pack 2-D polygons onto the minimum number of plates using NFP placement.
 
@@ -1123,6 +1232,7 @@ def pack_polygons_on_plates(
         )
     if strategy not in {"balanced", "greedy"}:
         raise ValueError(f"Unknown packing strategy {strategy!r}; expected 'balanced' or 'greedy'.")
+    quality = coerce_enum(ExactPackQuality, quality, "quality")
     if not polygons:
         return []
 
@@ -1158,6 +1268,7 @@ def pack_polygons_on_plates(
             fast = _offset_plates(fast, edge_margin_mm, edge_margin_mm)
             if metadata is not None:
                 metadata["strategy"] = "rectangular-fast-path"
+                metadata["quality"] = quality.value
                 metadata["baseline_plates"] = len(fast)
                 metadata["final_plates"] = len(fast)
                 metadata["height_score"] = 0.0
@@ -1168,27 +1279,104 @@ def pack_polygons_on_plates(
             return fast
 
     exact_stats = _ExactPackStats()
-    variants = _build_placement_variants(polygons, exact_stats)
+    compact = quality is ExactPackQuality.FINAL
+    attempts: list[dict[str, object]]
+    if quality is ExactPackQuality.FEASIBILITY:
+        best = None
+        baseline = None
+        best_score = (max_plates + 1, float("inf"), float("inf"))
+        attempts = []
+        feasibility_start = time.perf_counter()
+        last_error = "polygon_pack: no feasibility order could place all parts."
+        phases: tuple[tuple[str, Sequence[float]], ...] = (
+            ("fast-angles", _FEASIBILITY_FAST_ANGLES),
+            ("full-angles", _PLACEMENT_ANGLES),
+        )
+        order_candidates = _feasibility_order_candidates(order, polygons, part_heights, exact_seed)
+        for phase_name, phase_angles in phases:
+            variants = _build_placement_variants(polygons, exact_stats, phase_angles)
+            for order_idx, candidate_order in enumerate(order_candidates):
+                if order_idx > 0 and time.perf_counter() - feasibility_start > (
+                    _FEASIBILITY_MONTE_CARLO_BUDGET_S
+                ):
+                    attempts.append(
+                        {
+                            "kind": "monte-carlo-order",
+                            "phase": phase_name,
+                            "skipped": "time_budget",
+                            "order": order_idx,
+                        }
+                    )
+                    break
+                try:
+                    candidate = _pack_order(
+                        candidate_order,
+                        polygons,
+                        effective_bed_w,
+                        effective_bed_h,
+                        gap_mm,
+                        grid_step_mm,
+                        max_plates,
+                        on_placed,
+                        variants,
+                        exact_stats,
+                        compact=False,
+                    )
+                except RuntimeError as exc:
+                    last_error = str(exc)
+                    attempts.append(
+                        {
+                            "kind": "monte-carlo-order",
+                            "phase": phase_name,
+                            "order": order_idx,
+                            "ok": False,
+                        }
+                    )
+                    continue
+                score = _layout_score(candidate, polygons, part_heights)
+                attempts.append(
+                    {
+                        "kind": "monte-carlo-order",
+                        "phase": phase_name,
+                        "order": order_idx,
+                        "ok": True,
+                        "plates": len(candidate),
+                        "score": list(score),
+                    }
+                )
+                best = candidate
+                baseline = candidate
+                best_score = score
+                break
+            if best is not None:
+                break
+        if best is None or baseline is None:
+            raise RuntimeError(last_error)
+    else:
+        variants = _build_placement_variants(polygons, exact_stats)
+        baseline = _pack_order(
+            order,
+            polygons,
+            effective_bed_w,
+            effective_bed_h,
+            gap_mm,
+            grid_step_mm,
+            max_plates,
+            on_placed,
+            variants,
+            exact_stats,
+            compact=compact,
+        )
+        best = baseline
+        best_score = _layout_score(best, polygons, part_heights)
+        attempts = [{"kind": "baseline", "plates": len(baseline), "score": list(best_score)}]
 
-    baseline = _pack_order(
-        order,
-        polygons,
-        effective_bed_w,
-        effective_bed_h,
-        gap_mm,
-        grid_step_mm,
-        max_plates,
-        on_placed,
-        variants,
-        exact_stats,
-    )
-    best = baseline
-    best_score = _layout_score(best, polygons, part_heights)
-    attempts: list[dict[str, object]] = [
-        {"kind": "baseline", "plates": len(baseline), "score": list(best_score)}
-    ]
-
-    if strategy == "balanced" and part_heights is not None and len(polygons) > 1:
+    if (
+        quality is ExactPackQuality.FINAL
+        and strategy == "balanced"
+        and part_heights is not None
+        and len(polygons) > 1
+    ):
         if len(polygons) <= 12:
             lower_bound = max(
                 1,
@@ -1202,7 +1390,7 @@ def pack_polygons_on_plates(
                 for order_idx, candidate_order in enumerate(orderings):
                     if time.perf_counter() >= deadline:
                         break
-                    candidate = _try_pack_order_into_k(
+                    fixed_candidate = _try_pack_order_into_k(
                         candidate_order,
                         polygons,
                         effective_bed_w,
@@ -1214,24 +1402,24 @@ def pack_polygons_on_plates(
                         variants,
                         exact_stats,
                     )
-                    if candidate is None:
+                    if fixed_candidate is None:
                         attempts.append(
                             {"kind": "fixed-k", "k": k, "order": order_idx, "ok": False}
                         )
                         continue
-                    score = _layout_score(candidate, polygons, part_heights)
+                    score = _layout_score(fixed_candidate, polygons, part_heights)
                     attempts.append(
                         {
                             "kind": "fixed-k",
                             "k": k,
                             "order": order_idx,
                             "ok": True,
-                            "plates": len(candidate),
+                            "plates": len(fixed_candidate),
                             "score": list(score),
                         }
                     )
                     if score < best_score:
-                        best = candidate
+                        best = fixed_candidate
                         best_score = score
 
                 if time.perf_counter() >= deadline:
@@ -1299,6 +1487,8 @@ def pack_polygons_on_plates(
 
     if metadata is not None:
         metadata["strategy"] = strategy
+        metadata["quality"] = quality.value
+        metadata["exact_seed"] = exact_seed
         metadata["baseline_plates"] = len(baseline)
         metadata["final_plates"] = len(best)
         metadata["height_score"] = best_score[1]
@@ -1310,9 +1500,20 @@ def pack_polygons_on_plates(
         metadata["exact_union_difference_s"] = exact_stats.union_difference_s
         metadata["exact_clearance_s"] = exact_stats.clearance_s
         metadata["exact_grid_fallback_s"] = exact_stats.grid_fallback_s
+        metadata["exact_compact_s"] = exact_stats.compact_s
         metadata["exact_placement_calls"] = exact_stats.placement_calls
         metadata["exact_rotations_tested"] = exact_stats.rotations_tested
         metadata["exact_candidate_checks"] = exact_stats.candidate_checks
+        metadata["exact_nfp_calls"] = exact_stats.nfp_calls
+        metadata["exact_nfp_bbox_skips"] = exact_stats.nfp_bbox_skips
+        metadata["monte_carlo_attempts"] = sum(
+            1 for attempt in attempts if attempt.get("kind") == "monte-carlo-order"
+        )
+        metadata["monte_carlo_successes"] = sum(
+            1
+            for attempt in attempts
+            if attempt.get("kind") == "monte-carlo-order" and attempt.get("ok") is True
+        )
         metadata["attempts"] = attempts
 
     return _offset_plates(best, edge_margin_mm, edge_margin_mm)

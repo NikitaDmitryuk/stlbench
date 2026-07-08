@@ -52,6 +52,7 @@ from shapely.geometry.base import BaseGeometry
 
 from stlbench.config.defaults import ORIENTATION_SAMPLES_DEFAULT, ORIENTATION_SEED_DEFAULT
 from stlbench.config.enums import (
+    ExactPackQuality,
     ExportCompressionMode,
     PackerBackend,
     PrepareOrientationQuality,
@@ -114,11 +115,19 @@ from stlbench.pipeline.resource_planner import (
 from stlbench.profiling import ProfileOptions, make_profiler
 
 _IDENTITY3 = np.eye(3, dtype=np.float64)
-_PREPARE_SCALE_SEARCH_VERSION = "scale_search_v3"
-_PREPARE_FAST_PROBE_STEPS = 12
-_PREPARE_FAST_PROBE_TOLERANCE = 0.01
-_PREPARE_FAST_PROBE_GRID_MM = 1.0
-_PREPARE_FAST_PROBE_BEAM_WIDTH = 8
+_PREPARE_SCALE_SEARCH_VERSION = "scale_search_v5"
+_PREPARE_SCALE_SEARCH_STRATEGY = "parallel_exact_monte_carlo_v1"
+_PREPARE_PARALLEL_BATCH_FRACTIONS: tuple[float, ...] = (
+    0.5,
+    0.625,
+    0.6875,
+    0.7375,
+    0.75,
+    0.875,
+    0.9375,
+)
+_PREPARE_PARALLEL_MAX_ROUNDS = 2
+_PREPARE_PARALLEL_RELATIVE_TOLERANCE = 0.02
 _PREPARE_LAYOUT_SCALE_TOLERANCE_FLOOR = 0.005
 _PREPARE_LAYOUT_PROBE_ROTATION_COUNT = 24
 _PREPARE_LAYOUT_PROBE_ANGLES: tuple[float, ...] = tuple(
@@ -234,6 +243,13 @@ class _ExportPlateJob:
 @dataclass(frozen=True)
 class _FootprintJob:
     ref: PreparedMeshRef
+
+
+@dataclass(frozen=True)
+class _PrepareScaleAttemptResult:
+    scale: float
+    plates: list[PackedPlate] | None
+    metadata: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -366,7 +382,7 @@ def _write_cached_footprint(cache_dir: Path | None, key: str, geometry: BaseGeom
 
 def _prepare_packer_version(packer: PackerBackend | str) -> str:
     packer = coerce_enum(PackerBackend, packer, "packer")
-    return "prepare_bitmap_v3" if packer is PackerBackend.BITMAP else "prepare_exact_v3"
+    return "prepare_bitmap_v5" if packer is PackerBackend.BITMAP else "prepare_exact_v5"
 
 
 def _packing_cache_key(
@@ -387,14 +403,14 @@ def _packing_cache_key(
     packer = coerce_enum(PackerBackend, packer, "packer")
     return _json_hash(
         {
-            "version": 3,
+            "version": 5,
             "footprint_keys": footprint_keys,
             "bed_w": round(float(bed_w), 9),
             "bed_h": round(float(bed_h), 9),
             "gap_mm": round(float(gap_mm), 9),
             "edge_margin_mm": round(float(edge_margin_mm), 9),
             "part_heights": (
-                [round(float(h), 6) for h in part_heights]
+                [round(float(h), 3) for h in part_heights]
                 if packer is PackerBackend.EXACT
                 else None
             ),
@@ -409,6 +425,21 @@ def _packing_cache_key(
             ),
             "scale_search_version": (
                 _PREPARE_SCALE_SEARCH_VERSION if max_plates is not None else None
+            ),
+            "exact_search_quality": (
+                _PREPARE_SCALE_SEARCH_STRATEGY
+                if max_plates is not None and packer is PackerBackend.EXACT
+                else None
+            ),
+            "parallel_batch_fractions": (
+                [round(float(v), 6) for v in _PREPARE_PARALLEL_BATCH_FRACTIONS]
+                if max_plates is not None and packer is PackerBackend.EXACT
+                else None
+            ),
+            "parallel_max_rounds": (
+                _PREPARE_PARALLEL_MAX_ROUNDS
+                if max_plates is not None and packer is PackerBackend.EXACT
+                else None
             ),
             "post_fit_scale": (
                 round(float(post_fit_scale), 9)
@@ -718,12 +749,16 @@ def _try_pack_prepare_at_scale(
     max_plates: int,
     part_heights: list[float],
     on_placed: Any | None = None,
+    exact_quality: ExactPackQuality | str = ExactPackQuality.FINAL,
+    exact_seed: int | None = None,
 ) -> tuple[list[PackedPlate] | None, dict[str, object]]:
     start = time.perf_counter()
     scaled = _scale_polygons(base_polygons, scale)
     metadata: dict[str, object] = {"layout_pack_scale": float(scale)}
     try:
         packer = coerce_enum(PackerBackend, packer, "packer")
+        if packer is PackerBackend.BITMAP:
+            packer = PackerBackend.EXACT
         metadata["packer"] = packer.value
         if packer is PackerBackend.BITMAP:
             plates = _pack_bitmap_multi_plate(
@@ -737,6 +772,9 @@ def _try_pack_prepare_at_scale(
                 max_plates=max_plates,
             )
         else:
+            exact_quality = coerce_enum(ExactPackQuality, exact_quality, "exact_quality")
+            metadata["exact_quality"] = exact_quality.value
+            metadata["exact_seed"] = exact_seed
             plates = pack_polygons_on_plates(
                 scaled,
                 bed_w,
@@ -748,6 +786,8 @@ def _try_pack_prepare_at_scale(
                 metadata=metadata,
                 edge_margin_mm=edge_margin_mm,
                 on_placed=on_placed,
+                quality=exact_quality,
+                exact_seed=exact_seed,
             )
     except (RuntimeError, ValueError) as exc:
         metadata["duration_s"] = time.perf_counter() - start
@@ -860,77 +900,64 @@ def _prepare_layout_scale_precheck(
     return True, metadata
 
 
-def _coarse_bitmap_options(bitmap_options: BitmapPackOptions) -> BitmapPackOptions:
-    return BitmapPackOptions(
-        grid_mm=max(float(bitmap_options.grid_mm), _PREPARE_FAST_PROBE_GRID_MM),
-        beam_width=min(int(bitmap_options.beam_width), _PREPARE_FAST_PROBE_BEAM_WIDTH),
-    )
+def _prepare_scale_attempt_seed(
+    scale: float,
+    max_plates: int,
+    base_polygons: list[BaseGeometry],
+) -> int:
+    payload = {
+        "version": _PREPARE_SCALE_SEARCH_VERSION,
+        "scale": round(float(scale), 9),
+        "max_plates": int(max_plates),
+        "areas": [round(float(poly.area), 6) for poly in base_polygons],
+        "bounds": [[round(float(v), 6) for v in poly.bounds] for poly in base_polygons],
+    }
+    return int(_json_hash(payload)[:16], 16)
 
 
-def _fast_probe_prepare_layout_scale(
+def _prepare_scale_attempt_worker(
+    *,
     base_polygons: list[BaseGeometry],
     bed_w: float,
     bed_h: float,
     gap_mm: float,
     edge_margin_mm: float,
-    *,
+    scale: float,
+    packer: PackerBackend | str,
     bitmap_options: BitmapPackOptions,
+    grid_step_mm: float,
     max_plates: int,
-    lo: float,
-    hi: float,
-    on_attempt: Any | None = None,
-) -> tuple[float, list[dict[str, object]]]:
-    attempts: list[dict[str, object]] = []
-    best = lo
-    if hi <= lo:
-        return best, attempts
-    probe_options = _coarse_bitmap_options(bitmap_options)
-    probe_tolerance = max(_PREPARE_FAST_PROBE_TOLERANCE, (hi - lo) / (2**_PREPARE_FAST_PROBE_STEPS))
-    for _ in range(_PREPARE_FAST_PROBE_STEPS):
-        if hi - lo <= probe_tolerance:
-            break
-        mid = (lo + hi) / 2.0
-        started = time.perf_counter()
-        scaled = _scale_polygons(base_polygons, mid)
-        metadata: dict[str, object] = {"layout_pack_scale": mid}
-        plates: list[PackedPlate] | None
-        try:
-            plates = _pack_bitmap_multi_plate(
-                scaled,
-                bed_w,
-                bed_h,
-                gap_mm,
-                edge_margin_mm,
-                probe_options,
-                metadata,
-                max_plates=max_plates,
-            )
-        except (RuntimeError, ValueError) as exc:
-            plates = None
-            metadata["error"] = str(exc)
-        fits = plates is not None and _validate_layout_geometry(
-            scaled, plates, bed_w, bed_h, gap_mm
-        )
-        if fits:
-            best = mid
-            lo = mid
-        else:
-            hi = mid
-        attempt = {
-            "kind": "fast-probe",
-            "scale": mid,
-            "packer": PackerBackend.BITMAP.value,
-            "fits": fits,
-            "plates": len(plates) if plates is not None else None,
-            "placed_count": (
-                sum(len(plate.rects) for plate in plates) if plates is not None else 0
-            ),
-            "duration_s": time.perf_counter() - started,
-        }
-        attempts.append(attempt)
-        if on_attempt is not None:
-            on_attempt(attempt)
-    return best, attempts
+    part_heights: list[float],
+    exact_quality: ExactPackQuality | str,
+    exact_seed: int | None,
+    precheck_metadata: dict[str, object],
+) -> _PrepareScaleAttemptResult:
+    plates, metadata = _try_pack_prepare_at_scale(
+        base_polygons,
+        bed_w,
+        bed_h,
+        gap_mm,
+        edge_margin_mm,
+        scale,
+        packer=packer,
+        bitmap_options=bitmap_options,
+        grid_step_mm=grid_step_mm,
+        max_plates=max_plates,
+        part_heights=part_heights,
+        exact_quality=exact_quality,
+        exact_seed=exact_seed,
+    )
+    metadata.update({k: v for k, v in precheck_metadata.items() if k not in metadata})
+    return _PrepareScaleAttemptResult(scale=scale, plates=plates, metadata=metadata)
+
+
+def _candidate_scales_for_parallel_round(lo: float, hi: float) -> list[float]:
+    values = {
+        round(lo + (hi - lo) * fraction, 12)
+        for fraction in _PREPARE_PARALLEL_BATCH_FRACTIONS
+        if lo < lo + (hi - lo) * fraction < hi
+    }
+    return sorted(values)
 
 
 def _search_prepare_layout_scale(
@@ -952,6 +979,8 @@ def _search_prepare_layout_scale(
 ) -> tuple[float, list[PackedPlate] | None, dict[str, object]]:
     requested_tolerance = float(tolerance)
     packer = coerce_enum(PackerBackend, packer, "packer")
+    if packer is PackerBackend.BITMAP:
+        packer = PackerBackend.EXACT
     tolerance = (
         max(requested_tolerance, _PREPARE_LAYOUT_SCALE_TOLERANCE_FLOOR)
         if packer is PackerBackend.BITMAP
@@ -959,11 +988,16 @@ def _search_prepare_layout_scale(
     )
     attempts = 0
     exact_attempts = 0
+    exact_feasibility_attempts = 0
+    exact_final_attempts = 0
     skipped_by_precheck = 0
     best_scale = 0.0
     best_plates: list[PackedPlate] | None = None
     best_metadata: dict[str, object] = {}
     attempt_log: list[dict[str, object]] = []
+    batch_rounds = 0
+    parallel_attempts = 0
+    batch_log: list[dict[str, object]] = []
 
     def record_attempt(kind: str, scale: float, metadata: dict[str, object]) -> None:
         attempt = {
@@ -974,13 +1008,32 @@ def _search_prepare_layout_scale(
             "plates": metadata.get("plates", metadata.get("final_plates")),
             "placed_count": metadata.get("placed_count"),
             "duration_s": metadata.get("duration_s"),
+            "exact_quality": metadata.get("exact_quality"),
         }
         attempt_log.append(attempt)
         if on_attempt is not None:
             on_attempt(attempt)
 
-    def try_scale(kind: str, scale: float) -> tuple[list[PackedPlate] | None, dict[str, object]]:
-        nonlocal attempts, exact_attempts, skipped_by_precheck
+    def record_result(
+        scale: float,
+        plates: list[PackedPlate] | None,
+        metadata: dict[str, object],
+        kind: str,
+        exact_quality: ExactPackQuality,
+    ) -> tuple[list[PackedPlate] | None, dict[str, object]]:
+        nonlocal attempts, exact_attempts, exact_feasibility_attempts, exact_final_attempts
+        attempts += 1
+        if packer is PackerBackend.EXACT:
+            exact_attempts += 1
+            if exact_quality is ExactPackQuality.FINAL:
+                exact_final_attempts += 1
+            else:
+                exact_feasibility_attempts += 1
+        record_attempt(kind, scale, metadata)
+        return plates, metadata
+
+    def precheck_scale(kind: str, scale: float) -> dict[str, object] | None:
+        nonlocal skipped_by_precheck
         precheck_ok, precheck_metadata = _prepare_layout_scale_precheck(
             base_polygons,
             bed_w,
@@ -990,22 +1043,30 @@ def _search_prepare_layout_scale(
             scale,
             max_plates,
         )
-        if not precheck_ok:
-            skipped_by_precheck += 1
-            metadata = {
-                "layout_pack_scale": float(scale),
-                "packer": packer.value,
-                "fits": False,
-                "plates": None,
-                "placed_count": None,
-                "duration_s": 0.0,
-                **precheck_metadata,
-            }
-            record_attempt(f"{kind}-precheck", scale, metadata)
-            return None, metadata
-        attempts += 1
-        if packer is PackerBackend.EXACT:
-            exact_attempts += 1
+        if precheck_ok:
+            return precheck_metadata
+        skipped_by_precheck += 1
+        metadata = {
+            "layout_pack_scale": float(scale),
+            "packer": packer.value,
+            "fits": False,
+            "plates": None,
+            "placed_count": None,
+            "duration_s": 0.0,
+            **precheck_metadata,
+        }
+        record_attempt(f"{kind}-precheck", scale, metadata)
+        return None
+
+    def try_scale(
+        kind: str,
+        scale: float,
+        *,
+        exact_quality: ExactPackQuality = ExactPackQuality.FEASIBILITY,
+    ) -> tuple[list[PackedPlate] | None, dict[str, object]]:
+        precheck_metadata = precheck_scale(kind, scale)
+        if precheck_metadata is None:
+            return None, {}
         plates, metadata = _try_pack_prepare_at_scale(
             base_polygons,
             bed_w,
@@ -1019,10 +1080,62 @@ def _search_prepare_layout_scale(
             max_plates=max_plates,
             part_heights=part_heights,
             on_placed=on_placed,
+            exact_quality=(
+                exact_quality if packer is PackerBackend.EXACT else ExactPackQuality.FINAL
+            ),
+            exact_seed=_prepare_scale_attempt_seed(scale, max_plates, base_polygons),
         )
         metadata.update({k: v for k, v in precheck_metadata.items() if k not in metadata})
-        record_attempt(kind, scale, metadata)
-        return plates, metadata
+        return record_result(scale, plates, metadata, kind, exact_quality)
+
+    def try_scale_batch(
+        kind: str,
+        scales: list[float],
+    ) -> list[_PrepareScaleAttemptResult]:
+        nonlocal parallel_attempts
+        jobs: list[tuple[float, dict[str, object]]] = []
+        for scale in scales:
+            precheck_metadata = precheck_scale(kind, scale)
+            if precheck_metadata is not None:
+                jobs.append((scale, precheck_metadata))
+        if not jobs:
+            return []
+
+        parallel_attempts += len(jobs)
+        max_workers = min(len(jobs), max(1, mp.cpu_count() or 1))
+        results: list[_PrepareScaleAttemptResult] = []
+        with ProcessPoolExecutor(max_workers=max_workers, max_tasks_per_child=1) as pool:
+            futures = {
+                pool.submit(
+                    _prepare_scale_attempt_worker,
+                    base_polygons=base_polygons,
+                    bed_w=bed_w,
+                    bed_h=bed_h,
+                    gap_mm=gap_mm,
+                    edge_margin_mm=edge_margin_mm,
+                    scale=scale,
+                    packer=packer,
+                    bitmap_options=bitmap_options,
+                    grid_step_mm=grid_step_mm,
+                    max_plates=max_plates,
+                    part_heights=part_heights,
+                    exact_quality=ExactPackQuality.FEASIBILITY,
+                    exact_seed=_prepare_scale_attempt_seed(scale, max_plates, base_polygons),
+                    precheck_metadata=precheck_metadata,
+                ): scale
+                for scale, precheck_metadata in jobs
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                record_result(
+                    result.scale,
+                    result.plates,
+                    result.metadata,
+                    kind,
+                    ExactPackQuality.FEASIBILITY,
+                )
+                results.append(result)
+        return sorted(results, key=lambda item: item.scale)
 
     lo = 0.0
     hi = _prepare_layout_scale_upper_bound(base_polygons, bed_w, bed_h, edge_margin_mm, max_plates)
@@ -1037,33 +1150,14 @@ def _search_prepare_layout_scale(
                 "requested_scale_tolerance": requested_tolerance,
                 "effective_scale_tolerance": tolerance,
                 "exact_attempts": exact_attempts,
+                "exact_feasibility_attempts": exact_feasibility_attempts,
+                "exact_final_attempts": exact_final_attempts,
                 "skipped_by_precheck": skipped_by_precheck,
                 "best_reused_as_final": False,
                 "scale_attempts": attempt_log,
+                "search_strategy": _PREPARE_SCALE_SEARCH_STRATEGY,
             },
         )
-
-    if packer is PackerBackend.EXACT:
-        probe_scale, probe_attempts = _fast_probe_prepare_layout_scale(
-            base_polygons,
-            bed_w,
-            bed_h,
-            gap_mm,
-            edge_margin_mm,
-            bitmap_options=bitmap_options,
-            max_plates=max_plates,
-            lo=0.0,
-            hi=hi,
-            on_attempt=on_attempt,
-        )
-        attempt_log.extend(probe_attempts)
-        if probe_scale > tolerance:
-            plates, metadata = try_scale("exact-probe", probe_scale)
-            if plates is not None:
-                lo = probe_scale
-                best_scale = probe_scale
-                best_plates = plates
-                best_metadata = metadata
 
     if hi > 0.0 and hi - lo > tolerance:
         plates, metadata = try_scale("upper-bound", hi)
@@ -1073,18 +1167,43 @@ def _search_prepare_layout_scale(
             best_metadata = metadata
             lo = hi
 
-    for _ in range(max_iter):
+    search_stopped_by = "tolerance"
+    for round_index in range(min(max_iter, _PREPARE_PARALLEL_MAX_ROUNDS)):
         if hi - lo < tolerance:
             break
-        mid = (lo + hi) / 2.0
-        plates, metadata = try_scale("binary", mid)
-        if plates is not None:
-            lo = mid
-            best_scale = mid
-            best_plates = plates
-            best_metadata = metadata
-        else:
-            hi = mid
+        if lo > 0.0 and (hi - lo) / lo <= _PREPARE_PARALLEL_RELATIVE_TOLERANCE:
+            search_stopped_by = "relative_tolerance"
+            break
+        candidate_scales = _candidate_scales_for_parallel_round(lo, hi)
+        if not candidate_scales:
+            break
+        batch_rounds += 1
+        started = time.perf_counter()
+        results = try_scale_batch(f"batch-{round_index + 1}", candidate_scales)
+        successes = [result for result in results if result.plates is not None]
+        failures = [result for result in results if result.plates is None]
+        if successes:
+            best_result = max(successes, key=lambda item: item.scale)
+            lo = max(lo, best_result.scale)
+            best_scale = best_result.scale
+            best_plates = best_result.plates
+            best_metadata = best_result.metadata
+        fail_above_lo = [result.scale for result in failures if result.scale > lo]
+        if fail_above_lo:
+            hi = min(hi, min(fail_above_lo))
+        batch_log.append(
+            {
+                "round": round_index + 1,
+                "scales": candidate_scales,
+                "duration_s": time.perf_counter() - started,
+                "successes": len(successes),
+                "failures": len(failures),
+                "lo": lo,
+                "hi": hi,
+            }
+        )
+    else:
+        search_stopped_by = "round_budget"
 
     if best_plates is None:
         return (
@@ -1097,16 +1216,22 @@ def _search_prepare_layout_scale(
                 "requested_scale_tolerance": requested_tolerance,
                 "effective_scale_tolerance": tolerance,
                 "exact_attempts": exact_attempts,
+                "exact_feasibility_attempts": exact_feasibility_attempts,
+                "exact_final_attempts": exact_final_attempts,
                 "skipped_by_precheck": skipped_by_precheck,
                 "best_reused_as_final": False,
                 "scale_attempts": attempt_log,
+                "search_strategy": _PREPARE_SCALE_SEARCH_STRATEGY,
             },
         )
+
+    best_reused_as_final = True
 
     best_metadata.update(
         {
             "scale_search_enabled": True,
             "scale_search_version": _PREPARE_SCALE_SEARCH_VERSION,
+            "search_strategy": _PREPARE_SCALE_SEARCH_STRATEGY,
             "max_plates": max_plates,
             "layout_pack_scale": best_scale,
             "scale_tolerance": tolerance,
@@ -1114,11 +1239,19 @@ def _search_prepare_layout_scale(
             "effective_scale_tolerance": tolerance,
             "attempts_run": attempts,
             "exact_attempts": exact_attempts,
+            "exact_feasibility_attempts": exact_feasibility_attempts,
+            "exact_final_attempts": exact_final_attempts,
             "skipped_by_precheck": skipped_by_precheck,
-            "best_reused_as_final": True,
+            "best_reused_as_final": best_reused_as_final,
             "final_plates": len(best_plates),
             "scale_attempts": attempt_log,
+            "batch_rounds": batch_rounds,
+            "parallel_attempts": parallel_attempts,
+            "scale_search_batches": batch_log,
+            "reused_feasibility_as_final": best_reused_as_final,
+            "final_refine_skipped": packer is PackerBackend.EXACT,
             "scale_search_upper_bound": hi,
+            "scale_search_stopped_by": search_stopped_by,
         }
     )
     return best_scale, best_plates, best_metadata
@@ -1130,7 +1263,9 @@ def _resolve_prepare_packer(
 ) -> PackerBackend:
     out = value or settings_value or PackerBackend.AUTO
     packer = coerce_enum(PackerBackend, out, "--packer")
-    return PackerBackend.EXACT if packer is PackerBackend.AUTO else packer
+    if packer in {PackerBackend.AUTO, PackerBackend.BITMAP}:
+        return PackerBackend.EXACT
+    return packer
 
 
 def _resolve_prepare_bitmap_options(
@@ -2072,10 +2207,9 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
     console.print(
         f"Gap: {gap} mm  |  edge margin: {edge_margin} mm  |  post_fit_scale: {post_fit_scale}"
     )
-    if packer is PackerBackend.BITMAP and requested_packer is PackerBackend.BITMAP:
+    if requested_packer is PackerBackend.BITMAP:
         console.print(
-            "[yellow]Warning: prepare bitmap packing is a fast heuristic backend; "
-            "use --packer auto/exact for quality-first plate count.[/yellow]"
+            "[yellow]Warning: prepare ignores bitmap packing and uses exact layout packing.[/yellow]"
         )
 
     with profiler.stage("collect inputs"):
@@ -2696,10 +2830,13 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                     scale = attempt.get("scale")
                     fits = "ok" if attempt.get("fits") else "miss"
                     scale_text = _fmt_optional_float(scale)
+                    quality = attempt.get("exact_quality")
+                    quality_text = f", {quality}" if quality else ""
                     progress.update(
                         ptask,
                         description=(
-                            f"Packing scale {scale_text} [{attempt.get('kind', 'attempt')}, {fits}]"
+                            f"Packing scale {scale_text} "
+                            f"[{attempt.get('kind', 'attempt')}{quality_text}, {fits}]"
                         ),
                     )
 
@@ -2737,7 +2874,11 @@ def run_prepare(args: PrepareRunArgs) -> int:  # noqa: C901
                 )
                 plates = _scale_plate_dimensions(search_plates, post_fit_scale)
                 final_shadows = _scale_polygons(packed_shadows, export_mesh_scale)
-                if not _validate_layout_geometry(final_shadows, plates, px, py, gap):
+                packing_metadata["post_fit_reuse_valid"] = _validate_layout_geometry(
+                    final_shadows, plates, px, py, gap
+                )
+                if not packing_metadata["post_fit_reuse_valid"]:
+                    progress.update(ptask, description="Packing post-fit repack…")
                     repack_plates, repack_metadata = profiler.profiled_call(
                         f"prepare.packing.{packer.value}.post_fit_repack",
                         _try_pack_prepare_at_scale,
